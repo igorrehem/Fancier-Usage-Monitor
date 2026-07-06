@@ -22,6 +22,7 @@ use crate::native_interop::{
     WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::settings;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -287,13 +288,44 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// In-memory copy of the render/appearance settings, refreshed from disk at startup
+/// (`run()`) and whenever the settings window saves new values (`set_settings`).
+/// Render paths read this instead of hitting disk on every frame.
+static SETTINGS: Mutex<Option<settings::Settings>> = Mutex::new(None);
+
+fn lock_settings() -> MutexGuard<'static, Option<settings::Settings>> {
+    SETTINGS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Store settings into the global without triggering a repaint. Used at startup and by
+/// `save_state_settings` (which must not recursively repaint mid-save).
+fn store_settings(s: settings::Settings) {
+    *lock_settings() = Some(s);
+}
+
+/// Clone of the current in-memory settings. Falls back to `Settings::default()` if `run()`
+/// hasn't populated the global yet (reproduces today's look/behavior either way, since
+/// defaults are chosen to match the existing hardcoded values).
+pub fn current_settings() -> settings::Settings {
+    lock_settings().clone().unwrap_or_default()
+}
+
+/// Store new settings (e.g. from the settings window) and immediately repaint so the
+/// change is visible.
+pub fn set_settings(s: settings::Settings) {
+    store_settings(s);
+    render_layered();
+}
+
 fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
-        // Preserve appearance/typography/geometry/animation currently on disk: read current
-        // settings, overwrite only the state-derived fields, and save. This avoids clobbering
-        // sections this build doesn't manage yet.
-        let mut settings = crate::settings::load();
+        // Preserve appearance/typography/geometry/animation currently in memory: start
+        // from current_settings() (NOT settings::load()) so a save here can't clobber
+        // appearance/typography/geometry changes that came from the settings window but
+        // haven't hit disk in this exact shape yet, overwrite only the state-derived
+        // fields, save to disk, and store the merged result back into the global.
+        let mut settings = current_settings();
         settings.tray_offset = s.tray_offset;
         settings.taskbar_index = s.taskbar_index;
         settings.poll_interval_ms = s.poll_interval_ms;
@@ -306,6 +338,7 @@ fn save_state_settings() {
         settings.show_codex = s.show_codex;
         settings.show_antigravity = s.show_antigravity;
         crate::settings::save(&settings);
+        store_settings(settings);
     }
 }
 
@@ -957,26 +990,26 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
-// Dimensions matching the C# version
+// Dimensions matching the C# version.
+//
+// SEGMENT_H, SEGMENT_GAP, CORNER_RADIUS, LABEL_WIDTH, TEXT_WIDTH, and WIDGET_HEIGHT moved
+// to `settings::Geometry` (bar_thickness, spacing, corner_radius, label_width, text_width,
+// height respectively) so the renderer can be driven by user overrides; the rest have no
+// corresponding settings field and stay as fixed layout constants.
 const SEGMENT_W: i32 = 10;
-const SEGMENT_H: i32 = 13;
-const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
-const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
-const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let widget_height = current_settings().geometry.height;
+    let divider_top = (sc(widget_height) - divider_h) / 2;
     client_x >= 0
         && client_x < sc(LEFT_DIVIDER_W)
         && client_y >= divider_top
@@ -1005,15 +1038,15 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
+fn total_widget_width_for(active_models: i32, geometry: &settings::Geometry) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
+    let model_width = (sc(SEGMENT_W) + sc(geometry.spacing)) * bar_segments - sc(geometry.spacing)
         + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+        + sc(geometry.text_width);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
+        + sc(geometry.label_width)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
@@ -1021,11 +1054,15 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    let geometry = current_settings().geometry;
+    total_widget_width_for(
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        &geometry,
+    )
 }
 
 fn total_widget_width() -> i32 {
@@ -1036,7 +1073,8 @@ fn total_widget_width() -> i32 {
             .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
             .unwrap_or(1)
     };
-    total_widget_width_for(active_models)
+    let geometry = current_settings().geometry;
+    total_widget_width_for(active_models, &geometry)
 }
 
 fn claude_accent_color() -> Color {
@@ -1148,6 +1186,7 @@ pub fn run() {
         }
 
         let settings = crate::settings::load();
+        store_settings(settings.clone());
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1166,8 +1205,8 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
+            total_widget_width_for(initial_model_count, &settings.geometry),
+            sc(settings.geometry.height),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1387,27 +1426,36 @@ fn render_layered() {
         return;
     }
 
-    let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
+    // Read settings once per render; everything below uses `cfg` instead of re-locking
+    // the global.
+    let cfg = current_settings();
+    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let width = total_widget_width_for(active_models, &cfg.geometry);
+    let height = sc(cfg.geometry.height);
 
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
     let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
+    let track_default = if is_dark {
         Color::from_hex("#444444")
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
+    let text_default = if is_dark {
         Color::from_hex("#888888")
     } else {
         Color::from_hex("#404040")
     };
-    let bg_color = if is_dark {
+    let bg_default = if is_dark {
         Color::from_hex("#1C1C1C")
     } else {
         Color::from_hex("#F3F3F3")
     };
+    // Option-override model: `None` (the default) reproduces today's adaptive colors
+    // exactly; `Some(rgba)` overrides them.
+    let track = cfg.appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
+    let text_color = cfg.appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
+    let bg_color = cfg.appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -1469,6 +1517,9 @@ fn render_layered() {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            &cfg.geometry,
+            &cfg.typography,
+            cfg.appearance.palette,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1481,6 +1532,19 @@ fn render_layered() {
                 *px = 0x01000000;
             } else {
                 *px = rgb | 0xFF000000;
+            }
+        }
+
+        // Apply the global opacity override on top of the alpha channel just assigned
+        // above. Default 1.0 leaves every pixel byte-for-byte unchanged (a * 1.0 rounds
+        // back to `a` exactly for every u8 value).
+        let opacity = cfg.appearance.opacity.clamp(0.0, 1.0);
+        if opacity != 1.0 {
+            for px in pixel_data.iter_mut() {
+                let a = (*px >> 24) as u8;
+                let rgb = *px & 0x00FFFFFF;
+                let new_a = ((a as f32) * opacity).round().clamp(0.0, 255.0) as u32;
+                *px = (new_a << 24) | rgb;
             }
         }
 
@@ -1545,6 +1609,9 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    geometry: &settings::Geometry,
+    typography: &settings::Typography,
+    palette: Option<settings::PaletteStops>,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1596,19 +1663,37 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let bar_thickness = sc(geometry.bar_thickness);
+        let row2_y = height - sc(5) - bar_thickness;
+        let row1_y = row2_y - sc(10) - bar_thickness;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
+        // Weight mapping (documented, must stay in sync with Typography::default()):
+        // today's hardcoded CreateFontW call used FW_MEDIUM (not FW_REGULAR), so
+        // Weight::Regular -> FW_MEDIUM to keep the default output pixel-identical.
+        // SemiBold and Bold map to their obvious GDI equivalents.
+        let font_weight = match typography.weight {
+            settings::Weight::Regular => FW_MEDIUM.0 as i32,
+            settings::Weight::SemiBold => FW_SEMIBOLD.0 as i32,
+            settings::Weight::Bold => FW_BOLD.0 as i32,
+        };
+
+        // nHeight mapping (documented, must stay in sync with default_font_size() in
+        // settings.rs): Windows converts point size to logical units via
+        // nHeight = -(point_size * dpi / 72). At the 96-DPI baseline `sc()` scales
+        // relative to, the default size_pt = 9.0 reproduces today's hardcoded `sc(-12)`
+        // call: -(9.0 * 96 / 72) = -12.
+        let base_height = -((typography.size_pt * 96.0 / 72.0).round() as i32);
+
+        let font_name = native_interop::wide_str(&typography.family);
         let font = CreateFontW(
-            sc(-12),
+            sc(base_height),
             0,
             0,
             0,
-            FW_MEDIUM.0 as i32,
+            font_weight,
             0,
             0,
             0,
@@ -1641,6 +1726,8 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            geometry,
+            palette,
         );
         draw_row(
             hdc,
@@ -1662,6 +1749,8 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            geometry,
+            palette,
         );
 
         SelectObject(hdc, old_font);
@@ -2040,7 +2129,7 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT);
+    let widget_height = sc(current_settings().geometry.height);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
@@ -2325,7 +2414,7 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT);
+                            let widget_height = sc(current_settings().geometry.height);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
                             let x = if embedded {
                                 tray_left - taskbar_rect.left - widget_width - new_offset
@@ -2927,24 +3016,33 @@ fn paint(hdc: HDC, hwnd: HWND) {
         }
     };
 
+    // Read settings once per render; everything below uses `cfg` instead of re-locking
+    // the global.
+    let cfg = current_settings();
+
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
     let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
+    let track_default = if is_dark {
         Color::from_hex("#444444")
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
+    let text_default = if is_dark {
         Color::from_hex("#888888")
     } else {
         Color::from_hex("#404040")
     };
-    let bg_color = if is_dark {
+    let bg_default = if is_dark {
         Color::from_hex("#1C1C1C")
     } else {
         Color::from_hex("#F3F3F3")
     };
+    // Option-override model: `None` (the default) reproduces today's adaptive colors
+    // exactly; `Some(rgba)` overrides them.
+    let track = cfg.appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
+    let text_color = cfg.appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
+    let bg_color = cfg.appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -2987,6 +3085,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            &cfg.geometry,
+            &cfg.typography,
+            cfg.appearance.palette,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3017,8 +3118,10 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    geometry: &settings::Geometry,
+    palette: Option<settings::PaletteStops>,
 ) {
-    let seg_h = sc(SEGMENT_H);
+    let seg_h = sc(geometry.bar_thickness);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1;
@@ -3044,7 +3147,7 @@ fn draw_row(
         let mut label_rect = RECT {
             left: x,
             top: y,
-            right: x + sc(LABEL_WIDTH),
+            right: x + sc(geometry.label_width),
             bottom: y + seg_h,
         };
         let _ = DrawTextW(
@@ -3054,7 +3157,7 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x + sc(geometry.label_width) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -3066,8 +3169,10 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                geometry,
+                palette,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, geometry) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
@@ -3080,8 +3185,10 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                geometry,
+                palette,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, geometry) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
@@ -3094,15 +3201,31 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                geometry,
+                palette,
             );
         }
     }
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+fn model_usage_width(segment_count: i32, geometry: &settings::Geometry) -> i32 {
+    (sc(SEGMENT_W) + sc(geometry.spacing)) * segment_count - sc(geometry.spacing)
         + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
+        + sc(geometry.text_width)
+}
+
+/// Interpolates a bar-fill color from `stops` based on usage fraction `p` (0.0..=1.0):
+/// the lower half blends calm→attention, the upper half blends attention→critical.
+fn palette_color(stops: &settings::PaletteStops, p: f32) -> Color {
+    let p = p.clamp(0.0, 1.0);
+    let calm = stops.calm.to_color();
+    let attention = stops.attention.to_color();
+    let critical = stops.critical.to_color();
+    if p < 0.5 {
+        calm.lerp(&attention, p * 2.0)
+    } else {
+        attention.lerp(&critical, (p - 0.5) * 2.0)
+    }
 }
 
 fn draw_usage_bar(
@@ -3115,15 +3238,26 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    geometry: &settings::Geometry,
+    palette: Option<settings::PaletteStops>,
 ) {
     let seg_w = sc(SEGMENT_W);
-    let seg_h = sc(SEGMENT_H);
-    let seg_gap = sc(SEGMENT_GAP);
-    let corner_r = sc(CORNER_RADIUS);
+    let seg_h = sc(geometry.bar_thickness);
+    let seg_gap = sc(geometry.spacing);
+    let corner_r = sc(geometry.corner_radius);
 
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
         let segment_percent = 100.0 / segment_count as f64;
+
+        // Per-model bar fill: if a palette override is set, interpolate the fill color by
+        // this bar's overall usage fraction; otherwise keep the per-model accent passed in
+        // (today's exact behavior, since palette defaults to None).
+        let effective_accent: Color = match &palette {
+            Some(stops) => palette_color(stops, (percent_clamped / 100.0) as f32),
+            None => *accent,
+        };
+        let accent = &effective_accent;
 
         for i in 0..segment_count {
             let seg_x = bar_x + i * (seg_w + seg_gap);
@@ -3175,7 +3309,7 @@ fn draw_usage_bar(
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + sc(TEXT_WIDTH),
+            right: text_x + sc(geometry.text_width),
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
