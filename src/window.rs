@@ -14,12 +14,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::animation::AnimationClock;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, IDT_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK,
+    WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::settings;
@@ -297,6 +298,85 @@ fn lock_settings() -> MutexGuard<'static, Option<settings::Settings>> {
     SETTINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Global animation clock driving bar-fill, shimmer, alert-glow, and fade transitions for
+/// the embedded widget's layered render. Lazily constructed (from the live settings) on
+/// first use by `with_anim` so no explicit init call is needed at startup.
+static ANIM: Mutex<Option<AnimationClock>> = Mutex::new(None);
+
+/// Wall-clock timestamp of the previous `render_layered` animation tick. `None` both before
+/// the first tick and whenever the animation timer has been stopped (idle), so the next
+/// tick after a gap falls back to an assumed 16ms frame instead of a huge `dt`.
+static LAST_ANIM_TICK: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// One bar slot in the fixed draw-order contract shared by `set_targets` (feeding the
+/// clock) and `render_layered` (reading `frame.fill_pcts` back out). Index N in
+/// `ordered_bar_fracts`/`ordered_bar_slots` always refers to the same slot here, so the two
+/// call sites can never disagree about what a given index means.
+#[derive(Clone, Copy)]
+enum BarSlot {
+    ClaudeSession,
+    ClaudeWeekly,
+    CodexSession,
+    CodexWeekly,
+    AntigravitySession,
+    AntigravityWeekly,
+}
+
+/// The ordered list of bar slots for the currently shown model sections, in draw order:
+/// `[claude.session, claude.weekly, codex.session, codex.weekly, antigravity.session,
+/// antigravity.weekly]`, omitting any section whose `show_*` flag is off. This is the
+/// single source of truth for bar ordering -- both `ordered_bar_fracts` (used for
+/// `set_targets`) and `render_layered` (used to read `frame.fill_pcts` back for drawing)
+/// build their index off this same sequence.
+fn ordered_bar_slots(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> Vec<BarSlot> {
+    let mut slots = Vec::with_capacity(6);
+    if show_claude_code {
+        slots.push(BarSlot::ClaudeSession);
+        slots.push(BarSlot::ClaudeWeekly);
+    }
+    if show_codex {
+        slots.push(BarSlot::CodexSession);
+        slots.push(BarSlot::CodexWeekly);
+    }
+    if show_antigravity {
+        slots.push(BarSlot::AntigravitySession);
+        slots.push(BarSlot::AntigravityWeekly);
+    }
+    slots
+}
+
+/// The ordered list of bar fill fractions (0.0..=1.0) for the currently shown model
+/// sections, in the exact `ordered_bar_slots` order. Fed to `AnimationClock::set_targets`.
+fn ordered_bar_fracts(state: &AppState) -> Vec<f32> {
+    ordered_bar_slots(state.show_claude_code, state.show_codex, state.show_antigravity)
+        .into_iter()
+        .map(|slot| match slot {
+            BarSlot::ClaudeSession => (state.session_percent / 100.0) as f32,
+            BarSlot::ClaudeWeekly => (state.weekly_percent / 100.0) as f32,
+            BarSlot::CodexSession => (state.codex_session_percent / 100.0) as f32,
+            BarSlot::CodexWeekly => (state.codex_weekly_percent / 100.0) as f32,
+            BarSlot::AntigravitySession => (state.antigravity_session_percent / 100.0) as f32,
+            BarSlot::AntigravityWeekly => (state.antigravity_weekly_percent / 100.0) as f32,
+        })
+        .collect()
+}
+
+/// Run `f` against the global animation clock, lazily constructing it from the live
+/// settings on first use.
+fn with_anim<R>(f: impl FnOnce(&mut AnimationClock) -> R) -> R {
+    let mut guard = ANIM.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(AnimationClock::new(&current_settings().animation));
+    }
+    f(guard.as_mut().unwrap())
+}
+
+/// Re-apply the live animation settings (speeds/easing/thresholds/reduce-motion) to the
+/// running clock. Called whenever the settings window saves new animation preferences.
+fn anim_apply_settings() {
+    with_anim(|clock| clock.apply_settings(&current_settings().animation));
+}
+
 /// Store settings into the global without triggering a repaint. Used at startup and by
 /// `save_state_settings` (which must not recursively repaint mid-save).
 fn store_settings(s: settings::Settings) {
@@ -314,6 +394,7 @@ pub fn current_settings() -> settings::Settings {
 /// change is visible.
 pub fn set_settings(s: settings::Settings) {
     store_settings(s);
+    anim_apply_settings();
     render_layered();
 }
 
@@ -434,8 +515,12 @@ fn toggle_widget_visibility(hwnd: HWND) {
         if new_visible {
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            with_anim(|clock| clock.trigger_fade_in());
+            let _ = SetTimer(hwnd, IDT_ANIM, 16, None);
             render_layered();
         } else {
+            with_anim(|clock| clock.trigger_fade_out());
+            let _ = SetTimer(hwnd, IDT_ANIM, 16, None);
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
@@ -1309,6 +1394,8 @@ pub fn run() {
         position_at_taskbar();
         if settings.widget_visible {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            with_anim(|clock| clock.trigger_fade_in());
+            SetTimer(hwnd, IDT_ANIM, 16, None);
         }
         diagnose::log("window shown");
 
@@ -1388,6 +1475,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        bar_fracts,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1411,6 +1499,7 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                ordered_bar_fracts(s),
             ),
             None => return,
         }
@@ -1429,6 +1518,62 @@ fn render_layered() {
     // Read settings once per render; everything below uses `cfg` instead of re-locking
     // the global.
     let cfg = current_settings();
+
+    // --- Animation tick ---
+    // `dt` is measured against the previous tick; the first tick after a timer restart (or
+    // ever) has no previous sample, so it assumes one frame's worth (16ms) rather than a
+    // huge or zero delta.
+    let dt = {
+        let mut last = LAST_ANIM_TICK.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let dt = match *last {
+            Some(prev) => now.duration_since(prev),
+            None => Duration::from_millis(16),
+        };
+        *last = Some(now);
+        dt
+    };
+    let usage_max = bar_fracts.iter().cloned().fold(0.0f32, f32::max);
+    let (frame, anim_active) = with_anim(|clock| clock.tick(dt, usage_max));
+
+    // Map the animated fill fractions back onto each bar using the SAME ordered-slot
+    // sequence used to build `bar_fracts` / feed `set_targets`, so index N always refers to
+    // the same bar here as it did when the target was set. Falls back to the real
+    // (unanimated) percentage for any slot the frame doesn't have yet (e.g. before the
+    // first poll population).
+    let slots = ordered_bar_slots(show_claude_code, show_codex, show_antigravity);
+    let mut anim_session_pct = session_pct;
+    let mut anim_weekly_pct = weekly_pct;
+    let mut anim_codex_session_pct = codex_session_pct;
+    let mut anim_codex_weekly_pct = codex_weekly_pct;
+    let mut anim_antigravity_session_pct = antigravity_session_pct;
+    let mut anim_antigravity_weekly_pct = antigravity_weekly_pct;
+    for (i, slot) in slots.iter().enumerate() {
+        let Some(&frac) = frame.fill_pcts.get(i) else {
+            continue;
+        };
+        let pct = (frac as f64) * 100.0;
+        match slot {
+            BarSlot::ClaudeSession => anim_session_pct = pct,
+            BarSlot::ClaudeWeekly => anim_weekly_pct = pct,
+            BarSlot::CodexSession => anim_codex_session_pct = pct,
+            BarSlot::CodexWeekly => anim_codex_weekly_pct = pct,
+            BarSlot::AntigravitySession => anim_antigravity_session_pct = pct,
+            BarSlot::AntigravityWeekly => anim_antigravity_weekly_pct = pct,
+        }
+    }
+
+    // Shimmer/glow render params: `None` disables the effect entirely (either turned off
+    // in settings, or -- for glow -- not currently pulsing because no bar is over
+    // threshold).
+    let shimmer_fx = cfg
+        .animation
+        .shimmer
+        .on
+        .then_some((frame.shimmer_phase, cfg.animation.shimmer.intensity));
+    let glow_fx = (frame.glow_intensity > 0.0)
+        .then_some((cfg.animation.alert_glow.threshold, frame.glow_intensity));
+
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let width = total_widget_width_for(active_models, &cfg.geometry);
     let height = sc(cfg.geometry.height);
@@ -1490,6 +1635,8 @@ fn render_layered() {
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
+        // Fill widths animate (anim_*_pct); the text and segment count still reflect the
+        // real polled percentage (the *_text strings are untouched above).
         paint_content(
             mem_dc,
             width,
@@ -1500,17 +1647,17 @@ fn render_layered() {
             &accent,
             &track,
             strings,
-            session_pct,
+            anim_session_pct,
             &session_text,
-            weekly_pct,
+            anim_weekly_pct,
             &weekly_text,
-            codex_session_pct,
+            anim_codex_session_pct,
             &codex_session_text,
-            codex_weekly_pct,
+            anim_codex_weekly_pct,
             &codex_weekly_text,
-            antigravity_session_pct,
+            anim_antigravity_session_pct,
             &antigravity_session_text,
-            antigravity_weekly_pct,
+            anim_antigravity_weekly_pct,
             &antigravity_weekly_text,
             show_claude_code,
             show_codex,
@@ -1520,6 +1667,8 @@ fn render_layered() {
             &cfg.geometry,
             &cfg.typography,
             cfg.appearance.palette,
+            shimmer_fx,
+            glow_fx,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1535,10 +1684,11 @@ fn render_layered() {
             }
         }
 
-        // Apply the global opacity override on top of the alpha channel just assigned
-        // above. Default 1.0 leaves every pixel byte-for-byte unchanged (a * 1.0 rounds
-        // back to `a` exactly for every u8 value).
-        let opacity = cfg.appearance.opacity.clamp(0.0, 1.0);
+        // Apply the global opacity override together with the current fade (show/hide/
+        // update fade-in-out) alpha on top of the alpha channel just assigned above.
+        // Default opacity 1.0 * settled fade_alpha 1.0 leaves every pixel byte-for-byte
+        // unchanged (a * 1.0 rounds back to `a` exactly for every u8 value).
+        let opacity = cfg.appearance.opacity.clamp(0.0, 1.0) * frame.fade_alpha.clamp(0.0, 1.0);
         if opacity != 1.0 {
             for px in pixel_data.iter_mut() {
                 let a = (*px >> 24) as u8;
@@ -1579,6 +1729,16 @@ fn render_layered() {
         let _ = DeleteDC(mem_dc);
         ReleaseDC(hwnd, screen_dc);
     }
+
+    // The clock has nothing left to animate (fill settled, no shimmer/glow pulsing, fade
+    // complete): stop the timer so idle CPU returns to ~0% instead of repainting every
+    // 16ms forever, and clear the last-tick timestamp so the next kick starts clean.
+    if !anim_active {
+        unsafe {
+            let _ = KillTimer(hwnd, IDT_ANIM);
+        }
+        *LAST_ANIM_TICK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// Paint all widget content onto a DC with a given background color.
@@ -1612,6 +1772,11 @@ fn paint_content(
     geometry: &settings::Geometry,
     typography: &settings::Typography,
     palette: Option<settings::PaletteStops>,
+    // Animation overlays for the embedded/animated render path. `None` disables the effect
+    // entirely; the non-embedded fallback `paint()` passes `None` for both since it never
+    // animates.
+    shimmer: Option<(f32, f32)>, // (shimmer_phase 0..1, intensity 0..1)
+    glow: Option<(f32, f32)>,    // (alert_glow.threshold 0..1, glow_intensity 0..1)
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1726,8 +1891,11 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            bg,
             geometry,
             palette,
+            shimmer,
+            glow,
         );
         draw_row(
             hdc,
@@ -1749,8 +1917,11 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            bg,
             geometry,
             palette,
+            shimmer,
+            glow,
         );
 
         SelectObject(hdc, old_font);
@@ -2307,6 +2478,9 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                IDT_ANIM => {
+                    render_layered();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -2314,6 +2488,17 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            // Kick the fill animation toward the freshly-polled percentages and make sure
+            // the animation timer is running so the tween (and any shimmer/glow/fade still
+            // in flight) actually gets rendered.
+            let fresh_targets = {
+                let state = lock_state();
+                state.as_ref().map(ordered_bar_fracts)
+            };
+            if let Some(targets) = fresh_targets {
+                with_anim(|clock| clock.set_targets(&targets));
+                let _ = SetTimer(hwnd, IDT_ANIM, 16, None);
+            }
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -3088,6 +3273,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &cfg.geometry,
             &cfg.typography,
             cfg.appearance.palette,
+            None,
+            None,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3118,8 +3305,11 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    bg: &Color,
     geometry: &settings::Geometry,
     palette: Option<settings::PaletteStops>,
+    shimmer: Option<(f32, f32)>,
+    glow: Option<(f32, f32)>,
 ) {
     let seg_h = sc(geometry.bar_thickness);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
@@ -3168,9 +3358,12 @@ fn draw_row(
                 claude_text,
                 claude_accent,
                 track,
+                bg,
                 &claude_value_color,
                 geometry,
                 palette,
+                shimmer,
+                glow,
             );
             model_x += model_usage_width(segment_count, geometry) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3184,9 +3377,12 @@ fn draw_row(
                 codex_text,
                 codex_accent,
                 track,
+                bg,
                 &codex_value_color,
                 geometry,
                 palette,
+                shimmer,
+                glow,
             );
             model_x += model_usage_width(segment_count, geometry) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3200,9 +3396,12 @@ fn draw_row(
                 antigravity_text,
                 antigravity_accent,
                 track,
+                bg,
                 &antigravity_value_color,
                 geometry,
                 palette,
+                shimmer,
+                glow,
             );
         }
     }
@@ -3237,14 +3436,22 @@ fn draw_usage_bar(
     text: &str,
     accent: &Color,
     track: &Color,
+    bg: &Color,
     text_color: &Color,
     geometry: &settings::Geometry,
     palette: Option<settings::PaletteStops>,
+    // (shimmer_phase 0..1, intensity 0..1); `None` disables shimmer for this bar entirely.
+    shimmer: Option<(f32, f32)>,
+    // (alert_glow.threshold 0..1, glow_intensity 0..1); `None` disables glow for this bar.
+    // Even when `Some`, the halo only actually draws once this bar's own fraction reaches
+    // `threshold` -- `glow` being `Some` just means *some* bar in the widget is pulsing.
+    glow: Option<(f32, f32)>,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(geometry.bar_thickness);
     let seg_gap = sc(geometry.spacing);
     let corner_r = sc(geometry.corner_radius);
+    let total_w = segment_count * (seg_w + seg_gap) - seg_gap;
 
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
@@ -3258,6 +3465,27 @@ fn draw_usage_bar(
             None => *accent,
         };
         let accent = &effective_accent;
+
+        // --- Alert glow: a soft halo drawn BEHIND the bar so the (opaque) track/fill
+        // segments painted below cover its interior, leaving just a subtle tinted ring
+        // peeking out around the bar's edges. Only shown once this specific bar's own
+        // fraction reaches the threshold, even though `glow` is shared across the whole
+        // widget (it just signals "the clock is currently pulsing").
+        if let Some((threshold, glow_intensity)) = glow {
+            if glow_intensity > 0.0 && (percent_clamped / 100.0) as f32 >= threshold {
+                let pad = sc(3).max(1);
+                let halo_rect = RECT {
+                    left: bar_x - pad,
+                    top: y - pad,
+                    right: bar_x + total_w + pad,
+                    bottom: y + seg_h + pad,
+                };
+                // Blend mostly toward the background; only a sliver of accent shows through
+                // as the "glow" -- keeps it a soft wash rather than a hard colored box.
+                let halo_color = bg.lerp(accent, glow_intensity.clamp(0.0, 1.0) * 0.45);
+                draw_rounded_rect(hdc, &halo_rect, &halo_color, corner_r + pad);
+            }
+        }
 
         for i in 0..segment_count {
             let seg_x = bar_x + i * (seg_w + seg_gap);
@@ -3300,6 +3528,49 @@ fn draw_usage_bar(
                     let _ = DeleteObject(brush);
                     let _ = SelectClipRgn(hdc, HRGN::default());
                     let _ = DeleteObject(rgn);
+                }
+            }
+        }
+
+        // --- Shimmer: a thin, soft highlight band sweeping left-to-right across the
+        // FILLED portion only, clipped to the bar's rounded outline so it never pokes past
+        // the corners. Drawn as a lightened solid (not true alpha blending -- GDI has no
+        // cheap per-pixel alpha on this DC) so `intensity` controls how much it lightens
+        // toward white rather than true transparency; kept low by design for subtlety.
+        if let Some((phase, shimmer_intensity)) = shimmer {
+            if shimmer_intensity > 0.0 {
+                let fill_w = ((percent_clamped / 100.0) * total_w as f64).round() as i32;
+                if fill_w > 2 {
+                    let band_w = (total_w / 10).max(sc(4));
+                    let center = bar_x + (total_w as f32 * phase).round() as i32;
+                    let band_left = (center - band_w / 2).max(bar_x);
+                    let band_right = (center + band_w / 2).min(bar_x + fill_w);
+                    if band_right > band_left {
+                        let highlight = accent.lerp(
+                            &Color::from_hex("#FFFFFF"),
+                            shimmer_intensity.clamp(0.0, 1.0) * 0.35,
+                        );
+                        let clip_rgn = CreateRoundRectRgn(
+                            bar_x,
+                            y,
+                            bar_x + total_w + 1,
+                            y + seg_h + 1,
+                            corner_r * 2,
+                            corner_r * 2,
+                        );
+                        let _ = SelectClipRgn(hdc, clip_rgn);
+                        let band_rect = RECT {
+                            left: band_left,
+                            top: y,
+                            right: band_right,
+                            bottom: y + seg_h,
+                        };
+                        let brush = CreateSolidBrush(COLORREF(highlight.to_colorref()));
+                        FillRect(hdc, &band_rect, brush);
+                        let _ = DeleteObject(brush);
+                        let _ = SelectClipRgn(hdc, HRGN::default());
+                        let _ = DeleteObject(clip_rgn);
+                    }
                 }
             }
         }

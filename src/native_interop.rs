@@ -18,6 +18,10 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+/// Drives repaints while the animation clock has active work (fill/shimmer/glow/fade).
+/// Started when a render kicks off an animation and stopped once `AnimationClock::tick`
+/// reports `active == false`, so idle CPU returns to ~0%.
+pub const IDT_ANIM: usize = 0xA0;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
