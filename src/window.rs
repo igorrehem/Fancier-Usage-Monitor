@@ -1,9 +1,7 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -289,109 +287,25 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn settings_path() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata)
-        .join("ClaudeCodeUsageMonitor")
-        .join("settings.json")
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SettingsFile {
-    #[serde(default)]
-    tray_offset: i32,
-    #[serde(default)]
-    taskbar_index: usize,
-    #[serde(default = "default_poll_interval")]
-    poll_interval_ms: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_update_check_unix: Option<u64>,
-    #[serde(default = "default_widget_visible")]
-    widget_visible: bool,
-    #[serde(default = "default_show_claude_code")]
-    show_claude_code: bool,
-    #[serde(default = "default_show_codex")]
-    show_codex: bool,
-    #[serde(default = "default_show_antigravity")]
-    show_antigravity: bool,
-}
-
-impl Default for SettingsFile {
-    fn default() -> Self {
-        Self {
-            tray_offset: 0,
-            taskbar_index: 0,
-            poll_interval_ms: default_poll_interval(),
-            language: None,
-            last_update_check_unix: None,
-            widget_visible: true,
-            show_claude_code: true,
-            show_codex: false,
-            show_antigravity: false,
-        }
-    }
-}
-
-fn default_poll_interval() -> u32 {
-    POLL_15_MIN
-}
-
-fn default_widget_visible() -> bool {
-    true
-}
-
-fn default_show_claude_code() -> bool {
-    true
-}
-
-fn default_show_codex() -> bool {
-    false
-}
-
-fn default_show_antigravity() -> bool {
-    false
-}
-
-fn load_settings() -> SettingsFile {
-    let content = match std::fs::read_to_string(settings_path()) {
-        Ok(c) => c,
-        Err(_) => return SettingsFile::default(),
-    };
-    let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
-        settings.show_claude_code = true;
-    }
-    settings
-}
-
-fn save_settings(settings: &SettingsFile) {
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(path, json);
-    }
-}
-
 fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
-        save_settings(&SettingsFile {
-            tray_offset: s.tray_offset,
-            taskbar_index: s.taskbar_index,
-            poll_interval_ms: s.poll_interval_ms,
-            language: s
-                .language_override
-                .map(|language| language.code().to_string()),
-            last_update_check_unix: s.last_update_check_unix,
-            widget_visible: s.widget_visible,
-            show_claude_code: s.show_claude_code,
-            show_codex: s.show_codex,
-            show_antigravity: s.show_antigravity,
-        });
+        // Preserve appearance/typography/geometry/animation currently on disk: read current
+        // settings, overwrite only the state-derived fields, and save. This avoids clobbering
+        // sections this build doesn't manage yet.
+        let mut settings = crate::settings::load();
+        settings.tray_offset = s.tray_offset;
+        settings.taskbar_index = s.taskbar_index;
+        settings.poll_interval_ms = s.poll_interval_ms;
+        settings.language = s
+            .language_override
+            .map(|language| language.code().to_string());
+        settings.last_update_check_unix = s.last_update_check_unix;
+        settings.widget_visible = s.widget_visible;
+        settings.show_claude_code = s.show_claude_code;
+        settings.show_codex = s.show_codex;
+        settings.show_antigravity = s.show_antigravity;
+        crate::settings::save(&settings);
     }
 }
 
@@ -1233,7 +1147,7 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let settings = load_settings();
+        let settings = crate::settings::load();
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
