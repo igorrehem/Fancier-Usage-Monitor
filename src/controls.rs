@@ -4,7 +4,7 @@
 //! settings window (Tasks 11-15) composes these into sections; nothing here depends on
 //! `window.rs`/`settings.rs`/`animation.rs`.
 
-use windows::Win32::Foundation::{COLORREF, RECT};
+use windows::Win32::Foundation::{COLORREF, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
 
@@ -455,6 +455,313 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
     }
 }
 
+/// `EnumFontFamiliesExW` callback: appends the enumerated family name to the `Vec<String>`
+/// pointed to by `lparam` (set up by `enumerate_font_families`). Skips the empty name (can
+/// occur for degenerate font entries) and names starting with `@`, which are Windows'
+/// vertical-writing variants of an East Asian family (e.g. "@MS Gothic") — cosmetic
+/// duplicates of the base family, not distinct fonts a user would pick by name. Returning `1`
+/// tells GDI to keep enumerating.
+unsafe extern "system" fn enum_font_families_callback(
+    lplf: *const LOGFONTW,
+    _lptm: *const TEXTMETRICW,
+    _font_type: u32,
+    lparam: LPARAM,
+) -> i32 {
+    if lplf.is_null() {
+        return 1;
+    }
+    let logfont = &*lplf;
+    let name_len = logfont
+        .lfFaceName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(logfont.lfFaceName.len());
+    let name = String::from_utf16_lossy(&logfont.lfFaceName[..name_len]);
+    if !name.is_empty() && !name.starts_with('@') {
+        let families = &mut *(lparam.0 as *mut Vec<String>);
+        families.push(name);
+    }
+    1
+}
+
+/// Enumerates installed font family names via `EnumFontFamiliesExW`, returning them sorted
+/// and deduplicated. Uses an empty `lfFaceName` + `DEFAULT_CHARSET` in the query `LOGFONTW`,
+/// which asks GDI to enumerate one entry per distinct family name (across all charsets)
+/// rather than every style/charset variant of a single family.
+#[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+pub fn enumerate_font_families() -> Vec<String> {
+    let mut families: Vec<String> = Vec::new();
+    unsafe {
+        let hdc = GetDC(None);
+        let logfont = LOGFONTW {
+            lfCharSet: DEFAULT_CHARSET,
+            ..Default::default()
+        };
+        let _ = EnumFontFamiliesExW(
+            hdc,
+            &logfont,
+            Some(enum_font_families_callback),
+            LPARAM(&mut families as *mut Vec<String> as isize),
+            0,
+        );
+        ReleaseDC(None, hdc);
+    }
+    families.sort();
+    families.dedup();
+    families
+}
+
+/// Layout constants for `Dropdown`'s open list: each row's height, the maximum number of
+/// rows shown at once before the list scrolls, and text padding shared with the closed row.
+const DROPDOWN_ROW_HEIGHT: i32 = 24;
+const DROPDOWN_MAX_VISIBLE: usize = 6;
+const DROPDOWN_TEXT_PAD: i32 = 8;
+/// Width reserved on the right of the closed row for the open/close arrow glyph.
+const DROPDOWN_ARROW_ZONE: i32 = 18;
+
+/// A closed-by-default combobox: the closed row shows `items[selected]` plus an arrow
+/// glyph; clicking it opens a scrollable list of all `items` drawn directly below the
+/// closed row. Clicking an item selects it, closes the list, and emits `Changed`. Clicking
+/// the closed row again while open collapses it, and clicking anywhere else (outside both
+/// the closed row and the open list) also dismisses it, without changing `selected` — the
+/// brief doesn't fully specify outside-click behavior; this follows the standard
+/// combobox/`<select>` convention of treating an outside click as "cancel", not "commit".
+///
+/// Note for the settings window wiring (Tasks 11-15): while open, the interactive area
+/// extends below `rect` (see `list_rect`) — clicks landing there must still be routed to
+/// this control's `on_mouse` with the *closed* row's `rect`, not just clicks within `rect`
+/// itself.
+#[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+pub struct Dropdown {
+    pub items: Vec<String>,
+    pub selected: usize,
+    open: bool,
+    /// Index of the first item currently visible in the open list.
+    scroll: usize,
+}
+
+impl Dropdown {
+    #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+    pub fn new(items: Vec<String>, selected: usize) -> Self {
+        let selected = if items.is_empty() {
+            0
+        } else {
+            selected.min(items.len() - 1)
+        };
+        Self {
+            items,
+            selected,
+            open: false,
+            scroll: 0,
+        }
+    }
+
+    /// How many rows the open list shows at once (never more than the item count).
+    fn visible_count(&self) -> usize {
+        self.items.len().min(DROPDOWN_MAX_VISIBLE)
+    }
+
+    /// The largest valid `scroll` value: any further would leave blank rows at the bottom.
+    fn max_scroll(&self) -> usize {
+        self.items.len().saturating_sub(self.visible_count())
+    }
+
+    /// Adjusts `scroll` so `selected` falls within the visible window; called on open so
+    /// the current selection is always in view.
+    fn scroll_to_selected(&mut self) {
+        let visible = self.visible_count();
+        if visible == 0 {
+            self.scroll = 0;
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The open list's rect: directly below the closed `rect`, spanning its width, with
+    /// height sized to the number of currently visible rows (zero when there are no items).
+    fn list_rect(&self, rect: RECT) -> RECT {
+        let height = DROPDOWN_ROW_HEIGHT * self.visible_count() as i32;
+        RECT {
+            left: rect.left,
+            top: rect.bottom,
+            right: rect.right,
+            bottom: rect.bottom + height,
+        }
+    }
+
+    /// The rect of the visible row at `visible_idx` (0-based within the current scroll
+    /// window), relative to the open list computed from the closed `rect`.
+    fn row_rect(&self, rect: RECT, visible_idx: usize) -> RECT {
+        let list = self.list_rect(rect);
+        let top = list.top + DROPDOWN_ROW_HEIGHT * visible_idx as i32;
+        RECT {
+            left: list.left,
+            top,
+            right: list.right,
+            bottom: top + DROPDOWN_ROW_HEIGHT,
+        }
+    }
+
+    /// Whether client point `(x, y)` falls within `r` using half-open bounds (`[left,
+    /// right)` x `[top, bottom)`), so adjacent rects (e.g. the closed row and the open list
+    /// starting exactly at its bottom edge) never both claim the same point.
+    fn point_in(&self, x: i32, y: i32, r: RECT) -> bool {
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    }
+
+    /// Maps a client point to an item index in the open list, accounting for `scroll`.
+    /// Returns `None` when `(x, y)` falls outside the list's horizontal or vertical bounds
+    /// (including below the last visible row).
+    fn item_at(&self, x: i32, y: i32, rect: RECT) -> Option<usize> {
+        let list = self.list_rect(rect);
+        if !self.point_in(x, y, list) {
+            return None;
+        }
+        let visible_idx = ((y - list.top) / DROPDOWN_ROW_HEIGHT) as usize;
+        let idx = self.scroll + visible_idx;
+        if idx < self.items.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+}
+
+impl Control for Dropdown {
+    fn draw(&self, hdc: HDC, rect: RECT, dark: bool) {
+        unsafe {
+            let bg = if dark {
+                Color::new(0x33, 0x33, 0x33)
+            } else {
+                Color::new(0xff, 0xff, 0xff)
+            };
+            let border = if dark {
+                Color::new(0x55, 0x55, 0x55)
+            } else {
+                Color::new(0xc0, 0xc0, 0xc0)
+            };
+            let text_color = if dark {
+                Color::new(0xf0, 0xf0, 0xf0)
+            } else {
+                Color::new(0x20, 0x20, 0x20)
+            };
+            let highlight = Color::new(0xd9, 0x77, 0x57);
+
+            draw_rounded_rect(hdc, &rect, &border, 4);
+            let inset_rect = RECT {
+                left: rect.left + 1,
+                top: rect.top + 1,
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+            };
+            draw_rounded_rect(hdc, &inset_rect, &bg, 4);
+
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+
+            let label = self
+                .items
+                .get(self.selected)
+                .map(String::as_str)
+                .unwrap_or("");
+            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+            let mut label_rect = RECT {
+                left: rect.left + DROPDOWN_TEXT_PAD,
+                top: rect.top,
+                right: rect.right - DROPDOWN_ARROW_ZONE,
+                bottom: rect.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut label_wide,
+                &mut label_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+
+            let arrow = if self.open { "\u{25B2}" } else { "\u{25BC}" };
+            let mut arrow_wide: Vec<u16> = arrow.encode_utf16().collect();
+            let mut arrow_rect = RECT {
+                left: rect.right - DROPDOWN_ARROW_ZONE,
+                top: rect.top,
+                right: rect.right - DROPDOWN_TEXT_PAD / 2,
+                bottom: rect.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut arrow_wide,
+                &mut arrow_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+
+            if self.open && !self.items.is_empty() {
+                let list = self.list_rect(rect);
+                draw_rounded_rect(hdc, &list, &border, 4);
+                let inset_list = RECT {
+                    left: list.left + 1,
+                    top: list.top,
+                    right: list.right - 1,
+                    bottom: list.bottom - 1,
+                };
+                draw_rounded_rect(hdc, &inset_list, &bg, 4);
+
+                for visible_idx in 0..self.visible_count() {
+                    let idx = self.scroll + visible_idx;
+                    let row = self.row_rect(rect, visible_idx);
+                    if idx == self.selected {
+                        fill_rect(hdc, &row, &highlight);
+                    }
+                    let mut item_wide: Vec<u16> = self.items[idx].encode_utf16().collect();
+                    let mut item_rect = RECT {
+                        left: row.left + DROPDOWN_TEXT_PAD,
+                        top: row.top,
+                        right: row.right - DROPDOWN_TEXT_PAD,
+                        bottom: row.bottom,
+                    };
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut item_wide,
+                        &mut item_rect,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_mouse(&mut self, msg: u32, x: i32, y: i32, rect: RECT) -> Option<ControlEvent> {
+        if msg != WM_LBUTTONDOWN || self.items.is_empty() {
+            return None;
+        }
+        if self.open {
+            if self.point_in(x, y, rect) {
+                // Click on the closed row while open: collapse without changing selection.
+                self.open = false;
+                return None;
+            }
+            if let Some(idx) = self.item_at(x, y, rect) {
+                self.selected = idx;
+                self.open = false;
+                return Some(ControlEvent::Changed);
+            }
+            // Outside both the closed row and the open list: dismiss, no value change (see
+            // struct doc comment for the outside-click interpretation).
+            self.open = false;
+            None
+        } else if self.point_in(x, y, rect) {
+            self.open = true;
+            self.scroll_to_selected();
+            None
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +835,182 @@ mod tests {
         assert!(event.is_none());
         assert_eq!(picker.value.r, 200);
         assert!(picker.active.is_none());
+    }
+
+    fn dropdown_items(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("Item {i}")).collect()
+    }
+
+    #[test]
+    fn dropdown_item_at_accounts_for_scroll_offset() {
+        // 10 items, only 6 visible at a time (DROPDOWN_MAX_VISIBLE), scrolled so item 3 is
+        // the first visible row.
+        let dropdown = Dropdown {
+            items: dropdown_items(10),
+            selected: 0,
+            open: true,
+            scroll: 3,
+        };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 24,
+        };
+        let list = dropdown.list_rect(rect);
+
+        // First visible row maps to item (scroll + 0) = 3, not 0.
+        let mid_row0_y = list.top + DROPDOWN_ROW_HEIGHT / 2;
+        assert_eq!(dropdown.item_at(100, mid_row0_y, rect), Some(3));
+
+        // Last visible row (index 5) maps to item 3 + 5 = 8.
+        let mid_last_row_y = list.top + DROPDOWN_ROW_HEIGHT * 5 + DROPDOWN_ROW_HEIGHT / 2;
+        assert_eq!(dropdown.item_at(100, mid_last_row_y, rect), Some(8));
+
+        // Exactly at the list's bottom edge (one pixel past the last visible row) is
+        // outside the half-open list rect -> None, not an out-of-range item index.
+        assert_eq!(dropdown.item_at(100, list.bottom, rect), None);
+
+        // Outside the horizontal bounds is also None even at a valid row's y.
+        assert_eq!(dropdown.item_at(-5, mid_row0_y, rect), None);
+        assert_eq!(dropdown.item_at(500, mid_row0_y, rect), None);
+
+        // Above the list (still within the closed row's y-range) is None.
+        assert_eq!(dropdown.item_at(100, 0, rect), None);
+    }
+
+    #[test]
+    fn dropdown_item_at_clamps_when_scroll_leaves_partial_last_page() {
+        // 7 items, 6 visible max -> max_scroll is 1. With scroll at the max, the visible
+        // window is items [1..7), so the last visible row (index 5) is item 6, and there is
+        // no item 7 to click even though the row slot exists.
+        let dropdown = Dropdown {
+            items: dropdown_items(7),
+            selected: 0,
+            open: true,
+            scroll: 1,
+        };
+        assert_eq!(dropdown.max_scroll(), 1);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 24,
+        };
+        let list = dropdown.list_rect(rect);
+        let last_row_mid_y = list.top + DROPDOWN_ROW_HEIGHT * 5 + DROPDOWN_ROW_HEIGHT / 2;
+        assert_eq!(dropdown.item_at(100, last_row_mid_y, rect), Some(6));
+    }
+
+    #[test]
+    fn dropdown_scroll_to_selected_keeps_selection_in_view() {
+        let mut dropdown = Dropdown::new(dropdown_items(20), 15);
+        dropdown.scroll_to_selected();
+        let visible = dropdown.visible_count();
+        assert!(dropdown.selected >= dropdown.scroll);
+        assert!(dropdown.selected < dropdown.scroll + visible);
+        assert!(dropdown.scroll <= dropdown.max_scroll());
+    }
+
+    #[test]
+    fn dropdown_click_opens_then_click_item_selects_and_closes() {
+        let mut dropdown = Dropdown::new(dropdown_items(10), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 24,
+        };
+
+        // Click the closed row: opens, no value change.
+        let event = dropdown.on_mouse(WM_LBUTTONDOWN, 50, 12, rect);
+        assert!(event.is_none());
+        assert!(dropdown.open);
+
+        // Click the 3rd visible row (index 2) in the open list: selects it, closes, and
+        // reports Changed.
+        let list = dropdown.list_rect(rect);
+        let row2_mid_y = list.top + DROPDOWN_ROW_HEIGHT * 2 + DROPDOWN_ROW_HEIGHT / 2;
+        let event = dropdown.on_mouse(WM_LBUTTONDOWN, 50, row2_mid_y, rect);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert_eq!(dropdown.selected, 2);
+        assert!(!dropdown.open);
+    }
+
+    #[test]
+    fn dropdown_click_outside_open_list_closes_without_changing_selection() {
+        let mut dropdown = Dropdown::new(dropdown_items(10), 4);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 24,
+        };
+        dropdown.on_mouse(WM_LBUTTONDOWN, 50, 12, rect); // open it
+        assert!(dropdown.open);
+
+        // Click far below the open list: outside both the closed row and the list.
+        let list = dropdown.list_rect(rect);
+        let event = dropdown.on_mouse(WM_LBUTTONDOWN, 50, list.bottom + 100, rect);
+        assert!(event.is_none());
+        assert!(!dropdown.open);
+        assert_eq!(dropdown.selected, 4);
+    }
+
+    #[test]
+    fn dropdown_click_closed_row_while_open_collapses_without_change() {
+        let mut dropdown = Dropdown::new(dropdown_items(10), 4);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 24,
+        };
+        dropdown.on_mouse(WM_LBUTTONDOWN, 50, 12, rect); // open it
+        assert!(dropdown.open);
+
+        let event = dropdown.on_mouse(WM_LBUTTONDOWN, 50, 12, rect); // click closed row again
+        assert!(event.is_none());
+        assert!(!dropdown.open);
+        assert_eq!(dropdown.selected, 4);
+    }
+
+    #[test]
+    fn dropdown_ignores_clicks_when_no_items() {
+        let mut dropdown = Dropdown::new(Vec::new(), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 24,
+        };
+        let event = dropdown.on_mouse(WM_LBUTTONDOWN, 50, 12, rect);
+        assert!(event.is_none());
+        assert!(!dropdown.open);
+    }
+
+    // No TDD test drives `enumerate_font_families` itself (per the task brief: it's a system
+    // API with no meaningful pure-logic seam, and the real result depends on whatever fonts
+    // are installed on the machine running the test). This is an ignored sanity check for
+    // manual verification (`cargo test controls -- --ignored --nocapture`), not part of the
+    // normal `cargo test` run.
+    #[test]
+    #[ignore]
+    fn enumerate_font_families_is_nonempty_sorted_and_deduped() {
+        let families = enumerate_font_families();
+        println!("enumerated {} font families", families.len());
+        assert!(
+            !families.is_empty(),
+            "expected at least one installed font family"
+        );
+        let mut sorted = families.clone();
+        sorted.sort();
+        assert_eq!(families, sorted, "expected result to already be sorted");
+        let mut deduped = families.clone();
+        deduped.dedup();
+        assert_eq!(
+            families, deduped,
+            "expected result to contain no duplicates"
+        );
     }
 }
