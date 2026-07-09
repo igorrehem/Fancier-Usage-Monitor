@@ -762,6 +762,233 @@ impl Control for Dropdown {
     }
 }
 
+/// Horizontal gap, in pixels, between adjacent segment pills in a `Segmented` control.
+const SEGMENTED_GAP: i32 = 2;
+
+/// A row of equal-width "pill" buttons, one per `options` entry, with `selected` drawn
+/// highlighted. Clicking a pill (other than the one already selected) selects it and
+/// emits `Changed`; clicking the already-selected pill is a no-op (nothing changed).
+#[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+pub struct Segmented {
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
+impl Segmented {
+    #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+    pub fn new(options: Vec<String>, selected: usize) -> Self {
+        let selected = if options.is_empty() {
+            0
+        } else {
+            selected.min(options.len() - 1)
+        };
+        Self { options, selected }
+    }
+
+    /// The rect of segment `index` within `rect`: `rect`'s width divided evenly into
+    /// `options.len()` columns, with a `SEGMENTED_GAP`-wide gap between adjacent segments
+    /// (the gap is carved out of each segment's own width, not added on top, so the row of
+    /// segments still exactly spans `rect`). The last segment absorbs any leftover width
+    /// from integer division, matching `RgbaPicker::row_rect`'s convention.
+    fn segment_rect(&self, index: usize, rect: RECT) -> RECT {
+        let n = self.options.len().max(1) as i32;
+        let width = (rect.right - rect.left).max(1);
+        let col_w = width / n;
+        let left = rect.left + col_w * index as i32;
+        let right = if index as i32 == n - 1 {
+            rect.right
+        } else {
+            left + col_w
+        };
+        let gap = SEGMENTED_GAP.min((right - left) / 2).max(0);
+        RECT {
+            left: left + if index == 0 { 0 } else { gap },
+            top: rect.top,
+            right: right - if index as i32 == n - 1 { 0 } else { gap },
+            bottom: rect.bottom,
+        }
+    }
+
+    /// Which option index (if any) contains client point `(x, y)`, using half-open bounds
+    /// per-column (`[col.left, col.left + col_w)` horizontally, matching the `Dropdown`
+    /// convention) so that a click exactly on a shared boundary resolves to exactly one
+    /// segment, and a click above/below `rect` (or when there are no options) resolves to
+    /// `None`.
+    fn option_at(&self, x: i32, y: i32, rect: RECT) -> Option<usize> {
+        if self.options.is_empty() || y < rect.top || y >= rect.bottom {
+            return None;
+        }
+        let n = self.options.len().max(1) as i32;
+        let width = (rect.right - rect.left).max(1);
+        let col_w = (width / n).max(1);
+        if x < rect.left || x >= rect.right {
+            return None;
+        }
+        let idx = ((x - rect.left) / col_w).clamp(0, n - 1);
+        Some(idx as usize)
+    }
+}
+
+impl Control for Segmented {
+    fn draw(&self, hdc: HDC, rect: RECT, dark: bool) {
+        unsafe {
+            let bg = if dark {
+                Color::new(0x33, 0x33, 0x33)
+            } else {
+                Color::new(0xe8, 0xe8, 0xe8)
+            };
+            let selected_bg = Color::new(0xd9, 0x77, 0x57);
+            let text_color = if dark {
+                Color::new(0xf0, 0xf0, 0xf0)
+            } else {
+                Color::new(0x20, 0x20, 0x20)
+            };
+            let selected_text = Color::new(0xff, 0xff, 0xff);
+
+            let _ = SetBkMode(hdc, TRANSPARENT);
+
+            let radius = ((rect.bottom - rect.top).max(1) / 2).min(8);
+            for (i, option) in self.options.iter().enumerate() {
+                let seg = self.segment_rect(i, rect);
+                let (fill, text) = if i == self.selected {
+                    (&selected_bg, selected_text)
+                } else {
+                    (&bg, text_color)
+                };
+                draw_rounded_rect(hdc, &seg, fill, radius);
+
+                let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
+                let mut label_wide: Vec<u16> = option.encode_utf16().collect();
+                let mut label_rect = seg;
+                let _ = DrawTextW(
+                    hdc,
+                    &mut label_wide,
+                    &mut label_rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
+        }
+    }
+
+    fn on_mouse(&mut self, msg: u32, x: i32, y: i32, rect: RECT) -> Option<ControlEvent> {
+        if msg != WM_LBUTTONDOWN {
+            return None;
+        }
+        let idx = self.option_at(x, y, rect)?;
+        if idx == self.selected {
+            return None;
+        }
+        self.selected = idx;
+        Some(ControlEvent::Changed)
+    }
+}
+
+/// Layout constants for `Toggle`'s pill switch: overall track size and the padding between
+/// the track's edge and the knob circle.
+const TOGGLE_TRACK_W: i32 = 36;
+const TOGGLE_TRACK_H: i32 = 18;
+const TOGGLE_KNOB_PAD: i32 = 2;
+
+/// A simple on/off switch drawn as a pill-shaped track with a circular knob at the left
+/// (off) or right (on) end. Clicking anywhere in `rect` flips `on` and emits `Changed`.
+#[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+pub struct Toggle {
+    pub on: bool,
+}
+
+impl Toggle {
+    #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
+    pub fn new(on: bool) -> Self {
+        Self { on }
+    }
+
+    /// The track rect: a `TOGGLE_TRACK_W` x `TOGGLE_TRACK_H` pill vertically centered
+    /// within `rect` and anchored to `rect`'s left edge (matching `RgbaPicker::swatch_rect`'s
+    /// left-anchored, height-clamped convention), shrunk to fit if `rect` is smaller than
+    /// the nominal track size.
+    fn track_rect(&self, rect: RECT) -> RECT {
+        let avail_h = (rect.bottom - rect.top).max(1);
+        let avail_w = (rect.right - rect.left).max(1);
+        let h = TOGGLE_TRACK_H.min(avail_h);
+        let w = TOGGLE_TRACK_W.min(avail_w).max(h); // never narrower than it is tall
+        let top = rect.top + (avail_h - h) / 2;
+        RECT {
+            left: rect.left,
+            top,
+            right: rect.left + w,
+            bottom: top + h,
+        }
+    }
+
+    /// The knob's bounding rect within `track`: a circle inset by `TOGGLE_KNOB_PAD`, flush
+    /// with the track's left edge when off and its right edge when on.
+    fn knob_rect(&self, track: RECT) -> RECT {
+        let h = (track.bottom - track.top).max(1);
+        let d = (h - TOGGLE_KNOB_PAD * 2).max(1);
+        let left = if self.on {
+            track.right - TOGGLE_KNOB_PAD - d
+        } else {
+            track.left + TOGGLE_KNOB_PAD
+        };
+        RECT {
+            left,
+            top: track.top + TOGGLE_KNOB_PAD,
+            right: left + d,
+            bottom: track.top + TOGGLE_KNOB_PAD + d,
+        }
+    }
+}
+
+impl Control for Toggle {
+    fn draw(&self, hdc: HDC, rect: RECT, dark: bool) {
+        unsafe {
+            let track = self.track_rect(rect);
+            let track_color = if self.on {
+                Color::new(0xd9, 0x77, 0x57)
+            } else if dark {
+                Color::new(0x4a, 0x4a, 0x4a)
+            } else {
+                Color::new(0xd4, 0xd4, 0xd4)
+            };
+            let knob_color = if dark {
+                Color::new(0xf0, 0xf0, 0xf0)
+            } else {
+                Color::new(0xff, 0xff, 0xff)
+            };
+            let knob_border = if dark {
+                Color::new(0x20, 0x20, 0x20)
+            } else {
+                Color::new(0xa0, 0xa0, 0xa0)
+            };
+
+            draw_rounded_rect(hdc, &track, &track_color, (track.bottom - track.top) / 2);
+
+            let knob = self.knob_rect(track);
+            let brush = CreateSolidBrush(COLORREF(knob_color.to_colorref()));
+            let pen = CreatePen(PS_SOLID, 1, COLORREF(knob_border.to_colorref()));
+            let old_brush = SelectObject(hdc, brush);
+            let old_pen = SelectObject(hdc, pen);
+            let _ = Ellipse(hdc, knob.left, knob.top, knob.right, knob.bottom);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(brush);
+            let _ = DeleteObject(pen);
+        }
+    }
+
+    fn on_mouse(&mut self, msg: u32, x: i32, y: i32, rect: RECT) -> Option<ControlEvent> {
+        if msg != WM_LBUTTONDOWN {
+            return None;
+        }
+        if x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom {
+            self.on = !self.on;
+            Some(ControlEvent::Changed)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,5 +1239,150 @@ mod tests {
             families, deduped,
             "expected result to contain no duplicates"
         );
+    }
+
+    fn segmented_options(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("Opt{i}")).collect()
+    }
+
+    #[test]
+    fn segmented_option_at_splits_evenly_and_resolves_boundaries() {
+        // 3 options over a 300px-wide rect: even columns [0,100) [100,200) [200,300).
+        let seg = Segmented::new(segmented_options(3), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 24,
+        };
+        let y = 12;
+
+        // Interior of each column.
+        assert_eq!(seg.option_at(50, y, rect), Some(0));
+        assert_eq!(seg.option_at(150, y, rect), Some(1));
+        assert_eq!(seg.option_at(250, y, rect), Some(2));
+
+        // Exactly on a shared boundary: half-open bounds mean it belongs to the segment
+        // starting there, not the one ending there.
+        assert_eq!(seg.option_at(100, y, rect), Some(1));
+        assert_eq!(seg.option_at(200, y, rect), Some(2));
+
+        // Leftmost pixel and rightmost valid pixel (right edge is exclusive).
+        assert_eq!(seg.option_at(0, y, rect), Some(0));
+        assert_eq!(seg.option_at(299, y, rect), Some(2));
+        assert_eq!(seg.option_at(300, y, rect), None);
+        assert_eq!(seg.option_at(-1, y, rect), None);
+
+        // Outside the vertical bounds (half-open: bottom is exclusive) is also None.
+        assert_eq!(seg.option_at(50, rect.top - 1, rect), None);
+        assert_eq!(seg.option_at(50, rect.bottom, rect), None);
+    }
+
+    #[test]
+    fn segmented_option_at_last_segment_absorbs_uneven_remainder() {
+        // 3 options over a 301px-wide rect: 301 / 3 = 100 (integer division), so the last
+        // column must still resolve up to rect.right - 1 (300), not fall off after 299.
+        let seg = Segmented::new(segmented_options(3), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 301,
+            bottom: 24,
+        };
+        assert_eq!(seg.option_at(300, 12, rect), Some(2));
+        assert_eq!(seg.option_at(199, 12, rect), Some(1));
+        assert_eq!(seg.option_at(200, 12, rect), Some(2));
+    }
+
+    #[test]
+    fn segmented_click_selects_and_emits_changed() {
+        let mut seg = Segmented::new(segmented_options(3), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 24,
+        };
+        let event = seg.on_mouse(WM_LBUTTONDOWN, 250, 12, rect);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert_eq!(seg.selected, 2);
+    }
+
+    #[test]
+    fn segmented_click_on_already_selected_option_is_a_no_op() {
+        let mut seg = Segmented::new(segmented_options(3), 1);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 24,
+        };
+        let event = seg.on_mouse(WM_LBUTTONDOWN, 150, 12, rect);
+        assert!(event.is_none());
+        assert_eq!(seg.selected, 1);
+    }
+
+    #[test]
+    fn segmented_ignores_clicks_when_no_options() {
+        let mut seg = Segmented::new(Vec::new(), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 24,
+        };
+        let event = seg.on_mouse(WM_LBUTTONDOWN, 150, 12, rect);
+        assert!(event.is_none());
+        assert_eq!(seg.selected, 0);
+    }
+
+    #[test]
+    fn toggle_click_flips_state_and_emits_changed() {
+        let mut toggle = Toggle::new(false);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 36,
+            bottom: 18,
+        };
+        let event = toggle.on_mouse(WM_LBUTTONDOWN, 10, 9, rect);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(toggle.on);
+
+        let event = toggle.on_mouse(WM_LBUTTONDOWN, 10, 9, rect);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(!toggle.on);
+    }
+
+    #[test]
+    fn toggle_ignores_clicks_outside_rect() {
+        let mut toggle = Toggle::new(false);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 36,
+            bottom: 18,
+        };
+        assert!(toggle.on_mouse(WM_LBUTTONDOWN, 36, 9, rect).is_none());
+        assert!(toggle.on_mouse(WM_LBUTTONDOWN, -1, 9, rect).is_none());
+        assert!(toggle.on_mouse(WM_LBUTTONDOWN, 10, 18, rect).is_none());
+        assert!(!toggle.on);
+    }
+
+    #[test]
+    fn toggle_knob_moves_from_left_to_right_edge_when_on() {
+        let track = RECT {
+            left: 0,
+            top: 0,
+            right: 36,
+            bottom: 18,
+        };
+        let off = Toggle::new(false);
+        let on = Toggle::new(true);
+        let off_knob = off.knob_rect(track);
+        let on_knob = on.knob_rect(track);
+        assert_eq!(off_knob.left, TOGGLE_KNOB_PAD);
+        assert_eq!(on_knob.right, track.right - TOGGLE_KNOB_PAD);
+        assert!(on_knob.left > off_knob.left);
     }
 }
