@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod animation;
+mod config_window;
 mod controls;
 mod diagnose;
 mod localization;
