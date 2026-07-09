@@ -212,9 +212,12 @@ impl RgbaPicker {
     }
 
     /// The swatch rect: a square anchored at the control's top-left, clamped so it never
-    /// takes up more than half the control's height.
+    /// takes up more than half the control's height (the usual 12px floor only applies
+    /// when half the height is at least that big, so a very short control still shrinks
+    /// the swatch instead of overflowing it).
     fn swatch_rect(&self, rect: RECT) -> RECT {
-        let size = SWATCH_SIZE.min(((rect.bottom - rect.top) / 2).max(1)).max(12);
+        let half_h = ((rect.bottom - rect.top) / 2).max(1);
+        let size = SWATCH_SIZE.min(half_h).max(12.min(half_h));
         RECT {
             left: rect.left,
             top: rect.top,
@@ -254,8 +257,15 @@ impl RgbaPicker {
         }
     }
 
-    /// Which channel row (if any) contains client-y `y`.
-    fn row_at(&self, y: i32, rect: RECT) -> Option<usize> {
+    /// Which channel row (if any) contains client point `(x, y)`. Returns `None` both when
+    /// `y` falls outside the rows area and when `x` falls within the row's label column
+    /// (`row.left .. row.left + LABEL_WIDTH`) — a click on the label text must not be
+    /// dispatched to the channel's slider (it would otherwise snap that channel to 0, since
+    /// `Slider::pos_to_value` clamps any `x` left of the sub-slider's rect to its minimum).
+    fn row_at(&self, x: i32, y: i32, rect: RECT) -> Option<usize> {
+        if x < rect.left + LABEL_WIDTH {
+            return None;
+        }
         let top0 = self.rows_top(rect);
         if y < top0 || y > rect.bottom {
             return None;
@@ -348,7 +358,7 @@ impl Control for RgbaPicker {
     fn on_mouse(&mut self, msg: u32, x: i32, y: i32, rect: RECT) -> Option<ControlEvent> {
         match msg {
             WM_LBUTTONDOWN => {
-                let idx = self.row_at(y, rect)?;
+                let idx = self.row_at(x, y, rect)?;
                 self.active = Some(idx);
                 let sub_rect = self.slider_rect(idx, rect);
                 let event = self.slider_mut(idx).on_mouse(msg, x, y, sub_rect);
@@ -466,5 +476,57 @@ mod tests {
         assert_eq!(s.pos_to_value(60, r).round(), 50.0);
         assert_eq!(s.pos_to_value(-999, r), 0.0);
         assert_eq!(s.pos_to_value(9999, r), 100.0);
+    }
+
+    #[test]
+    fn row_at_rejects_label_column_clicks() {
+        let picker = RgbaPicker::new(Rgba {
+            r: 200,
+            g: 150,
+            b: 100,
+            a: 255,
+        });
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 120,
+        };
+        let row0 = picker.row_rect(0, rect);
+        let y = (row0.top + row0.bottom) / 2;
+
+        // A click anywhere in the label column (x < row.left + LABEL_WIDTH) must not
+        // resolve to a row, regardless of how far left it is.
+        assert_eq!(picker.row_at(row0.left, y, rect), None);
+        assert_eq!(picker.row_at(row0.left + LABEL_WIDTH - 1, y, rect), None);
+        // Just past the label column it resolves to the expected channel again.
+        assert_eq!(picker.row_at(row0.left + LABEL_WIDTH, y, rect), Some(0));
+    }
+
+    #[test]
+    fn rgba_picker_label_click_does_not_zero_slider_value() {
+        let mut picker = RgbaPicker::new(Rgba {
+            r: 200,
+            g: 150,
+            b: 100,
+            a: 255,
+        });
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 120,
+        };
+        let row0 = picker.row_rect(0, rect);
+        let y = (row0.top + row0.bottom) / 2;
+        let x_in_label = row0.left + 2; // inside the "R" label column
+
+        let event = picker.on_mouse(WM_LBUTTONDOWN, x_in_label, y, rect);
+
+        // Before the fix, this click would dispatch to the R slider with an
+        // out-of-range x, clamping it to 0 (`Slider::pos_to_value`). Now it's a no-op.
+        assert!(event.is_none());
+        assert_eq!(picker.value.r, 200);
+        assert!(picker.active.is_none());
     }
 }
