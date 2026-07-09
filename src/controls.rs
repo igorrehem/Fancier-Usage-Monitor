@@ -793,7 +793,9 @@ impl Segmented {
     fn segment_rect(&self, index: usize, rect: RECT) -> RECT {
         let n = self.options.len().max(1) as i32;
         let width = (rect.right - rect.left).max(1);
-        let col_w = width / n;
+        // `.max(1)` matches `option_at`'s floor so the two agree on which option owns space
+        // even when `rect` is narrower than `n` (each column at least 1px rather than 0).
+        let col_w = (width / n).max(1);
         let left = rect.left + col_w * index as i32;
         let right = if index as i32 == n - 1 {
             rect.right
@@ -890,7 +892,9 @@ const TOGGLE_TRACK_H: i32 = 18;
 const TOGGLE_KNOB_PAD: i32 = 2;
 
 /// A simple on/off switch drawn as a pill-shaped track with a circular knob at the left
-/// (off) or right (on) end. Clicking anywhere in `rect` flips `on` and emits `Changed`.
+/// (off) or right (on) end. Clicking within the drawn track (`track_rect(rect)`, which may
+/// be narrower than `rect` itself) flips `on` and emits `Changed`; clicks in the empty space
+/// of `rect` outside the track are ignored.
 #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
 pub struct Toggle {
     pub on: bool,
@@ -910,7 +914,11 @@ impl Toggle {
         let avail_h = (rect.bottom - rect.top).max(1);
         let avail_w = (rect.right - rect.left).max(1);
         let h = TOGGLE_TRACK_H.min(avail_h);
-        let w = TOGGLE_TRACK_W.min(avail_w).max(h); // never narrower than it is tall
+        // Never narrower than it is tall, but the final `.min(avail_w)` re-clamps in case
+        // `.max(h)` (applied after the first `.min(avail_w)`) would otherwise re-widen `w`
+        // past the available width for narrow-but-tall rects (e.g. avail_w=1, h=18: without
+        // this the naive `min(36,1).max(18)` would overflow to 18).
+        let w = TOGGLE_TRACK_W.min(avail_w).max(h).min(avail_w);
         let top = rect.top + (avail_h - h) / 2;
         RECT {
             left: rect.left,
@@ -980,7 +988,11 @@ impl Control for Toggle {
         if msg != WM_LBUTTONDOWN {
             return None;
         }
-        if x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom {
+        // Hit-test against the actual drawn track (`track_rect`), not the raw `rect`: when
+        // `rect` is wider than the fixed-size track (see `draw`/`track_rect`), a click in the
+        // visually empty space to the right of the track must not flip `on`.
+        let track = self.track_rect(rect);
+        if x >= track.left && x < track.right && y >= track.top && y < track.bottom {
             self.on = !self.on;
             Some(ControlEvent::Changed)
         } else {
@@ -1337,6 +1349,24 @@ mod tests {
     }
 
     #[test]
+    fn segmented_single_option_always_selected_and_click_is_a_no_op() {
+        // With exactly one option, any click within `rect` resolves to that option, which is
+        // already selected -> no-op, mirroring `segmented_ignores_clicks_when_no_options` for
+        // the N=0 case.
+        let mut seg = Segmented::new(segmented_options(1), 0);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 24,
+        };
+        assert_eq!(seg.option_at(150, 12, rect), Some(0));
+        let event = seg.on_mouse(WM_LBUTTONDOWN, 150, 12, rect);
+        assert!(event.is_none());
+        assert_eq!(seg.selected, 0);
+    }
+
+    #[test]
     fn toggle_click_flips_state_and_emits_changed() {
         let mut toggle = Toggle::new(false);
         let rect = RECT {
@@ -1367,6 +1397,51 @@ mod tests {
         assert!(toggle.on_mouse(WM_LBUTTONDOWN, -1, 9, rect).is_none());
         assert!(toggle.on_mouse(WM_LBUTTONDOWN, 10, 18, rect).is_none());
         assert!(!toggle.on);
+    }
+
+    #[test]
+    fn toggle_ignores_clicks_past_track_edge_in_wider_rect() {
+        // `rect` is much wider than the drawn track (TOGGLE_TRACK_W == 36); a click in the
+        // empty space to the right of the track must not flip `on`, even though it's well
+        // within `rect` itself. This is the regression scenario for the hit-test fix: before
+        // it, `on_mouse` tested against the raw (wide) `rect` instead of `track_rect(rect)`.
+        let mut toggle = Toggle::new(false);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 18,
+        };
+        let track = toggle.track_rect(rect);
+        assert_eq!(track.right, TOGGLE_TRACK_W); // sanity: track stays fixed-size, left-anchored
+
+        // Click well past the track's right edge, still inside `rect`: ignored.
+        let event = toggle.on_mouse(WM_LBUTTONDOWN, 150, 9, rect);
+        assert!(event.is_none());
+        assert!(!toggle.on);
+
+        // Click just within the track's own bounds still flips it.
+        let event = toggle.on_mouse(WM_LBUTTONDOWN, track.right - 1, 9, rect);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(toggle.on);
+    }
+
+    #[test]
+    fn toggle_track_rect_never_exceeds_narrow_rects_width() {
+        // A narrow-but-tall rect: avail_w=1 is far smaller than TOGGLE_TRACK_H (18), so the
+        // naive `TOGGLE_TRACK_W.min(avail_w).max(h)` would re-widen `w` back up to `h` (18),
+        // overflowing 17px past `rect.right`. The track must never exceed the rect's own
+        // width, even when that means it's narrower than it is tall.
+        let toggle = Toggle::new(false);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 100,
+        };
+        let track = toggle.track_rect(rect);
+        assert!(track.right - track.left <= rect.right - rect.left);
+        assert_eq!(track.right, rect.right);
     }
 
     #[test]
