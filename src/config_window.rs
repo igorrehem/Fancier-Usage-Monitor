@@ -9,9 +9,12 @@
 //! Cancel discards `draft`, Reset snaps it back to the real widget's current settings (see
 //! `handle_button_action`).
 //!
-//! Scope for this task: Appearance/Font/Size/Animations/Update sections get real controls;
-//! Presets stays a placeholder (its buttons + `apply_preset` are Task 16, and `presets.rs`
-//! doesn't exist yet). Still no menu/tray entry point (Task 15).
+//! Appearance/Font/Size/Animations/Update/Presets sections all get real controls. Presets
+//! (Task 16) is a 2x2 grid of clickable cards, one per `crate::presets::apply_preset` built-in
+//! (Default/Glass/Neon/Minimal): clicking one mutates `draft`'s appearance+animation in place,
+//! rebuilds `state.controls` from it (so Appearance/Animations' own cached widget values don't
+//! go stale), and repaints the preview -- same as any other control, and same rebuild-on-
+//! external-mutation pattern `ButtonAction::Reset` uses below.
 //!
 //! # Threading / message-loop architecture
 //!
@@ -46,7 +49,7 @@ use crate::controls::{Control, Dropdown, RgbaPicker, Segmented, Slider, Toggle};
 use crate::diagnose;
 use crate::localization::{self, LanguageId};
 use crate::native_interop::{self, Color, IDT_PREVIEW_ANIM};
-use crate::settings::{PaletteStops, Rgba, Settings, Weight};
+use crate::settings::{PaletteStops, PresetId, Rgba, Settings, Weight};
 use crate::theme;
 use crate::window::{self, UsageData};
 
@@ -106,6 +109,10 @@ const RGBA_LABEL_GAP: i32 = 4;
 const RGBA_PICKER_H: i32 = 84;
 const RGBA_ROW_GAP: i32 = 12;
 const RGBA_COL_GAP: i32 = 16;
+
+// Presets section (Task 16): a 2x2 grid of large clickable "cards", one per built-in preset.
+const PRESET_CARD_H: i32 = 56;
+const PRESET_CARD_GAP: i32 = 12;
 
 /// Per-window state for the config window. Only one instance can exist at a time (enforced
 /// by `open_config_window`'s idempotency check), so this is held in a global rather than via
@@ -200,6 +207,13 @@ struct AnimationControls {
 /// this task's file scope is `config_window.rs` only; full menu<->window sync is Task 17.
 const FREQ_PRESETS_MS: [u32; 4] = [60_000, 300_000, 900_000, 3_600_000];
 const FREQUENCY_LABELS: [&str; 5] = ["1 min", "5 min", "15 min", "1 hour", "Custom"];
+
+/// Built-in style presets (Task 16), in the order the Presets section's card grid displays
+/// them. `PRESET_LABELS[i]` names `PRESET_IDS[i]`; kept as two parallel arrays (rather than a
+/// `[(&str, PresetId); 4]`) so `PRESET_LABELS` can be indexed the same way `APPEARANCE_PICKER_
+/// LABELS` etc. already are elsewhere in this file.
+const PRESET_LABELS: [&str; 4] = ["Default", "Glass", "Neon", "Minimal"];
+const PRESET_IDS: [PresetId; 4] = [PresetId::Default, PresetId::Glass, PresetId::Neon, PresetId::Minimal];
 
 /// Frequency `Segmented` (presets + "Custom") plus a custom `Slider` in whole minutes, both
 /// bound to `draft.poll_interval_ms`. Selecting a preset segment sets the interval directly;
@@ -1675,13 +1689,78 @@ fn dispatch_update(
     changed
 }
 
-unsafe fn draw_presets_placeholder(hdc: HDC, area: RECT, dpi: u32, dark: bool) {
-    // A single top-anchored row (matching every other section's first row), not the full
-    // (tall) `area` -- `draw_field_label`'s DT_VCENTER would otherwise center this one line
-    // in the middle of the whole controls panel instead of reading like the start of content.
+/// Presets section layout: an intro header row followed by a 2x2 grid of large clickable
+/// "cards", one per `PRESET_IDS`/`PRESET_LABELS` entry. Shared by draw + dispatch so hit-testing
+/// can never drift from what's painted -- the same discipline every other section's `*_layout`
+/// function follows.
+fn presets_layout(area: RECT, dpi: u32) -> (RECT, [RECT; 4]) {
     let mut cursor = RowCursor::new(area, dpi);
-    let row = cursor.header();
-    draw_field_label(hdc, row, dark, "Style presets are coming in a later task.");
+    let header = cursor.header();
+    cursor.group_gap();
+
+    let cols = 2i32;
+    let rows = 2i32;
+    let col_gap = scale(PRESET_CARD_GAP, dpi);
+    let row_gap = scale(PRESET_CARD_GAP, dpi);
+    let card_w = ((area.right - area.left) - col_gap * (cols - 1)).max(cols) / cols;
+    let card_h = scale(PRESET_CARD_H, dpi);
+    let grid_top = cursor.y;
+
+    let mut cards = [RECT::default(); 4];
+    for i in 0..(cols * rows) {
+        let col = i % cols;
+        let row = i / cols;
+        let left = area.left + col * (card_w + col_gap);
+        let top = grid_top + row * (card_h + row_gap);
+        cards[i as usize] = RECT {
+            left,
+            top,
+            right: left + card_w,
+            bottom: top + card_h,
+        };
+    }
+    (header, cards)
+}
+
+/// Draws the intro line plus the four preset cards, highlighting whichever preset (if any)
+/// `draft.animation.preset` currently records as last-applied -- purely a visual "this one's
+/// active" cue, not a control with its own state (clicking any card, including the highlighted
+/// one, always re-applies it).
+unsafe fn draw_presets_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, active: Option<PresetId>) {
+    let (header, cards) = presets_layout(area, dpi);
+    draw_field_label(
+        hdc,
+        header,
+        dark,
+        "Click a preset to apply it to Appearance and Animations below. Save to keep it, Cancel to discard.",
+    );
+    for i in 0..4 {
+        let primary = active == Some(PRESET_IDS[i]);
+        draw_button(hdc, cards[i], dark, PRESET_LABELS[i], primary);
+    }
+}
+
+/// Hit-tests a click against the preset card grid; if it lands on a card, applies that preset
+/// to `state.draft` and rebuilds `state.controls` from the mutated draft so the Appearance/
+/// Animations sections' own cached widget values (each `Slider`/`RgbaPicker`/`Toggle` holds its
+/// own copy, not a live view of `draft`) don't go stale -- the same rebuild
+/// `ButtonAction::Reset` performs in `handle_button_action`. Only reacts to `WM_LBUTTONDOWN`
+/// (a preset card is a plain click, not a drag) and never touches disk or the real widget --
+/// same as every other control here, Save still commits `draft` and Cancel still discards it.
+fn dispatch_presets(state: &mut ConfigState, area: RECT, dpi: u32, msg: u32, x: i32, y: i32) -> bool {
+    if msg != WM_LBUTTONDOWN {
+        return false;
+    }
+    let (_header, cards) = presets_layout(area, dpi);
+    let Some(i) = cards
+        .iter()
+        .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+    else {
+        return false;
+    };
+    crate::presets::apply_preset(PRESET_IDS[i], &mut state.draft);
+    state.controls = SectionControls::from_settings(&state.draft, theme::is_dark_mode());
+    true
 }
 
 /// Draws the active section's controls into `area`. Selects a smaller/lighter font than the
@@ -1718,7 +1797,7 @@ unsafe fn draw_section_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, sect
         2 => draw_size_controls(hdc, area, dpi, dark, &state.controls.size),
         3 => draw_animation_controls(hdc, area, dpi, dark, &state.controls.animations),
         4 => draw_update_controls(hdc, area, dpi, dark, &state.controls.update),
-        _ => draw_presets_placeholder(hdc, area, dpi, dark),
+        _ => draw_presets_controls(hdc, area, dpi, dark, state.draft.animation.preset),
     }
 
     SelectObject(hdc, old_font);
@@ -1779,6 +1858,7 @@ fn dispatch_controls(controls_area: RECT, dpi: u32, msg: u32, x: i32, y: i32) ->
             x,
             y,
         ),
+        5 => dispatch_presets(state, controls_area, dpi, msg, x, y),
         _ => false,
     }
 }

@@ -8,6 +8,7 @@ mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod presets;
 mod settings;
 mod theme;
 mod tray_icon;
