@@ -173,20 +173,60 @@ impl Control for Slider {
 /// Layout constant: side length of the color swatch (also the height of the top row that
 /// holds the swatch and the hex readout).
 const SWATCH_SIZE: i32 = 28;
-/// Layout constant: vertical gap between the swatch/hex row and the first slider row.
+/// Layout constant: vertical gap between the swatch/hex row and the first slider row. Only
+/// relevant to the legacy always-expanded row math (`rows_top`/`row_rect`), retained for
+/// its existing unit test coverage but no longer reachable from `draw`/`on_mouse` now that
+/// the four slider rows live in the popover instead (see `popover_slider_row_rect`).
 const ROW_GAP: i32 = 6;
 /// Layout constant: width reserved for the single-letter channel label left of each slider.
+/// Shared by both the legacy row math and the popover's slider rows.
 const LABEL_WIDTH: i32 = 14;
 /// Layout constant: horizontal gap between the swatch and the hex readout text.
 const HEX_GAP: i32 = 8;
 /// Layout constant: checkerboard cell size used to render alpha transparency under the swatch.
 const CHECKER_CELL: i32 = 6;
+/// Width reserved on the right of the closed row for the popover's disclosure arrow glyph.
+const RGBA_ARROW_ZONE: i32 = 18;
+/// Horizontal/vertical padding used inside the popover (around the swatch grid, and for the
+/// "Custom…" row's text inset).
+const POPOVER_PAD: i32 = 4;
+/// Columns in the popover's quick-swatch grid.
+const POPOVER_GRID_COLS: i32 = 5;
+/// Side length of each quick-swatch cell in the popover grid.
+const POPOVER_SWATCH_CELL: i32 = 24;
+/// Gap between adjacent quick-swatch cells.
+const POPOVER_SWATCH_GAP: i32 = 4;
+/// Height of the "Custom…" row within the popover.
+const POPOVER_CUSTOM_ROW_HEIGHT: i32 = 24;
+/// Height of each of the four R/G/B/A slider rows revealed inside the popover once
+/// "Custom…" has been picked.
+const POPOVER_SLIDER_ROW_HEIGHT: i32 = 22;
 
-/// A composed color picker: four `Slider`s (R/G/B/A, each ranging over `0..255`) plus a
-/// swatch (alpha rendered over a checkerboard so transparency is visible) and a
-/// `#RRGGBBAA` hex readout. `on_mouse` dispatches to whichever channel row the cursor is
-/// in and keeps dispatching to that same channel while the drag continues, even if the
-/// cursor drifts outside that row's exact bounds mid-drag.
+/// Curated quick-swatch palette shown at the top of the popover: this app's brand accent,
+/// a spread of complementary hues (amber, red, green, blue, purple, teal), and three
+/// neutrals (near-white, mid-gray, near-black). All fully opaque (`a: 255`) — quick
+/// swatches never carry partial transparency; alpha is only adjustable via the "Custom…"
+/// sliders. Ten entries lay out evenly as `POPOVER_GRID_COLS` (5) x 2 rows.
+const QUICK_SWATCHES: [Rgba; 10] = [
+    Rgba { r: 0xD9, g: 0x77, b: 0x57, a: 255 }, // brand accent
+    Rgba { r: 0xF5, g: 0xA6, b: 0x23, a: 255 }, // amber
+    Rgba { r: 0xE5, g: 0x48, b: 0x4D, a: 255 }, // red
+    Rgba { r: 0x46, g: 0xA7, b: 0x58, a: 255 }, // green
+    Rgba { r: 0x3B, g: 0x82, b: 0xF6, a: 255 }, // blue
+    Rgba { r: 0x8B, g: 0x5C, b: 0xF6, a: 255 }, // purple
+    Rgba { r: 0x14, g: 0xB8, b: 0xA6, a: 255 }, // teal
+    Rgba { r: 0xF5, g: 0xF5, b: 0xF4, a: 255 }, // near-white
+    Rgba { r: 0x8A, g: 0x8A, b: 0x8A, a: 255 }, // mid-gray
+    Rgba { r: 0x1C, g: 0x1C, b: 0x1C, a: 255 }, // near-black
+];
+
+/// A composed color picker, closed by default: a single row shows the swatch, the
+/// `#RRGGBBAA` hex readout, and a disclosure arrow. Clicking it opens a popover (mirroring
+/// `Dropdown`'s closed/open shape) offering a curated grid of `QUICK_SWATCHES` plus a
+/// "Custom…" row; picking "Custom…" reveals the four `Slider`s (R/G/B/A, each ranging over
+/// `0..255`) for manual entry. `on_mouse` dispatches to whichever popover element the
+/// cursor is in and keeps dispatching to the active slider while a drag continues, even if
+/// the cursor drifts outside that row's exact bounds mid-drag.
 #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
 pub struct RgbaPicker {
     pub value: Rgba,
@@ -196,6 +236,11 @@ pub struct RgbaPicker {
     a_slider: Slider,
     /// Channel index (0=R, 1=G, 2=B, 3=A) currently being dragged, if any.
     active: Option<usize>,
+    /// Whether the popover (quick swatches + "Custom…") is currently open.
+    open: bool,
+    /// Whether, within the open popover, "Custom…" has been picked and the manual R/G/B/A
+    /// sliders are revealed.
+    custom_expanded: bool,
 }
 
 impl RgbaPicker {
@@ -208,6 +253,8 @@ impl RgbaPicker {
             a_slider: Slider::new(value.a as f32, 0.0, 255.0),
             value,
             active: None,
+            open: false,
+            custom_expanded: false,
         }
     }
 
@@ -226,12 +273,21 @@ impl RgbaPicker {
         }
     }
 
-    /// Y position where the four channel rows begin (just below the swatch/hex row).
+    /// Y position where the four channel rows begin (just below the swatch/hex row). Part
+    /// of the legacy always-expanded row math: no longer called from `draw`/`on_mouse`
+    /// (superseded by `popover_slider_row_rect`, anchored to the popover's "Custom…" row
+    /// instead), but kept — along with `row_rect`/`slider_rect`/`row_at` below — because its
+    /// exact behavior is still covered by pre-existing unit tests and callers outside this
+    /// module may rely on the same math shape.
+    #[allow(dead_code)]
     fn rows_top(&self, rect: RECT) -> i32 {
         self.swatch_rect(rect).bottom + ROW_GAP
     }
 
-    /// The full-width row (label + slider) for channel `index` (0=R, 1=G, 2=B, 3=A).
+    /// The full-width row (label + slider) for channel `index` (0=R, 1=G, 2=B, 3=A). See
+    /// `rows_top`'s doc comment: retained for its existing test coverage, not called from
+    /// `draw`/`on_mouse` anymore (see `popover_slider_row_rect`).
+    #[allow(dead_code)]
     fn row_rect(&self, index: usize, rect: RECT) -> RECT {
         let top0 = self.rows_top(rect);
         let rows_h = (rect.bottom - top0).max(4);
@@ -246,7 +302,10 @@ impl RgbaPicker {
         }
     }
 
-    /// The slider-only portion of a channel row (row rect minus the label column).
+    /// The slider-only portion of a channel row (row rect minus the label column). See
+    /// `rows_top`'s doc comment: retained for its existing test coverage, not called from
+    /// `draw`/`on_mouse` anymore (see `popover_slider_slot_rect`).
+    #[allow(dead_code)]
     fn slider_rect(&self, index: usize, rect: RECT) -> RECT {
         let row = self.row_rect(index, rect);
         RECT {
@@ -262,6 +321,9 @@ impl RgbaPicker {
     /// (`row.left .. row.left + LABEL_WIDTH`) — a click on the label text must not be
     /// dispatched to the channel's slider (it would otherwise snap that channel to 0, since
     /// `Slider::pos_to_value` clamps any `x` left of the sub-slider's rect to its minimum).
+    /// See `rows_top`'s doc comment: retained for its existing test coverage, not called
+    /// from `draw`/`on_mouse` anymore (see `popover_slider_row_at`).
+    #[allow(dead_code)]
     fn row_at(&self, x: i32, y: i32, rect: RECT) -> Option<usize> {
         if x < rect.left + LABEL_WIDTH {
             return None;
@@ -274,6 +336,133 @@ impl RgbaPicker {
         let row_h = (rows_h / 4).max(1);
         let idx = ((y - top0) / row_h).clamp(0, 3);
         Some(idx as usize)
+    }
+
+    /// Whether client point `(x, y)` falls within `r`, using half-open bounds so adjacent
+    /// rects (e.g. the closed row and the popover starting exactly at its bottom edge)
+    /// never both claim the same point. Mirrors `Dropdown::point_in`.
+    fn point_in(&self, x: i32, y: i32, r: RECT) -> bool {
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    }
+
+    /// How many rows the quick-swatch grid needs to lay out all of `QUICK_SWATCHES` at
+    /// `POPOVER_GRID_COLS` columns per row.
+    fn swatch_grid_rows(&self) -> i32 {
+        (QUICK_SWATCHES.len() as i32 + POPOVER_GRID_COLS - 1) / POPOVER_GRID_COLS
+    }
+
+    /// The quick-swatch grid's rect: directly below the closed `rect`, spanning its width.
+    fn swatch_grid_rect(&self, rect: RECT) -> RECT {
+        let rows = self.swatch_grid_rows();
+        let height =
+            POPOVER_PAD * 2 + rows * POPOVER_SWATCH_CELL + (rows - 1).max(0) * POPOVER_SWATCH_GAP;
+        RECT {
+            left: rect.left,
+            top: rect.bottom,
+            right: rect.right,
+            bottom: rect.bottom + height,
+        }
+    }
+
+    /// The rect of quick-swatch cell `index` within the grid.
+    fn swatch_cell_rect(&self, index: usize, rect: RECT) -> RECT {
+        let grid = self.swatch_grid_rect(rect);
+        let col = index as i32 % POPOVER_GRID_COLS;
+        let row = index as i32 / POPOVER_GRID_COLS;
+        let left = grid.left + POPOVER_PAD + col * (POPOVER_SWATCH_CELL + POPOVER_SWATCH_GAP);
+        let top = grid.top + POPOVER_PAD + row * (POPOVER_SWATCH_CELL + POPOVER_SWATCH_GAP);
+        RECT {
+            left,
+            top,
+            right: left + POPOVER_SWATCH_CELL,
+            bottom: top + POPOVER_SWATCH_CELL,
+        }
+    }
+
+    /// Which quick-swatch cell (if any) contains client point `(x, y)`.
+    fn swatch_at(&self, x: i32, y: i32, rect: RECT) -> Option<usize> {
+        let grid = self.swatch_grid_rect(rect);
+        if !self.point_in(x, y, grid) {
+            return None;
+        }
+        (0..QUICK_SWATCHES.len()).find(|&i| self.point_in(x, y, self.swatch_cell_rect(i, rect)))
+    }
+
+    /// The "Custom…" row's rect: directly below the quick-swatch grid, spanning `rect`'s
+    /// width.
+    fn custom_row_rect(&self, rect: RECT) -> RECT {
+        let grid = self.swatch_grid_rect(rect);
+        RECT {
+            left: rect.left,
+            top: grid.bottom,
+            right: rect.right,
+            bottom: grid.bottom + POPOVER_CUSTOM_ROW_HEIGHT,
+        }
+    }
+
+    /// The full popover rect: the quick-swatch grid plus the "Custom…" row plus — while
+    /// `custom_expanded` — the four R/G/B/A slider rows, directly below the closed `rect`.
+    /// Mirrors `Dropdown::list_rect`'s shape (same width as `rect`, positioned directly
+    /// below it, height depending on current state).
+    fn popover_rect(&self, rect: RECT) -> RECT {
+        let custom = self.custom_row_rect(rect);
+        let sliders_h = if self.custom_expanded {
+            POPOVER_SLIDER_ROW_HEIGHT * 4
+        } else {
+            0
+        };
+        RECT {
+            left: rect.left,
+            top: rect.bottom,
+            right: rect.right,
+            bottom: custom.bottom + sliders_h,
+        }
+    }
+
+    /// The full-width row (label + slider) for channel `index`, within the popover's
+    /// revealed slider section below the "Custom…" row. Positional counterpart to the
+    /// legacy `row_rect`, anchored to the popover instead of always-visible below the
+    /// swatch/hex header.
+    fn popover_slider_row_rect(&self, index: usize, rect: RECT) -> RECT {
+        let custom = self.custom_row_rect(rect);
+        let top = custom.bottom + POPOVER_SLIDER_ROW_HEIGHT * index as i32;
+        RECT {
+            left: rect.left,
+            top,
+            right: rect.right,
+            bottom: top + POPOVER_SLIDER_ROW_HEIGHT,
+        }
+    }
+
+    /// The slider-only portion of popover channel row `index` (row rect minus the label
+    /// column). Positional counterpart to the legacy `slider_rect`.
+    fn popover_slider_slot_rect(&self, index: usize, rect: RECT) -> RECT {
+        let row = self.popover_slider_row_rect(index, rect);
+        RECT {
+            left: row.left + LABEL_WIDTH,
+            top: row.top,
+            right: row.right,
+            bottom: row.bottom,
+        }
+    }
+
+    /// Which popover channel row (if any) contains client point `(x, y)`. Only meaningful
+    /// while `custom_expanded` (the rows aren't drawn, or hit-testable, otherwise). Mirrors
+    /// `row_at`'s label-column exclusion.
+    fn popover_slider_row_at(&self, x: i32, y: i32, rect: RECT) -> Option<usize> {
+        if !self.custom_expanded || x < rect.left + LABEL_WIDTH {
+            return None;
+        }
+        let top0 = self.custom_row_rect(rect).bottom;
+        if y < top0 {
+            return None;
+        }
+        let idx = (y - top0) / POPOVER_SLIDER_ROW_HEIGHT;
+        if !(0..4).contains(&idx) {
+            None
+        } else {
+            Some(idx as usize)
+        }
     }
 
     fn slider(&self, index: usize) -> &Slider {
@@ -303,6 +492,13 @@ impl RgbaPicker {
             a: self.a_slider.value.round().clamp(0.0, 255.0) as u8,
         };
     }
+
+    /// Force-closes the popover (and collapses "Custom…" back down), if open, resetting to
+    /// the compact closed-row state. Mirrors `Dropdown::close`. A no-op if already closed.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.custom_expanded = false;
+    }
 }
 
 impl Control for RgbaPicker {
@@ -313,9 +509,23 @@ impl Control for RgbaPicker {
             } else {
                 Color::new(0x20, 0x20, 0x20)
             };
+            let border = if dark {
+                Color::new(0x55, 0x55, 0x55)
+            } else {
+                Color::new(0xc0, 0xc0, 0xc0)
+            };
+            let bg = if dark {
+                Color::new(0x33, 0x33, 0x33)
+            } else {
+                Color::new(0xff, 0xff, 0xff)
+            };
+            let highlight = Color::new(0xd9, 0x77, 0x57);
+
             let _ = SetBkMode(hdc, TRANSPARENT);
             let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
+            // Closed row: swatch + hex readout + disclosure arrow. Always drawn, whether
+            // or not the popover is open.
             let swatch = self.swatch_rect(rect);
             draw_checkerboard_swatch(hdc, swatch, &self.value.to_color());
 
@@ -324,7 +534,7 @@ impl Control for RgbaPicker {
             let mut hex_rect = RECT {
                 left: swatch.right + HEX_GAP,
                 top: swatch.top,
-                right: rect.right,
+                right: rect.right - RGBA_ARROW_ZONE,
                 bottom: swatch.bottom,
             };
             let _ = DrawTextW(
@@ -334,23 +544,89 @@ impl Control for RgbaPicker {
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
 
-            const LABELS: [&str; 4] = ["R", "G", "B", "A"];
-            for (i, label) in LABELS.iter().enumerate() {
-                let row = self.row_rect(i, rect);
-                let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-                let mut label_rect = RECT {
-                    left: row.left,
-                    top: row.top,
-                    right: row.left + LABEL_WIDTH,
-                    bottom: row.bottom,
-                };
-                let _ = DrawTextW(
-                    hdc,
-                    &mut label_wide,
-                    &mut label_rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                );
-                self.slider(i).draw(hdc, self.slider_rect(i, rect), dark);
+            let arrow = if self.open { "\u{25B2}" } else { "\u{25BC}" };
+            let mut arrow_wide: Vec<u16> = arrow.encode_utf16().collect();
+            let mut arrow_rect = RECT {
+                left: rect.right - RGBA_ARROW_ZONE,
+                top: swatch.top,
+                right: rect.right,
+                bottom: swatch.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut arrow_wide,
+                &mut arrow_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+
+            if !self.open {
+                return;
+            }
+
+            // Popover: panel background, quick-swatch grid, "Custom…" row, and — while
+            // `custom_expanded` — the four R/G/B/A slider rows.
+            let popover = self.popover_rect(rect);
+            draw_rounded_rect(hdc, &popover, &border, 4);
+            let inset_popover = RECT {
+                left: popover.left + 1,
+                top: popover.top,
+                right: popover.right - 1,
+                bottom: popover.bottom - 1,
+            };
+            draw_rounded_rect(hdc, &inset_popover, &bg, 4);
+
+            for i in 0..QUICK_SWATCHES.len() {
+                let cell = self.swatch_cell_rect(i, rect);
+                let swatch_color = QUICK_SWATCHES[i].to_color();
+                if self.value == QUICK_SWATCHES[i] {
+                    draw_rounded_rect(hdc, &cell, &highlight, 4);
+                    let inset = RECT {
+                        left: cell.left + 2,
+                        top: cell.top + 2,
+                        right: cell.right - 2,
+                        bottom: cell.bottom - 2,
+                    };
+                    draw_rounded_rect(hdc, &inset, &swatch_color, 3);
+                } else {
+                    draw_rounded_rect(hdc, &cell, &swatch_color, 4);
+                }
+            }
+
+            let custom_row = self.custom_row_rect(rect);
+            let mut custom_wide: Vec<u16> = "Custom\u{2026}".encode_utf16().collect();
+            let mut custom_rect = RECT {
+                left: custom_row.left + POPOVER_PAD * 2,
+                top: custom_row.top,
+                right: custom_row.right - POPOVER_PAD * 2,
+                bottom: custom_row.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut custom_wide,
+                &mut custom_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+
+            if self.custom_expanded {
+                const LABELS: [&str; 4] = ["R", "G", "B", "A"];
+                for (i, label) in LABELS.iter().enumerate() {
+                    let row = self.popover_slider_row_rect(i, rect);
+                    let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+                    let mut label_rect = RECT {
+                        left: row.left,
+                        top: row.top,
+                        right: row.left + LABEL_WIDTH,
+                        bottom: row.bottom,
+                    };
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut label_wide,
+                        &mut label_rect,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    self.slider(i)
+                        .draw(hdc, self.popover_slider_slot_rect(i, rect), dark);
+                }
             }
         }
     }
@@ -358,18 +634,54 @@ impl Control for RgbaPicker {
     fn on_mouse(&mut self, msg: u32, x: i32, y: i32, rect: RECT) -> Option<ControlEvent> {
         match msg {
             WM_LBUTTONDOWN => {
-                let idx = self.row_at(x, y, rect)?;
-                self.active = Some(idx);
-                let sub_rect = self.slider_rect(idx, rect);
-                let event = self.slider_mut(idx).on_mouse(msg, x, y, sub_rect);
-                if event.is_some() {
-                    self.sync_value();
+                if !self.open {
+                    // Closed: only a click on the closed row itself opens the popover.
+                    if self.point_in(x, y, rect) {
+                        self.open = true;
+                    }
+                    return None;
                 }
-                event
+                if self.point_in(x, y, rect) {
+                    // Click on the closed row again while open: collapse.
+                    self.close();
+                    return None;
+                }
+                if let Some(idx) = self.swatch_at(x, y, rect) {
+                    // Quick swatches are always fully opaque; sync the sliders too so a
+                    // later "Custom…" open reflects the swatch that was picked.
+                    let picked = QUICK_SWATCHES[idx];
+                    self.r_slider.value = picked.r as f32;
+                    self.g_slider.value = picked.g as f32;
+                    self.b_slider.value = picked.b as f32;
+                    self.a_slider.value = picked.a as f32;
+                    self.sync_value();
+                    self.close();
+                    return Some(ControlEvent::Changed);
+                }
+                if self.point_in(x, y, self.custom_row_rect(rect)) {
+                    self.custom_expanded = true;
+                    return None;
+                }
+                if self.custom_expanded {
+                    if let Some(idx) = self.popover_slider_row_at(x, y, rect) {
+                        self.active = Some(idx);
+                        let sub_rect = self.popover_slider_slot_rect(idx, rect);
+                        let event = self.slider_mut(idx).on_mouse(msg, x, y, sub_rect);
+                        if event.is_some() {
+                            self.sync_value();
+                        }
+                        return event;
+                    }
+                }
+                // Outside the closed row, the swatch grid, the "Custom…" row, and any
+                // revealed slider: dismiss without changing the value (see struct doc
+                // comment / `Dropdown`'s identical outside-click convention).
+                self.close();
+                None
             }
             WM_MOUSEMOVE => {
                 let idx = self.active?;
-                let sub_rect = self.slider_rect(idx, rect);
+                let sub_rect = self.popover_slider_slot_rect(idx, rect);
                 let event = self.slider_mut(idx).on_mouse(msg, x, y, sub_rect);
                 if event.is_some() {
                     self.sync_value();
@@ -378,7 +690,7 @@ impl Control for RgbaPicker {
             }
             WM_LBUTTONUP => {
                 let idx = self.active.take()?;
-                let sub_rect = self.slider_rect(idx, rect);
+                let sub_rect = self.popover_slider_slot_rect(idx, rect);
                 let event = self.slider_mut(idx).on_mouse(msg, x, y, sub_rect);
                 if event.is_some() {
                     self.sync_value();
@@ -1467,5 +1779,128 @@ mod tests {
         assert_eq!(off_knob.left, TOGGLE_KNOB_PAD);
         assert_eq!(on_knob.right, track.right - TOGGLE_KNOB_PAD);
         assert!(on_knob.left > off_knob.left);
+    }
+}
+
+#[cfg(test)]
+mod popover_tests {
+    use super::*;
+
+    #[test]
+    fn closed_row_is_one_row_tall() {
+        let picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+        // The closed control's own draw rect is exactly what's passed in — no
+        // extra height is consumed until `open` is true.
+        assert_eq!(picker.open, false);
+        let popover = picker.popover_rect(rect);
+        assert!(popover.top >= rect.bottom, "popover must render below the closed row");
+    }
+
+    #[test]
+    fn click_on_closed_row_opens_popover() {
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+        let _ = picker.on_mouse(WM_LBUTTONDOWN, 10, 10, rect);
+        assert!(picker.open, "clicking the closed row must open the popover");
+    }
+
+    #[test]
+    fn click_outside_when_open_closes_it() {
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        picker.open = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+        // A click far outside both the row and the popover.
+        let _ = picker.on_mouse(WM_LBUTTONDOWN, 500, 500, rect);
+        assert!(!picker.open, "an outside click must close the popover");
+    }
+
+    #[test]
+    fn close_forces_open_false() {
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        picker.open = true;
+        picker.close();
+        assert!(!picker.open);
+    }
+
+    #[test]
+    fn clicking_a_quick_swatch_sets_value_and_closes() {
+        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 });
+        picker.open = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+        let popover = picker.popover_rect(rect);
+        // Click the first quick-swatch cell (top-left of the grid).
+        let event = picker.on_mouse(WM_LBUTTONDOWN, popover.left + 5, popover.top + 5, rect);
+        assert!(event.is_some(), "clicking a swatch must fire a Changed event");
+        assert_eq!(picker.value, QUICK_SWATCHES[0]);
+        assert!(!picker.open, "picking a swatch closes the popover");
+    }
+
+    #[test]
+    fn clicking_custom_reveals_sliders_without_closing() {
+        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 });
+        picker.open = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+        let custom_row = picker.custom_row_rect(rect);
+        let _ = picker.on_mouse(WM_LBUTTONDOWN, custom_row.left + 5, custom_row.top + 5, rect);
+        assert!(picker.open, "Custom stays open to show the manual sliders");
+        assert!(picker.custom_expanded, "Custom must flip on the manual-slider view");
+    }
+
+    #[test]
+    fn dragging_a_revealed_slider_stays_open_and_updates_only_that_channel() {
+        // Beyond the brief's literal test list: exercises the full open -> Custom ->
+        // drag-a-slider path end to end, including that dragging one channel's slider
+        // doesn't perturb the other three (a scenario none of the brief's tests cover).
+        let mut picker = RgbaPicker::new(Rgba { r: 10, g: 20, b: 30, a: 255 });
+        picker.open = true;
+        picker.custom_expanded = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+
+        // Drag the G slider (index 1) to its rect's right edge -> should saturate near 255.
+        let g_slot = picker.popover_slider_slot_rect(1, rect);
+        let event = picker.on_mouse(WM_LBUTTONDOWN, g_slot.right, g_slot.top, rect);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(picker.open, "dragging a slider must not close the popover");
+        assert!(picker.custom_expanded, "dragging a slider must not collapse Custom");
+        assert_eq!(picker.value.g, 255);
+        // R/B/A untouched by dragging G.
+        assert_eq!(picker.value.r, 10);
+        assert_eq!(picker.value.b, 30);
+        assert_eq!(picker.value.a, 255);
+
+        // WM_MOUSEMOVE keeps tracking the same channel (active = Some(1)) even if the
+        // cursor drifts to x=0 (clamped to the slider's minimum).
+        let move_event = picker.on_mouse(WM_MOUSEMOVE, g_slot.left - 999, g_slot.top, rect);
+        assert!(matches!(move_event, Some(ControlEvent::Changed)));
+        assert_eq!(picker.value.g, 0);
+
+        // WM_LBUTTONUP ends the drag and commits.
+        let up_event = picker.on_mouse(WM_LBUTTONUP, g_slot.left, g_slot.top, rect);
+        assert!(matches!(up_event, Some(ControlEvent::CommitPreview)));
+        assert!(picker.active.is_none());
+    }
+
+    #[test]
+    fn picking_a_swatch_syncs_sliders_for_a_later_custom_view() {
+        // Beyond the brief's literal test list: `clicking_a_quick_swatch_sets_value_and_closes`
+        // checks `value` and `open`, but not that the four `Slider`s were kept in sync — if
+        // they weren't, reopening the popover and choosing "Custom…" afterward would show
+        // stale slider positions that don't match the swatch just picked.
+        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 });
+        picker.open = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+        let cell = picker.swatch_cell_rect(3, rect); // QUICK_SWATCHES[3] = green
+        let _ = picker.on_mouse(WM_LBUTTONDOWN, cell.left + 2, cell.top + 2, rect);
+        assert_eq!(picker.value, QUICK_SWATCHES[3]);
+        assert!(!picker.open);
+
+        // Reopen and expand Custom: the sliders must already reflect the picked swatch.
+        picker.open = true;
+        picker.custom_expanded = true;
+        assert_eq!(picker.r_slider.value, QUICK_SWATCHES[3].r as f32);
+        assert_eq!(picker.g_slider.value, QUICK_SWATCHES[3].g as f32);
+        assert_eq!(picker.b_slider.value, QUICK_SWATCHES[3].b as f32);
+        assert_eq!(picker.a_slider.value, QUICK_SWATCHES[3].a as f32);
     }
 }
