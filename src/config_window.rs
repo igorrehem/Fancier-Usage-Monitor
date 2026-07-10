@@ -1,10 +1,13 @@
-//! Settings window shell (Task 11): a top-level, titled `CcumConfig` window with a left
-//! section-nav list, an (as yet empty) right content panel, and an (as yet empty) bottom
-//! button bar. Section click switches the active section and repaints the highlight.
+//! Settings window shell (Task 11) plus live preview (Task 12): a top-level, titled
+//! `CcumConfig` window with a left section-nav list, a right content panel that renders a
+//! WYSIWYG live preview of `draft` (via `window::paint_widget`, the same paint path the real
+//! widget uses) with a running demo animation, and an (as yet empty) bottom button bar.
+//! Section click switches the active section and repaints the highlight.
 //!
-//! Scope for this task is the shell only: no live preview (Task 12), no controls wired to
-//! the draft settings (Task 13), no Save/Cancel/Reset (Task 14), no menu/tray entry point
-//! (Task 15).
+//! Scope for this task is the shell plus preview: no controls wired to the draft settings
+//! (Task 13; the preview currently occupies the whole content panel Task 11 left empty, and
+//! Task 13 carves out real per-section control layout alongside it), no Save/Cancel/Reset
+//! (Task 14), no menu/tray entry point (Task 15).
 //!
 //! # Threading / message-loop architecture
 //!
@@ -23,6 +26,7 @@
 #![allow(dead_code)]
 
 use std::sync::{Mutex, Once};
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
@@ -32,10 +36,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::animation::{AnimationClock, AnimationFrame};
 use crate::diagnose;
-use crate::native_interop::{self, Color};
+use crate::localization::{self, LanguageId};
+use crate::native_interop::{self, Color, IDT_PREVIEW_ANIM};
 use crate::settings::Settings;
 use crate::theme;
+use crate::window::{self, UsageData};
 
 const CLASS_NAME: &str = "CcumConfig";
 const WINDOW_TITLE: &str = "Settings";
@@ -63,11 +70,56 @@ const ACCENT_BAR_W: i32 = 3;
 /// `GWLP_USERDATA` -- matching how `window.rs` holds its own single-instance `AppState`.
 struct ConfigState {
     /// Working copy of settings edited by this window. Cloned from `current_settings()` when
-    /// the window opens; Task 12+ wires it up to live preview, Task 14 adds Save/Cancel.
-    #[allow(dead_code)] // read by later tasks (preview panel, control wiring); shell only for now
+    /// the window opens; the live preview (this task) renders it, Task 13 wires controls to
+    /// edit it, Task 14 adds Save/Cancel.
     draft: Settings,
     active_section: usize,
+    /// Drives the live preview's bar-fill/shimmer/glow/fade animation. Constructed fresh for
+    /// this window and ticked by `IDT_PREVIEW_ANIM` -- entirely independent of the main
+    /// widget's global `ANIM` clock in `window.rs` (see that module's `with_anim`).
+    preview_clock: AnimationClock,
+    /// Most recent frame produced by `preview_clock.tick`, consumed by `draw_preview` on the
+    /// next `WM_PAINT`.
+    preview_frame: AnimationFrame,
+    /// Wall-clock timestamp of the previous preview tick, mirroring `window.rs`'s
+    /// `LAST_ANIM_TICK`: `None` both before the first tick and whenever the preview timer has
+    /// been stopped (idle), so the next tick after a gap assumes one frame's worth (16ms)
+    /// rather than a huge `dt`.
+    preview_last_tick: Option<Instant>,
 }
+
+/// Hardcoded placeholder usage numbers for the live preview. The settings window has no live
+/// poll data (it isn't polling), so the preview always shows the same plausible Claude Code
+/// session/weekly figures regardless of what the real widget is currently displaying -- just
+/// enough to prove `paint_widget` renders end to end with `draft`'s appearance/geometry/
+/// typography/animation settings applied.
+fn demo_usage_data() -> UsageData {
+    UsageData {
+        session_pct: 62.0,
+        session_text: "62% \u{00b7} 3h".to_string(),
+        weekly_pct: 34.0,
+        weekly_text: "34% \u{00b7} 4d".to_string(),
+        codex_session_pct: 0.0,
+        codex_session_text: String::new(),
+        codex_weekly_pct: 0.0,
+        codex_weekly_text: String::new(),
+        antigravity_session_pct: 0.0,
+        antigravity_session_text: String::new(),
+        antigravity_weekly_pct: 0.0,
+        antigravity_weekly_text: String::new(),
+        show_claude_code: true,
+        show_codex: false,
+        show_antigravity: false,
+    }
+}
+
+/// Fill-animation targets (0.0..=1.0) for `demo_usage_data`'s two visible bars, in
+/// `[claude.session, claude.weekly]` order. This mirrors `window.rs`'s private
+/// `ordered_bar_slots` contract (Claude Code's session/weekly pair always comes first, and
+/// the demo dataset never shows Codex/Antigravity, so this pair is always the complete
+/// order) -- `paint_widget` maps `AnimationFrame::fill_pcts` back onto bars using that same
+/// index contract.
+const DEMO_TARGETS: [f32; 2] = [0.62, 0.34];
 
 static CONFIG_STATE: Mutex<Option<ConfigState>> = Mutex::new(None);
 
@@ -145,9 +197,22 @@ unsafe fn create_window() {
 
     // Seed the draft state *before* the window exists so a synchronous WM_PAINT arriving
     // during/just after CreateWindowExW always finds state populated.
+    let draft = crate::window::current_settings();
+    let mut preview_clock = AnimationClock::new(&draft.animation);
+    // Seed at zero, then set the real demo targets, so the first few preview ticks animate
+    // the bars growing in from empty -- a visible "this is live" cue when the settings
+    // window opens, mirroring how the real widget looks on its first poll.
+    preview_clock.set_targets(&[0.0; DEMO_TARGETS.len()]);
+    preview_clock.set_targets(&DEMO_TARGETS);
+    let usage_max = DEMO_TARGETS.iter().cloned().fold(0.0f32, f32::max);
+    let (preview_frame, _) = preview_clock.tick(Duration::ZERO, usage_max);
+
     *CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ConfigState {
-        draft: crate::window::current_settings(),
+        draft,
         active_section: 0,
+        preview_clock,
+        preview_frame,
+        preview_last_tick: None,
     });
 
     // Size/position using the primary monitor's current DPI; refined per-monitor via
@@ -192,6 +257,11 @@ unsafe fn create_window() {
     let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
     let _ = SetForegroundWindow(hwnd);
     let _ = UpdateWindow(hwnd);
+
+    // Drives the live preview's animation while it has active work (fill grow-in, and
+    // shimmer/glow if enabled in `draft.animation`); stopped by `tick_preview` once settled,
+    // matching window.rs's IDT_ANIM idle-stop pattern.
+    let _ = SetTimer(hwnd, IDT_PREVIEW_ANIM, 16, None);
 
     diagnose::log(format!("config window created hwnd={:?}", hwnd));
 }
@@ -398,6 +468,119 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
 
     SelectObject(hdc, old_font);
     let _ = DeleteObject(font);
+
+    // Live preview: the whole content panel (right of the sidebar divider, above the button
+    // bar) is Task 11's still-empty area. This task just proves pixels flow end to end into
+    // it; Task 13 carves out real per-section control layout alongside it.
+    let content_rect = RECT {
+        left: sidebar_w + 1,
+        top: 0,
+        right: client_w,
+        bottom: body_bottom,
+    };
+    draw_preview(hdc, content_rect, dpi);
+}
+
+/// Render `draft` via the same `paint_widget` the real widget uses (with a small hardcoded
+/// demo `UsageData`, since this window has no live poll data) into an off-screen bitmap sized
+/// to the widget's natural (unclamped) dimensions, then blit it into the top-left corner of
+/// `content_rect` with a small margin. If the panel is too small to fit the natural size, the
+/// preview is clamped down to whatever room is available rather than overflowing into the
+/// sidebar or button bar.
+unsafe fn draw_preview(hdc: HDC, content_rect: RECT, dpi: u32) {
+    let (draft, frame) = {
+        let guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(s) => (s.draft.clone(), s.preview_frame.clone()),
+            None => return,
+        }
+    };
+    let is_dark = theme::is_dark_mode();
+    let usage = demo_usage_data();
+    let strings = localization::resolve_language(
+        draft.language.as_deref().and_then(LanguageId::from_code),
+    )
+    .strings();
+
+    // Natural widget size, computed with window.rs's own layout math (`sc`/
+    // `active_model_count`/`total_widget_width_for`) so the preview's internal proportions
+    // (which `paint_content` lays out entirely in terms of that same `sc()`) stay consistent
+    // with the width/height we pass it.
+    let active_models = window::active_model_count(
+        usage.show_claude_code,
+        usage.show_codex,
+        usage.show_antigravity,
+    );
+    let natural_w = window::total_widget_width_for(active_models, &draft.geometry);
+    let natural_h = window::sc(draft.geometry.height);
+
+    let pad = scale(16, dpi);
+    let avail_w = (content_rect.right - content_rect.left - pad * 2).max(1);
+    let avail_h = (content_rect.bottom - content_rect.top - pad * 2).max(1);
+    let w = natural_w.clamp(1, avail_w);
+    let h = natural_h.clamp(1, avail_h);
+
+    let mem_dc = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, w, h);
+    if bmp.is_invalid() {
+        let _ = DeleteDC(mem_dc);
+        return;
+    }
+    let old_bmp = SelectObject(mem_dc, bmp);
+
+    window::paint_widget(mem_dc, w, h, &draft, &frame, &usage, is_dark, strings);
+
+    let _ = BitBlt(
+        hdc,
+        content_rect.left + pad,
+        content_rect.top + pad,
+        w,
+        h,
+        mem_dc,
+        0,
+        0,
+        SRCCOPY,
+    );
+
+    SelectObject(mem_dc, old_bmp);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(mem_dc);
+}
+
+/// Advance the preview's local animation clock by one tick and repaint. Mirrors
+/// `window.rs`'s `render_layered`/`IDT_ANIM` dt-measurement and idle-stop pattern, but against
+/// this window's own `ConfigState.preview_clock` -- entirely independent of the main widget's
+/// global `ANIM` clock.
+unsafe fn tick_preview(hwnd: HWND) {
+    let active = {
+        let mut guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let dt = match state.preview_last_tick {
+            Some(prev) => now.duration_since(prev),
+            None => Duration::from_millis(16),
+        };
+        state.preview_last_tick = Some(now);
+        let usage_max = DEMO_TARGETS.iter().cloned().fold(0.0f32, f32::max);
+        let (frame, active) = state.preview_clock.tick(dt, usage_max);
+        state.preview_frame = frame;
+        active
+    };
+
+    let _ = InvalidateRect(hwnd, None, false);
+
+    // The clock has nothing left to animate (fill settled, no shimmer/glow pulsing, fade
+    // complete): stop the timer so idle CPU returns to ~0% instead of repainting every 16ms
+    // forever, and clear the last-tick timestamp so a future kick (e.g. Task 13 changing
+    // `draft.animation`) starts clean.
+    if !active {
+        let _ = KillTimer(hwnd, IDT_PREVIEW_ANIM);
+        if let Some(state) = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            state.preview_last_tick = None;
+        }
+    }
 }
 
 unsafe extern "system" fn config_wnd_proc(
@@ -458,10 +641,17 @@ unsafe extern "system" fn config_wnd_proc(
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == IDT_PREVIEW_ANIM {
+                tick_preview(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // Deliberately does NOT call PostQuitMessage: this window shares the process's
             // single `GetMessageW` loop (window::run) with the main widget window, so
             // posting WM_QUIT here would tear down the whole app, not just this window.
+            let _ = KillTimer(hwnd, IDT_PREVIEW_ANIM);
             *CONFIG_HWND.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
             LRESULT(0)

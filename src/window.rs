@@ -14,7 +14,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::animation::AnimationClock;
+use crate::animation::{AnimationClock, AnimationFrame};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
@@ -146,7 +146,11 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
-fn sc(px: i32) -> i32 {
+///
+/// `pub(crate)`: also used by `config_window.rs` to size its live preview so the preview's
+/// internal layout (which goes through `paint_content`, itself built entirely on this same
+/// `sc()`) stays dimensionally consistent with the width/height passed to `paint_widget`.
+pub(crate) fn sc(px: i32) -> i32 {
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
     (px as f64 * dpi as f64 / 96.0).round() as i32
 }
@@ -1111,7 +1115,9 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
+/// `pub(crate)`: also used by `config_window.rs` to compute the preview widget's natural
+/// size (see `sc`'s doc comment).
+pub(crate) fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
     (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
 }
 
@@ -1123,7 +1129,8 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32, geometry: &settings::Geometry) -> i32 {
+/// `pub(crate)`: also used by `config_window.rs` (see `sc`'s doc comment).
+pub(crate) fn total_widget_width_for(active_models: i32, geometry: &settings::Geometry) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let model_width = (sc(SEGMENT_W) + sc(geometry.spacing)) * bar_segments - sc(geometry.spacing)
         + sc(BAR_RIGHT_MARGIN)
@@ -1450,6 +1457,153 @@ pub fn run() {
     }
 }
 
+/// Bundled per-model usage data (percentages + display text + section visibility) that
+/// `paint_widget` needs. Groups the ~16 loose parameters `paint_content` used to take for
+/// this concern into one value so both the real widget (`render_layered`, built from
+/// `AppState`) and the settings-window preview (`config_window.rs`, built from a hardcoded
+/// demo dataset) can construct one of these instead of threading individual percent/text
+/// pairs through call sites.
+pub(crate) struct UsageData {
+    pub session_pct: f64,
+    pub session_text: String,
+    pub weekly_pct: f64,
+    pub weekly_text: String,
+    pub codex_session_pct: f64,
+    pub codex_session_text: String,
+    pub codex_weekly_pct: f64,
+    pub codex_weekly_text: String,
+    pub antigravity_session_pct: f64,
+    pub antigravity_session_text: String,
+    pub antigravity_weekly_pct: f64,
+    pub antigravity_weekly_text: String,
+    pub show_claude_code: bool,
+    pub show_codex: bool,
+    pub show_antigravity: bool,
+}
+
+/// Adaptive dark/light default colors with `appearance`'s optional overrides applied.
+/// Returns `(background, text, track/divider)`. Single source of truth shared by
+/// `paint_widget` (which uses all three to draw) and `render_layered` (which needs just the
+/// background color to know which DIB pixels are "background" for the alpha-channel
+/// post-process -- see the `bg_bgr` comparison below).
+fn derive_colors(appearance: &settings::Appearance, is_dark: bool) -> (Color, Color, Color) {
+    let track_default = if is_dark {
+        Color::from_hex("#444444")
+    } else {
+        Color::from_hex("#AAAAAA")
+    };
+    let text_default = if is_dark {
+        Color::from_hex("#888888")
+    } else {
+        Color::from_hex("#404040")
+    };
+    let bg_default = if is_dark {
+        Color::from_hex("#1C1C1C")
+    } else {
+        Color::from_hex("#F3F3F3")
+    };
+    // Option-override model: `None` (the default) reproduces today's adaptive colors
+    // exactly; `Some(rgba)` overrides them.
+    let track = appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
+    let text_color = appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
+    let bg_color = appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
+    (bg_color, text_color, track)
+}
+
+/// Paint the widget's bars/labels/text onto `hdc` at `width`x`height`, given explicit
+/// `settings`/`frame`/`usage` rather than reading global state. Shared by the real widget's
+/// `render_layered` (which builds these from `AppState`/`current_settings()`/the global
+/// animation clock and then does layered-window-specific DIB/alpha/`UpdateLayeredWindow`
+/// work around this call) and the settings window's live preview (which builds these from
+/// `draft`/a demo `UsageData`/a local animation clock and blits straight into its own
+/// window's DC -- no DIB or layering involved there).
+pub(crate) fn paint_widget(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    settings: &settings::Settings,
+    frame: &AnimationFrame,
+    usage: &UsageData,
+    is_dark: bool,
+    strings: Strings,
+) {
+    let accent = claude_accent_color();
+    let codex_accent = codex_accent_color(is_dark);
+    let antigravity_accent = antigravity_accent_color();
+    let (bg_color, text_color, track) = derive_colors(&settings.appearance, is_dark);
+
+    // Shimmer/glow render params: `None` disables the effect entirely (either turned off in
+    // settings, or -- for glow -- not currently pulsing because no bar is over threshold).
+    let shimmer_fx = settings
+        .animation
+        .shimmer
+        .on
+        .then_some((frame.shimmer_phase, settings.animation.shimmer.intensity));
+    let glow_fx = (frame.glow_intensity > 0.0)
+        .then_some((settings.animation.alert_glow.threshold, frame.glow_intensity));
+
+    // Map the animated fill fractions back onto each bar using the SAME ordered-slot
+    // sequence used to feed the clock's `set_targets`, so index N always refers to the same
+    // bar here as it did when the target was set. Falls back to the raw (unanimated)
+    // percentage for any slot the frame doesn't have yet (e.g. before the first poll
+    // population, or a demo dataset whose clock hasn't been ticked with matching targets).
+    let slots = ordered_bar_slots(usage.show_claude_code, usage.show_codex, usage.show_antigravity);
+    let mut anim_session_pct = usage.session_pct;
+    let mut anim_weekly_pct = usage.weekly_pct;
+    let mut anim_codex_session_pct = usage.codex_session_pct;
+    let mut anim_codex_weekly_pct = usage.codex_weekly_pct;
+    let mut anim_antigravity_session_pct = usage.antigravity_session_pct;
+    let mut anim_antigravity_weekly_pct = usage.antigravity_weekly_pct;
+    for (i, slot) in slots.iter().enumerate() {
+        let Some(&frac) = frame.fill_pcts.get(i) else {
+            continue;
+        };
+        let pct = (frac as f64) * 100.0;
+        match slot {
+            BarSlot::ClaudeSession => anim_session_pct = pct,
+            BarSlot::ClaudeWeekly => anim_weekly_pct = pct,
+            BarSlot::CodexSession => anim_codex_session_pct = pct,
+            BarSlot::CodexWeekly => anim_codex_weekly_pct = pct,
+            BarSlot::AntigravitySession => anim_antigravity_session_pct = pct,
+            BarSlot::AntigravityWeekly => anim_antigravity_weekly_pct = pct,
+        }
+    }
+
+    paint_content(
+        hdc,
+        width,
+        height,
+        is_dark,
+        &bg_color,
+        &text_color,
+        &accent,
+        &track,
+        strings,
+        anim_session_pct,
+        &usage.session_text,
+        anim_weekly_pct,
+        &usage.weekly_text,
+        anim_codex_session_pct,
+        &usage.codex_session_text,
+        anim_codex_weekly_pct,
+        &usage.codex_weekly_text,
+        anim_antigravity_session_pct,
+        &usage.antigravity_session_text,
+        anim_antigravity_weekly_pct,
+        &usage.antigravity_weekly_text,
+        usage.show_claude_code,
+        usage.show_codex,
+        usage.show_antigravity,
+        &codex_accent,
+        &antigravity_accent,
+        &settings.geometry,
+        &settings.typography,
+        settings.appearance.palette,
+        shimmer_fx,
+        glow_fx,
+    );
+}
+
 /// Render widget content and push to the layered window via UpdateLayeredWindow.
 /// Renders fully opaque with the actual taskbar background colour so that
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
@@ -1536,71 +1690,32 @@ fn render_layered() {
     let usage_max = bar_fracts.iter().cloned().fold(0.0f32, f32::max);
     let (frame, anim_active) = with_anim(|clock| clock.tick(dt, usage_max));
 
-    // Map the animated fill fractions back onto each bar using the SAME ordered-slot
-    // sequence used to build `bar_fracts` / feed `set_targets`, so index N always refers to
-    // the same bar here as it did when the target was set. Falls back to the real
-    // (unanimated) percentage for any slot the frame doesn't have yet (e.g. before the
-    // first poll population).
-    let slots = ordered_bar_slots(show_claude_code, show_codex, show_antigravity);
-    let mut anim_session_pct = session_pct;
-    let mut anim_weekly_pct = weekly_pct;
-    let mut anim_codex_session_pct = codex_session_pct;
-    let mut anim_codex_weekly_pct = codex_weekly_pct;
-    let mut anim_antigravity_session_pct = antigravity_session_pct;
-    let mut anim_antigravity_weekly_pct = antigravity_weekly_pct;
-    for (i, slot) in slots.iter().enumerate() {
-        let Some(&frac) = frame.fill_pcts.get(i) else {
-            continue;
-        };
-        let pct = (frac as f64) * 100.0;
-        match slot {
-            BarSlot::ClaudeSession => anim_session_pct = pct,
-            BarSlot::ClaudeWeekly => anim_weekly_pct = pct,
-            BarSlot::CodexSession => anim_codex_session_pct = pct,
-            BarSlot::CodexWeekly => anim_codex_weekly_pct = pct,
-            BarSlot::AntigravitySession => anim_antigravity_session_pct = pct,
-            BarSlot::AntigravityWeekly => anim_antigravity_weekly_pct = pct,
-        }
-    }
-
-    // Shimmer/glow render params: `None` disables the effect entirely (either turned off
-    // in settings, or -- for glow -- not currently pulsing because no bar is over
-    // threshold).
-    let shimmer_fx = cfg
-        .animation
-        .shimmer
-        .on
-        .then_some((frame.shimmer_phase, cfg.animation.shimmer.intensity));
-    let glow_fx = (frame.glow_intensity > 0.0)
-        .then_some((cfg.animation.alert_glow.threshold, frame.glow_intensity));
-
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let width = total_widget_width_for(active_models, &cfg.geometry);
     let height = sc(cfg.geometry.height);
 
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
-    let track_default = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
+    // Only the background color is needed directly here (for the alpha-channel
+    // "background -> nearly transparent" post-process below); `paint_widget` derives the
+    // same triple internally for drawing.
+    let (bg_color, _, _) = derive_colors(&cfg.appearance, is_dark);
+
+    let usage = UsageData {
+        session_pct,
+        session_text,
+        weekly_pct,
+        weekly_text,
+        codex_session_pct,
+        codex_session_text,
+        codex_weekly_pct,
+        codex_weekly_text,
+        antigravity_session_pct,
+        antigravity_session_text,
+        antigravity_weekly_pct,
+        antigravity_weekly_text,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
     };
-    let text_default = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_default = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
-    // Option-override model: `None` (the default) reproduces today's adaptive colors
-    // exactly; `Some(rgba)` overrides them.
-    let track = cfg.appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
-    let text_color = cfg.appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
-    let bg_color = cfg.appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -1635,41 +1750,9 @@ fn render_layered() {
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
-        // Fill widths animate (anim_*_pct); the text and segment count still reflect the
-        // real polled percentage (the *_text strings are untouched above).
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            strings,
-            anim_session_pct,
-            &session_text,
-            anim_weekly_pct,
-            &weekly_text,
-            anim_codex_session_pct,
-            &codex_session_text,
-            anim_codex_weekly_pct,
-            &codex_weekly_text,
-            anim_antigravity_session_pct,
-            &antigravity_session_text,
-            anim_antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
-            &cfg.geometry,
-            &cfg.typography,
-            cfg.appearance.palette,
-            shimmer_fx,
-            glow_fx,
-        );
+        // Fill widths animate (via `frame`); the text and segment count still reflect the
+        // real polled percentage (`usage`'s *_text fields are untouched above).
+        paint_widget(mem_dc, width, height, &cfg, &frame, &usage, is_dark, strings);
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).

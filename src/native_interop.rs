@@ -22,6 +22,12 @@ pub const TIMER_UPDATE_CHECK: usize = 4;
 /// Started when a render kicks off an animation and stopped once `AnimationClock::tick`
 /// reports `active == false`, so idle CPU returns to ~0%.
 pub const IDT_ANIM: usize = 0xA0;
+/// Same purpose as `IDT_ANIM` but for the settings window's live preview animation clock
+/// (`config_window.rs`). Deliberately a distinct ID/value from `IDT_ANIM`: the two clocks are
+/// wholly independent (the preview never shares the main widget's global `ANIM`), and this
+/// keeps their timers unambiguous even though in practice Win32 already scopes timer IDs per
+/// HWND, so the two windows' timers could never actually collide.
+pub const IDT_PREVIEW_ANIM: usize = 0xA1;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
