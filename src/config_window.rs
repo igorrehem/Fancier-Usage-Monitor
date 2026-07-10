@@ -125,6 +125,13 @@ const RGBA_COL_GAP: i32 = 16;
 // Presets section (Task 16): a 2x2 grid of large clickable "cards", one per built-in preset.
 const PRESET_CARD_H: i32 = 56;
 const PRESET_CARD_GAP: i32 = 12;
+/// Height reserved for the Presets section's intro sentence, which is long enough (especially
+/// in several non-English locales) to need word-wrapping across multiple lines rather than the
+/// single-line `CTRL_HEADER_H` row every other section header uses. Sized to comfortably fit
+/// ~3 wrapped lines at the section-controls font (12px Segoe UI) within the controls area's
+/// width at the window's default size -- generous rather than tight, since the controls area
+/// has plenty of vertical slack below the 2x2 preset-card grid.
+const PRESETS_INTRO_H: i32 = 48;
 
 /// Per-window state for the config window. Only one instance can exist at a time (enforced
 /// by `open_config_window`'s idempotency check), so this is held in a global rather than via
@@ -1766,13 +1773,23 @@ fn dispatch_update(
     changed
 }
 
-/// Presets section layout: an intro header row followed by a 2x2 grid of large clickable
-/// "cards", one per `PRESET_IDS`/`PRESET_LABELS` entry. Shared by draw + dispatch so hit-testing
-/// can never drift from what's painted -- the same discipline every other section's `*_layout`
-/// function follows.
+/// Presets section layout: a word-wrapped intro sentence (`PRESETS_INTRO_H` tall, not the
+/// standard single-line header row) followed by a 2x2 grid of large clickable "cards", one per
+/// `PRESET_IDS`/`PRESET_LABELS` entry. Shared by draw + dispatch so hit-testing can never drift
+/// from what's painted -- the same discipline every other section's `*_layout` function follows.
 fn presets_layout(area: RECT, dpi: u32) -> (RECT, [RECT; 4]) {
     let mut cursor = RowCursor::new(area, dpi);
-    let header = cursor.header();
+    // Not `cursor.header()`: the intro is a full sentence (longer still in several non-English
+    // locales) that needs to word-wrap across multiple lines, not the single-line 18px header
+    // row every other section uses -- see `PRESETS_INTRO_H`.
+    let intro_h = scale(PRESETS_INTRO_H, dpi);
+    let header = RECT {
+        left: cursor.left,
+        top: cursor.y,
+        right: cursor.right,
+        bottom: cursor.y + intro_h,
+    };
+    cursor.y += intro_h + scale(CTRL_HEADER_GAP, dpi);
     cursor.group_gap();
 
     let cols = 2i32;
@@ -1799,13 +1816,33 @@ fn presets_layout(area: RECT, dpi: u32) -> (RECT, [RECT; 4]) {
     (header, cards)
 }
 
+/// Draws the Presets section's intro sentence, word-wrapping it across `rect` (sized by
+/// `PRESETS_INTRO_H` in `presets_layout`) instead of truncating it to a single ellipsized line
+/// like `draw_field_label` does for the short one-word/one-phrase labels used elsewhere in this
+/// window. Deliberately a separate function rather than a `draw_field_label` flag: that helper's
+/// `DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS` combination is correct for every other call
+/// site (short labels in a fixed-height row) and `DT_VCENTER` is incompatible with `DT_WORDBREAK`
+/// (Windows silently ignores `DT_WORDBREAK` when `DT_SINGLELINE` is set, and `DT_VCENTER`/
+/// `DT_BOTTOM` are only meaningful in single-line mode), so this needed its own flag set anyway.
+unsafe fn draw_presets_intro(hdc: HDC, rect: RECT, dark: bool, text: &str) {
+    let color = if dark {
+        Color::new(0xd0, 0xd0, 0xd0)
+    } else {
+        Color::new(0x30, 0x30, 0x30)
+    };
+    let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut r = rect;
+    let _ = DrawTextW(hdc, &mut wide, &mut r, DT_LEFT | DT_TOP | DT_WORDBREAK);
+}
+
 /// Draws the intro line plus the four preset cards, highlighting whichever preset (if any)
 /// `draft.animation.preset` currently records as last-applied -- purely a visual "this one's
 /// active" cue, not a control with its own state (clicking any card, including the highlighted
 /// one, always re-applies it).
 unsafe fn draw_presets_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, active: Option<PresetId>, strings: &Strings) {
     let (header, cards) = presets_layout(area, dpi);
-    draw_field_label(hdc, header, dark, strings.presets_intro);
+    draw_presets_intro(hdc, header, dark, strings.presets_intro);
     let labels = preset_labels(strings);
     for i in 0..4 {
         let primary = active == Some(PRESET_IDS[i]);
@@ -2066,6 +2103,11 @@ unsafe extern "system" fn config_wnd_proc(
                     match guard.as_mut() {
                         Some(state) if state.active_section != idx => {
                             state.active_section = idx;
+                            // Force-close the Font section's family dropdown so navigating away
+                            // while it's open (the only WM_LBUTTONDOWN path that bypasses
+                            // dispatch_controls, which is what normally closes a dropdown on an
+                            // outside click) never leaves it rendering pre-expanded on return.
+                            state.controls.font.family.close();
                             true
                         }
                         _ => false,

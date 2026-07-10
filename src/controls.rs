@@ -630,6 +630,14 @@ impl Dropdown {
             None
         }
     }
+
+    /// Force-closes the open list, if any, without changing `selected`. Used by embedders that
+    /// need to guarantee a dropdown isn't left visually "stuck open" when something other than a
+    /// click on/around the dropdown itself (e.g. navigating away from the section that owns it)
+    /// makes the open list stop making sense to show. A no-op if already closed.
+    pub fn close(&mut self) {
+        self.open = false;
+    }
 }
 
 impl Control for Dropdown {
