@@ -47,18 +47,30 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::animation::{AnimationClock, AnimationFrame};
 use crate::controls::{Control, Dropdown, RgbaPicker, Segmented, Slider, Toggle};
 use crate::diagnose;
-use crate::localization::{self, LanguageId};
+use crate::localization::{self, LanguageId, Strings};
 use crate::native_interop::{self, Color, IDT_PREVIEW_ANIM};
 use crate::settings::{PaletteStops, PresetId, Rgba, Settings, Weight};
 use crate::theme;
 use crate::window::{self, UsageData};
 
 const CLASS_NAME: &str = "CcumConfig";
-const WINDOW_TITLE: &str = "Settings";
 
-/// Section labels. Plain hardcoded English placeholders for this task; localized strings
-/// come in Task 18.
-const SECTIONS: [&str; 6] = ["Appearance", "Font", "Size", "Animations", "Update", "Presets"];
+/// Number of section-nav items (Appearance/Font/Size/Animations/Update/Presets); fixed
+/// regardless of locale, unlike the labels themselves (see `sections`).
+const SECTION_COUNT: usize = 6;
+
+/// Section-nav labels, localized (Task 18). Order matches `ConfigState::active_section`'s
+/// indices (0=Appearance .. 5=Presets) throughout this file.
+fn sections(strings: &Strings) -> [&'static str; SECTION_COUNT] {
+    [
+        strings.section_appearance,
+        strings.section_font,
+        strings.section_size,
+        strings.section_animations,
+        strings.section_update,
+        strings.section_presets,
+    ]
+}
 
 // Layout constants, all in "baseline" (96 DPI) pixels; scaled at paint/hit-test time via
 // `scale()` using this window's own live per-monitor DPI (see `effective_dpi`). This
@@ -152,15 +164,18 @@ struct ConfigState {
     last_synced_poll_interval_ms: u32,
 }
 
-/// Display labels for `AppearanceControls::pickers`, in the same order as the array itself.
-const APPEARANCE_PICKER_LABELS: [&str; 6] = [
-    "Calm",
-    "Attention",
-    "Critical",
-    "Background",
-    "Text",
-    "Divider",
-];
+/// Display labels for `AppearanceControls::pickers`, in the same order as the array itself,
+/// localized (Task 18).
+fn appearance_picker_labels(strings: &Strings) -> [&'static str; 6] {
+    [
+        strings.color_calm,
+        strings.color_attention,
+        strings.color_critical,
+        strings.color_background,
+        strings.color_text,
+        strings.color_divider,
+    ]
+}
 
 /// Six `RgbaPicker`s bound to `Appearance`'s color fields, plus the opacity `Slider`.
 /// `pickers` order matches `APPEARANCE_PICKER_LABELS`: [calm, attention, critical, background,
@@ -215,13 +230,34 @@ struct AnimationControls {
 /// `_1HOUR`), duplicated here as plain values rather than importing those private consts since
 /// this task's file scope is `config_window.rs` only; full menu<->window sync is Task 17.
 const FREQ_PRESETS_MS: [u32; 4] = [60_000, 300_000, 900_000, 3_600_000];
-const FREQUENCY_LABELS: [&str; 5] = ["1 min", "5 min", "15 min", "1 hour", "Custom"];
+
+/// Frequency segment labels, localized (Task 18): the four presets (reusing the same
+/// `Strings` fields the main widget's right-click menu already uses for these exact same
+/// durations -- `one_minute`/`five_minutes`/`fifteen_minutes`/`one_hour`) plus "Custom".
+fn frequency_labels(strings: &Strings) -> [&'static str; 5] {
+    [
+        strings.one_minute,
+        strings.five_minutes,
+        strings.fifteen_minutes,
+        strings.one_hour,
+        strings.frequency_custom,
+    ]
+}
 
 /// Built-in style presets (Task 16), in the order the Presets section's card grid displays
-/// them. `PRESET_LABELS[i]` names `PRESET_IDS[i]`; kept as two parallel arrays (rather than a
-/// `[(&str, PresetId); 4]`) so `PRESET_LABELS` can be indexed the same way `APPEARANCE_PICKER_
-/// LABELS` etc. already are elsewhere in this file.
-const PRESET_LABELS: [&str; 4] = ["Default", "Glass", "Neon", "Minimal"];
+/// them. `preset_labels(strings)[i]` names `PRESET_IDS[i]`; kept parallel to `PRESET_IDS`
+/// (rather than a `[(&str, PresetId); 4]`) so it can be indexed the same way
+/// `appearance_picker_labels` etc. already are elsewhere in this file. Localized (Task 18):
+/// "Glass"/"Neon"/"Minimal" read as descriptive style adjectives rather than proper brand
+/// names (unlike e.g. a font family name), so they're translated like any other label.
+fn preset_labels(strings: &Strings) -> [&'static str; 4] {
+    [
+        strings.preset_default,
+        strings.preset_glass,
+        strings.preset_neon,
+        strings.preset_minimal,
+    ]
+}
 const PRESET_IDS: [PresetId; 4] = [PresetId::Default, PresetId::Glass, PresetId::Neon, PresetId::Minimal];
 
 /// Frequency `Segmented` (presets + "Custom") plus a custom `Slider` in whole minutes, both
@@ -280,6 +316,14 @@ fn default_palette_seed() -> PaletteStops {
     }
 }
 
+/// Resolves this window's active `Strings` from `settings.language` (falling back to the
+/// system default when unset/invalid) -- the single place every section of this file goes to
+/// answer "what language is the settings window showing right now" (Task 18).
+fn strings_for(settings: &Settings) -> Strings {
+    localization::resolve_language(settings.language.as_deref().and_then(LanguageId::from_code))
+        .strings()
+}
+
 /// Maps `poll_interval_ms` to (segment index, custom-slider minutes). Falls back to the
 /// "Custom" segment (index 4) with the equivalent minute count whenever the value doesn't
 /// exactly match one of `FREQ_PRESETS_MS`.
@@ -292,7 +336,7 @@ fn frequency_selection(poll_interval_ms: u32) -> (usize, f32) {
 }
 
 impl SectionControls {
-    fn from_settings(s: &Settings, is_dark: bool) -> Self {
+    fn from_settings(s: &Settings, is_dark: bool, strings: &Strings) -> Self {
         let (bg_default, text_default, divider_default) = adaptive_default_colors(is_dark);
         let palette = s.appearance.palette.unwrap_or_else(default_palette_seed);
         let background = s
@@ -340,7 +384,11 @@ impl SectionControls {
             // `default_font_size` doc comment) without allowing degenerate/illegible sizes.
             size: Slider::new(s.typography.size_pt, 6.0, 18.0),
             weight: Segmented::new(
-                vec!["Regular".to_string(), "SemiBold".to_string(), "Bold".to_string()],
+                vec![
+                    strings.weight_regular.to_string(),
+                    strings.weight_semibold.to_string(),
+                    strings.weight_bold.to_string(),
+                ],
                 weight_idx,
             ),
         };
@@ -373,7 +421,7 @@ impl SectionControls {
         let (freq_idx, custom_minutes) = frequency_selection(s.poll_interval_ms);
         let update = UpdateControls {
             frequency: Segmented::new(
-                FREQUENCY_LABELS.iter().map(|s| s.to_string()).collect(),
+                frequency_labels(strings).iter().map(|s| s.to_string()).collect(),
                 freq_idx,
             ),
             custom_minutes: Slider::new(custom_minutes, 1.0, 240.0),
@@ -508,7 +556,8 @@ unsafe fn create_window() {
     let usage_max = DEMO_TARGETS.iter().cloned().fold(0.0f32, f32::max);
     let (preview_frame, _) = preview_clock.tick(Duration::ZERO, usage_max);
 
-    let controls = SectionControls::from_settings(&draft, theme::is_dark_mode());
+    let strings = strings_for(&draft);
+    let controls = SectionControls::from_settings(&draft, theme::is_dark_mode(), &strings);
     let last_synced_poll_interval_ms = draft.poll_interval_ms;
 
     *CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ConfigState {
@@ -531,7 +580,11 @@ unsafe fn create_window() {
     let x = ((screen_w - width) / 2).max(0);
     let y = ((screen_h - height) / 2).max(0);
 
-    let title_wide = native_interop::wide_str(WINDOW_TITLE);
+    // Reuses `strings.settings` (also the main context menu's "Settings" submenu label) as
+    // this window's title bar text rather than adding a dedicated field -- both mean the same
+    // bare noun "Settings", just in different chrome (`open_settings`'s "Settings…" has a
+    // trailing ellipsis implying a further action, which doesn't fit a title bar).
+    let title_wide = native_interop::wide_str(strings.settings);
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         PCWSTR::from_raw(class_wide.as_ptr()),
@@ -634,7 +687,7 @@ fn section_rects(dpi: u32) -> Vec<RECT> {
     let item_h = scale(SECTION_ITEM_H, dpi);
     let top_pad = scale(SECTION_TOP_PAD, dpi);
     let sidebar_w = scale(SIDEBAR_W, dpi);
-    (0..SECTIONS.len())
+    (0..SECTION_COUNT)
         .map(|i| {
             let top = top_pad + i as i32 * item_h;
             RECT {
@@ -670,9 +723,12 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     let dpi = effective_dpi(hwnd);
     let dark = theme::is_dark_mode();
 
-    let active_section = {
+    let (active_section, strings) = {
         let guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|s| s.active_section).unwrap_or(0)
+        match guard.as_ref() {
+            Some(s) => (s.active_section, strings_for(&s.draft)),
+            None => (0, strings_for(&Settings::default())),
+        }
     };
 
     let bg = if dark {
@@ -748,7 +804,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         &divider,
     );
 
-    draw_button_bar(hdc, client_w, client_h, dpi, dark);
+    draw_button_bar(hdc, client_w, client_h, dpi, dark, &strings);
 
     let _ = SetBkMode(hdc, TRANSPARENT);
     let font_name = native_interop::wide_str("Segoe UI");
@@ -770,6 +826,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     );
     let old_font = SelectObject(hdc, font);
 
+    let section_labels = sections(&strings);
     for (i, item_rect) in section_rects(dpi).into_iter().enumerate() {
         if i == active_section {
             fill_rect(hdc, item_rect, &active_tint);
@@ -794,7 +851,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             right: item_rect.right - scale(8, dpi),
             bottom: item_rect.bottom,
         };
-        let mut label_wide: Vec<u16> = SECTIONS[i].encode_utf16().collect();
+        let mut label_wide: Vec<u16> = section_labels[i].encode_utf16().collect();
         let _ = DrawTextW(
             hdc,
             &mut label_wide,
@@ -826,7 +883,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         },
         &divider,
     );
-    draw_section_controls(hdc, controls_area, dpi, dark, active_section);
+    draw_section_controls(hdc, controls_area, dpi, dark, active_section, &strings);
 }
 
 /// Client rect of the content panel (right of the sidebar divider, spanning down to the
@@ -988,7 +1045,7 @@ unsafe fn draw_button(hdc: HDC, rect: RECT, dark: bool, label: &str, primary: bo
 
 /// Draws the three buttons into the button bar, given the window's client size/DPI. Called
 /// from `paint` after the divider above the bar.
-unsafe fn draw_button_bar(hdc: HDC, client_w: i32, client_h: i32, dpi: u32, dark: bool) {
+unsafe fn draw_button_bar(hdc: HDC, client_w: i32, client_h: i32, dpi: u32, dark: bool, strings: &Strings) {
     let (reset, cancel, save) = button_rects(client_w, client_h, dpi);
 
     let font_name = native_interop::wide_str("Segoe UI");
@@ -1010,9 +1067,9 @@ unsafe fn draw_button_bar(hdc: HDC, client_w: i32, client_h: i32, dpi: u32, dark
     );
     let old_font = SelectObject(hdc, font);
 
-    draw_button(hdc, reset, dark, "Reset", false);
-    draw_button(hdc, cancel, dark, "Cancel", false);
-    draw_button(hdc, save, dark, "Save", true);
+    draw_button(hdc, reset, dark, strings.button_reset, false);
+    draw_button(hdc, cancel, dark, strings.button_cancel, false);
+    draw_button(hdc, save, dark, strings.button_save, true);
 
     SelectObject(hdc, old_font);
     let _ = DeleteObject(font);
@@ -1053,7 +1110,8 @@ unsafe fn handle_button_action(hwnd: HWND, action: ButtonAction) {
                 if let Some(state) = guard.as_mut() {
                     let current = window::current_settings();
                     state.draft = Settings::default_preserving_position(current);
-                    state.controls = SectionControls::from_settings(&state.draft, dark);
+                    let strings = strings_for(&state.draft);
+                    state.controls = SectionControls::from_settings(&state.draft, dark, &strings);
                     state.preview_clock.apply_settings(&state.draft.animation);
                     state.preview_last_tick = None;
                     state.last_synced_poll_interval_ms = state.draft.poll_interval_ms;
@@ -1081,10 +1139,7 @@ unsafe fn draw_preview(hdc: HDC, content_rect: RECT, dpi: u32) {
     };
     let is_dark = theme::is_dark_mode();
     let usage = demo_usage_data();
-    let strings = localization::resolve_language(
-        draft.language.as_deref().and_then(LanguageId::from_code),
-    )
-    .strings();
+    let strings = strings_for(&draft);
 
     // Natural widget size, computed with window.rs's own layout math (`sc`/
     // `active_model_count`/`total_widget_width_for`) so the preview's internal proportions
@@ -1282,13 +1337,14 @@ fn appearance_layout(area: RECT, dpi: u32) -> ([RECT; 6], [RECT; 6], RECT, RECT)
     (labels, bodies, opacity_label, opacity_control)
 }
 
-unsafe fn draw_appearance_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &AppearanceControls) {
+unsafe fn draw_appearance_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &AppearanceControls, strings: &Strings) {
     let (labels, bodies, opacity_label, opacity_control) = appearance_layout(area, dpi);
+    let picker_labels = appearance_picker_labels(strings);
     for i in 0..6 {
-        draw_field_label(hdc, labels[i], dark, APPEARANCE_PICKER_LABELS[i]);
+        draw_field_label(hdc, labels[i], dark, picker_labels[i]);
         c.pickers[i].draw(hdc, bodies[i], dark);
     }
-    draw_field_label(hdc, opacity_label, dark, "Opacity");
+    draw_field_label(hdc, opacity_label, dark, strings.field_opacity);
     c.opacity.draw(hdc, opacity_control, dark);
 }
 
@@ -1340,13 +1396,13 @@ fn font_layout(area: RECT, dpi: u32) -> (RECT, RECT, RECT, RECT, RECT, RECT) {
     )
 }
 
-unsafe fn draw_font_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &FontControls) {
+unsafe fn draw_font_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &FontControls, strings: &Strings) {
     let (fl, fc, sl, sctrl, wl, wc) = font_layout(area, dpi);
-    draw_field_label(hdc, fl, dark, "Family");
+    draw_field_label(hdc, fl, dark, strings.field_family);
     c.family.draw(hdc, fc, dark);
-    draw_field_label(hdc, sl, dark, "Size");
+    draw_field_label(hdc, sl, dark, strings.field_size);
     c.size.draw(hdc, sctrl, dark);
-    draw_field_label(hdc, wl, dark, "Weight");
+    draw_field_label(hdc, wl, dark, strings.field_weight);
     c.weight.draw(hdc, wc, dark);
 }
 
@@ -1398,16 +1454,20 @@ fn size_layout(area: RECT, dpi: u32) -> [(RECT, RECT); 6] {
     ]
 }
 
-const SIZE_LABELS: [&str; 6] = [
-    "Height",
-    "Corner Radius",
-    "Bar Thickness",
-    "Label Width",
-    "Text Width",
-    "Spacing",
-];
+/// Localized (Task 18) labels for the six `SizeControls` sliders, in the same field order as
+/// `size_layout`/`SizeControls` itself.
+fn size_labels(strings: &Strings) -> [&'static str; 6] {
+    [
+        strings.geometry_height,
+        strings.geometry_corner_radius,
+        strings.geometry_bar_thickness,
+        strings.geometry_label_width,
+        strings.geometry_text_width,
+        strings.geometry_spacing,
+    ]
+}
 
-unsafe fn draw_size_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &SizeControls) {
+unsafe fn draw_size_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &SizeControls, strings: &Strings) {
     let rows = size_layout(area, dpi);
     let sliders = [
         &c.height,
@@ -1417,8 +1477,9 @@ unsafe fn draw_size_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &Siz
         &c.text_width,
         &c.spacing,
     ];
+    let labels = size_labels(strings);
     for i in 0..6 {
-        draw_field_label(hdc, rows[i].0, dark, SIZE_LABELS[i]);
+        draw_field_label(hdc, rows[i].0, dark, labels[i]);
         sliders[i].draw(hdc, rows[i].1, dark);
     }
 }
@@ -1526,38 +1587,38 @@ unsafe fn draw_group_header(hdc: HDC, rect: RECT, dark: bool, text: &str) {
     draw_field_label(hdc, rect, dark, text);
 }
 
-unsafe fn draw_animation_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &AnimationControls) {
+unsafe fn draw_animation_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &AnimationControls, strings: &Strings) {
     let r = animation_layout(area, dpi);
 
-    draw_group_header(hdc, r.fill_header, dark, "Fill");
-    draw_field_label(hdc, r.fill_on.0, dark, "On");
+    draw_group_header(hdc, r.fill_header, dark, strings.group_fill);
+    draw_field_label(hdc, r.fill_on.0, dark, strings.field_on);
     c.fill_on.draw(hdc, r.fill_on.1, dark);
-    draw_field_label(hdc, r.fill_speed.0, dark, "Speed");
+    draw_field_label(hdc, r.fill_speed.0, dark, strings.field_speed);
     c.fill_speed.draw(hdc, r.fill_speed.1, dark);
 
-    draw_group_header(hdc, r.shimmer_header, dark, "Shimmer");
-    draw_field_label(hdc, r.shimmer_on.0, dark, "On");
+    draw_group_header(hdc, r.shimmer_header, dark, strings.group_shimmer);
+    draw_field_label(hdc, r.shimmer_on.0, dark, strings.field_on);
     c.shimmer_on.draw(hdc, r.shimmer_on.1, dark);
-    draw_field_label(hdc, r.shimmer_speed.0, dark, "Speed");
+    draw_field_label(hdc, r.shimmer_speed.0, dark, strings.field_speed);
     c.shimmer_speed.draw(hdc, r.shimmer_speed.1, dark);
-    draw_field_label(hdc, r.shimmer_intensity.0, dark, "Intensity");
+    draw_field_label(hdc, r.shimmer_intensity.0, dark, strings.field_intensity);
     c.shimmer_intensity.draw(hdc, r.shimmer_intensity.1, dark);
 
-    draw_group_header(hdc, r.glow_header, dark, "Alert Glow");
-    draw_field_label(hdc, r.glow_on.0, dark, "On");
+    draw_group_header(hdc, r.glow_header, dark, strings.group_alert_glow);
+    draw_field_label(hdc, r.glow_on.0, dark, strings.field_on);
     c.glow_on.draw(hdc, r.glow_on.1, dark);
-    draw_field_label(hdc, r.glow_threshold.0, dark, "Threshold");
+    draw_field_label(hdc, r.glow_threshold.0, dark, strings.field_threshold);
     c.glow_threshold.draw(hdc, r.glow_threshold.1, dark);
-    draw_field_label(hdc, r.glow_intensity.0, dark, "Intensity");
+    draw_field_label(hdc, r.glow_intensity.0, dark, strings.field_intensity);
     c.glow_intensity.draw(hdc, r.glow_intensity.1, dark);
 
-    draw_group_header(hdc, r.fade_header, dark, "Fade / Slide");
-    draw_field_label(hdc, r.fade_on.0, dark, "On");
+    draw_group_header(hdc, r.fade_header, dark, strings.group_fade_slide);
+    draw_field_label(hdc, r.fade_on.0, dark, strings.field_on);
     c.fade_on.draw(hdc, r.fade_on.1, dark);
-    draw_field_label(hdc, r.fade_duration.0, dark, "Duration");
+    draw_field_label(hdc, r.fade_duration.0, dark, strings.field_duration);
     c.fade_duration.draw(hdc, r.fade_duration.1, dark);
 
-    draw_field_label(hdc, r.reduce_motion.0, dark, "Reduce Motion");
+    draw_field_label(hdc, r.reduce_motion.0, dark, strings.field_reduce_motion);
     c.reduce_motion.draw(hdc, r.reduce_motion.1, dark);
 }
 
@@ -1664,11 +1725,11 @@ fn update_layout(area: RECT, dpi: u32) -> (RECT, RECT, RECT, RECT) {
     (freq_label, freq_control, custom_label, custom_control)
 }
 
-unsafe fn draw_update_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &UpdateControls) {
+unsafe fn draw_update_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &UpdateControls, strings: &Strings) {
     let (fl, fc, cl, cc) = update_layout(area, dpi);
-    draw_field_label(hdc, fl, dark, "Frequency");
+    draw_field_label(hdc, fl, dark, strings.field_frequency);
     c.frequency.draw(hdc, fc, dark);
-    draw_field_label(hdc, cl, dark, "Custom (min)");
+    draw_field_label(hdc, cl, dark, strings.field_custom_minutes);
     c.custom_minutes.draw(hdc, cc, dark);
 }
 
@@ -1738,17 +1799,13 @@ fn presets_layout(area: RECT, dpi: u32) -> (RECT, [RECT; 4]) {
 /// `draft.animation.preset` currently records as last-applied -- purely a visual "this one's
 /// active" cue, not a control with its own state (clicking any card, including the highlighted
 /// one, always re-applies it).
-unsafe fn draw_presets_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, active: Option<PresetId>) {
+unsafe fn draw_presets_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, active: Option<PresetId>, strings: &Strings) {
     let (header, cards) = presets_layout(area, dpi);
-    draw_field_label(
-        hdc,
-        header,
-        dark,
-        "Click a preset to apply it to Appearance and Animations below. Save to keep it, Cancel to discard.",
-    );
+    draw_field_label(hdc, header, dark, strings.presets_intro);
+    let labels = preset_labels(strings);
     for i in 0..4 {
         let primary = active == Some(PRESET_IDS[i]);
-        draw_button(hdc, cards[i], dark, PRESET_LABELS[i], primary);
+        draw_button(hdc, cards[i], dark, labels[i], primary);
     }
 }
 
@@ -1771,13 +1828,14 @@ fn dispatch_presets(state: &mut ConfigState, area: RECT, dpi: u32, msg: u32, x: 
         return false;
     };
     crate::presets::apply_preset(PRESET_IDS[i], &mut state.draft);
-    state.controls = SectionControls::from_settings(&state.draft, theme::is_dark_mode());
+    let strings = strings_for(&state.draft);
+    state.controls = SectionControls::from_settings(&state.draft, theme::is_dark_mode(), &strings);
     true
 }
 
 /// Draws the active section's controls into `area`. Selects a smaller/lighter font than the
 /// sidebar's (controls need to fit a lot of rows) for the duration of the call.
-unsafe fn draw_section_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, section: usize) {
+unsafe fn draw_section_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, section: usize, strings: &Strings) {
     let guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(state) = guard.as_ref() else {
         return;
@@ -1804,12 +1862,12 @@ unsafe fn draw_section_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, sect
     let old_font = SelectObject(hdc, font);
 
     match section {
-        0 => draw_appearance_controls(hdc, area, dpi, dark, &state.controls.appearance),
-        1 => draw_font_controls(hdc, area, dpi, dark, &state.controls.font),
-        2 => draw_size_controls(hdc, area, dpi, dark, &state.controls.size),
-        3 => draw_animation_controls(hdc, area, dpi, dark, &state.controls.animations),
-        4 => draw_update_controls(hdc, area, dpi, dark, &state.controls.update),
-        _ => draw_presets_controls(hdc, area, dpi, dark, state.draft.animation.preset),
+        0 => draw_appearance_controls(hdc, area, dpi, dark, &state.controls.appearance, strings),
+        1 => draw_font_controls(hdc, area, dpi, dark, &state.controls.font, strings),
+        2 => draw_size_controls(hdc, area, dpi, dark, &state.controls.size, strings),
+        3 => draw_animation_controls(hdc, area, dpi, dark, &state.controls.animations, strings),
+        4 => draw_update_controls(hdc, area, dpi, dark, &state.controls.update, strings),
+        _ => draw_presets_controls(hdc, area, dpi, dark, state.draft.animation.preset, strings),
     }
 
     SelectObject(hdc, old_font);
