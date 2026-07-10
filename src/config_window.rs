@@ -141,6 +141,15 @@ struct ConfigState {
     /// rather than rebuilt each time -- rebuilding from `draft` on every message would lose an
     /// in-progress drag or an open `Dropdown` list.
     controls: SectionControls,
+    /// `draft.poll_interval_ms` as of the last time it was set by *this window* (window-open,
+    /// Reset, or a prior `resync_external_frequency` refresh) -- never by the user dragging the
+    /// Update section's own controls, which write `draft.poll_interval_ms` directly without
+    /// touching this field. `resync_external_frequency` compares the two to tell "the user has
+    /// an unsaved local frequency edit in progress" (fields differ) from "frequency in `draft`
+    /// is still whatever this window last saw" (fields match, so it's safe to pull in an
+    /// external change, e.g. from the main widget's right-click menu, without clobbering the
+    /// user's own edit).
+    last_synced_poll_interval_ms: u32,
 }
 
 /// Display labels for `AppearanceControls::pickers`, in the same order as the array itself.
@@ -500,6 +509,7 @@ unsafe fn create_window() {
     let (preview_frame, _) = preview_clock.tick(Duration::ZERO, usage_max);
 
     let controls = SectionControls::from_settings(&draft, theme::is_dark_mode());
+    let last_synced_poll_interval_ms = draft.poll_interval_ms;
 
     *CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ConfigState {
         draft,
@@ -508,6 +518,7 @@ unsafe fn create_window() {
         preview_frame,
         preview_last_tick: None,
         controls,
+        last_synced_poll_interval_ms,
     });
 
     // Size/position using the primary monitor's current DPI; refined per-monitor via
@@ -1045,6 +1056,7 @@ unsafe fn handle_button_action(hwnd: HWND, action: ButtonAction) {
                     state.controls = SectionControls::from_settings(&state.draft, dark);
                     state.preview_clock.apply_settings(&state.draft.animation);
                     state.preview_last_tick = None;
+                    state.last_synced_poll_interval_ms = state.draft.poll_interval_ms;
                 }
             }
             let _ = SetTimer(hwnd, IDT_PREVIEW_ANIM, 16, None);
@@ -1917,6 +1929,43 @@ unsafe fn tick_preview(hwnd: HWND) {
     }
 }
 
+/// Pulls a frequency change made via the main widget's right-click menu (`window.rs`'s
+/// `IDM_FREQ_*` handler, which updates `AppState` and -- via `save_state_settings` --
+/// `window::current_settings()`/disk) into this window's Update section, for when the settings
+/// window was already open at the time of that menu change (Task 17). Without this, only the
+/// *next* window-open (or Reset) would pick up the new value, since `draft` is otherwise just a
+/// point-in-time snapshot taken when the window was created.
+///
+/// Only refreshes when `draft.poll_interval_ms` still equals `last_synced_poll_interval_ms`,
+/// i.e. the user hasn't started editing frequency in this window since the last sync -- an
+/// unsaved local edit always wins over an external change rather than being silently
+/// overwritten. Called on `WM_ACTIVATE` (this window regaining focus), which is cheap and
+/// avoids running a dedicated poll timer for this one field.
+unsafe fn resync_external_frequency(hwnd: HWND) {
+    let refreshed = {
+        let mut guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let external = window::current_settings().poll_interval_ms;
+        if external == state.draft.poll_interval_ms
+            || state.draft.poll_interval_ms != state.last_synced_poll_interval_ms
+        {
+            false
+        } else {
+            state.draft.poll_interval_ms = external;
+            let (idx, minutes) = frequency_selection(external);
+            state.controls.update.frequency.selected = idx;
+            state.controls.update.custom_minutes.value = minutes;
+            state.last_synced_poll_interval_ms = external;
+            true
+        }
+    };
+    if refreshed {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
 unsafe extern "system" fn config_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -2019,6 +2068,14 @@ unsafe extern "system" fn config_wnd_proc(
             apply_dark_titlebar(hwnd, theme::is_dark_mode());
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            // Low word of wParam is WA_INACTIVE (0) / WA_ACTIVE (1) / WA_CLICKACTIVE (2); only
+            // the latter two (window gaining focus) should trigger a resync.
+            if (wparam.0 & 0xFFFF) != 0 {
+                resync_external_frequency(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER => {
             if wparam.0 == IDT_PREVIEW_ANIM {

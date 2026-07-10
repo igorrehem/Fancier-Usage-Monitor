@@ -408,9 +408,37 @@ pub fn current_settings() -> settings::Settings {
 
 /// Store new settings (e.g. from the settings window) and immediately repaint so the
 /// change is visible.
+///
+/// Also the single point where an externally-supplied `poll_interval_ms` (e.g. the settings
+/// window's Update section) is reconciled into the *running* `AppState` and its live poll
+/// timer -- mirroring what the `IDM_FREQ_*` menu handler does inline. Without this, saving a
+/// new frequency from the settings window would persist to disk/`SETTINGS` correctly but the
+/// real `SetTimer(TIMER_POLL, ...)` interval (and the menu's checkmark, which reads
+/// `AppState.poll_interval_ms`) would silently keep the old value until restart. The menu
+/// handler is left as-is (it already keeps `AppState` and `SETTINGS`/disk in sync via
+/// `save_state_settings`) rather than rerouted through here, since `store_settings` is
+/// documented as must-not-repaint-mid-save and folding this repainting path into
+/// `save_state_settings` would violate that.
 pub fn set_settings(s: settings::Settings) {
+    let new_interval = s.poll_interval_ms;
     store_settings(s);
     anim_apply_settings();
+    let retimer_hwnd = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|st| {
+            if st.poll_interval_ms == new_interval {
+                None
+            } else {
+                st.poll_interval_ms = new_interval;
+                Some(st.hwnd.to_hwnd())
+            }
+        })
+    };
+    if let Some(hwnd) = retimer_hwnd {
+        unsafe {
+            SetTimer(hwnd, TIMER_POLL, new_interval, None);
+        }
+    }
     render_layered();
 }
 
