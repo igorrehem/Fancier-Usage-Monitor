@@ -10,7 +10,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -20,8 +20,8 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, IDT_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK,
-    WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    self, Color, IDT_ANIM, IDT_TRAY_CLICK_DEBOUNCE, TIMER_COUNTDOWN, TIMER_POLL,
+    TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::settings;
@@ -2568,6 +2568,12 @@ unsafe extern "system" fn wnd_proc(
                 IDT_ANIM => {
                     render_layered();
                 }
+                IDT_TRAY_CLICK_DEBOUNCE => {
+                    // One-shot: stop it before acting so it doesn't keep firing every
+                    // GetDoubleClickTime() interval.
+                    let _ = KillTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE);
+                    toggle_widget_visibility(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -2955,12 +2961,19 @@ unsafe extern "system" fn wnd_proc(
         _ if msg == WM_APP_TRAY => {
             match tray_icon::handle_message(lparam) {
                 tray_icon::TrayAction::ToggleWidget => {
-                    toggle_widget_visibility(hwnd);
+                    // Don't toggle immediately: a real double-click delivers WM_LBUTTONUP
+                    // (this arm) for its first click before WM_LBUTTONDBLCLK fires for the
+                    // second. Debounce with a short one-shot timer instead; if the
+                    // double-click arrives before it fires, the OpenSettings arm below kills
+                    // it and the toggle never happens. A single click still toggles once the
+                    // timer expires, just delayed by GetDoubleClickTime() (imperceptible).
+                    let _ = SetTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE, GetDoubleClickTime(), None);
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
                     show_context_menu(hwnd);
                 }
                 tray_icon::TrayAction::OpenSettings => {
+                    let _ = KillTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE);
                     config_window::open_config_window();
                 }
                 tray_icon::TrayAction::None => {}

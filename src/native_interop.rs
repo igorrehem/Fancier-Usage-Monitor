@@ -28,6 +28,15 @@ pub const IDT_ANIM: usize = 0xA0;
 /// keeps their timers unambiguous even though in practice Win32 already scopes timer IDs per
 /// HWND, so the two windows' timers could never actually collide.
 pub const IDT_PREVIEW_ANIM: usize = 0xA1;
+/// One-shot debounce timer for tray icon clicks. Windows always delivers `WM_LBUTTONUP` for
+/// the first click of a double-click before `WM_LBUTTONDBLCLK` fires for the second, so a
+/// naive handler would toggle widget visibility on every double-click just before opening
+/// settings. Instead, `WM_LBUTTONUP` starts this timer (duration `GetDoubleClickTime()`)
+/// rather than acting immediately; if `WM_LBUTTONDBLCLK` arrives first, the timer is killed
+/// and settings opens without the toggle ever firing. Distinct from `IDT_ANIM`/
+/// `IDT_PREVIEW_ANIM` (Win32 scopes timer IDs per HWND anyway, so collision isn't possible,
+/// but a distinct ID keeps the `WM_TIMER` dispatch unambiguous).
+pub const IDT_TRAY_CLICK_DEBOUNCE: usize = 0xA2;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;

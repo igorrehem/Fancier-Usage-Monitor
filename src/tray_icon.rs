@@ -18,6 +18,7 @@ const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
 
 /// Actions the tray message handler can request from the main window.
+#[derive(Debug, PartialEq, Eq)]
 pub enum TrayAction {
     None,
     ToggleWidget,
@@ -450,10 +451,11 @@ pub fn remove_all(hwnd: HWND) {
 /// Interpret a tray callback message and return the action to take.
 ///
 /// Note: Windows delivers `WM_LBUTTONUP` for the first click of a double-click before
-/// `WM_LBUTTONDBLCLK` fires for the second, so a real double-click will also toggle the
-/// widget once (via the single-click handler) before opening settings. This mirrors the
-/// behavior of many tray icons (e.g. Explorer's), where the single click still fires; we
-/// accept it rather than add a debounce/timer to suppress the first click.
+/// `WM_LBUTTONDBLCLK` fires for the second. To keep a double-click from also toggling widget
+/// visibility, the caller (`window.rs`) does not act on `ToggleWidget` immediately — it starts
+/// a short one-shot debounce timer (`IDT_TRAY_CLICK_DEBOUNCE`) and only performs the toggle
+/// when that timer fires. If `WM_LBUTTONDBLCLK` arrives first, the caller kills the pending
+/// timer before opening settings, so the toggle is skipped entirely.
 pub fn handle_message(lparam: LPARAM) -> TrayAction {
     let mouse_msg = lparam.0 as u32;
     match mouse_msg {
@@ -474,4 +476,46 @@ fn copy_to_tip(s: &str, tip: &mut [u16; 128]) {
     }
     tip[..len].copy_from_slice(&wide[..len]);
     tip[len] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These pin down the click -> action mapping that window.rs's tray debounce depends on:
+    // WM_LBUTTONUP must keep mapping to ToggleWidget (window.rs turns this into "start the
+    // debounce timer" rather than acting immediately) and WM_LBUTTONDBLCLK must keep mapping
+    // to OpenSettings (window.rs turns this into "kill the pending timer, then open
+    // settings"). If either mapping changes, the debounce in window.rs silently breaks.
+    #[test]
+    fn single_click_up_maps_to_toggle_widget() {
+        assert_eq!(
+            handle_message(LPARAM(WM_LBUTTONUP as isize)),
+            TrayAction::ToggleWidget
+        );
+    }
+
+    #[test]
+    fn double_click_maps_to_open_settings() {
+        assert_eq!(
+            handle_message(LPARAM(WM_LBUTTONDBLCLK as isize)),
+            TrayAction::OpenSettings
+        );
+    }
+
+    #[test]
+    fn right_click_up_maps_to_show_context_menu() {
+        assert_eq!(
+            handle_message(LPARAM(WM_RBUTTONUP as isize)),
+            TrayAction::ShowContextMenu
+        );
+    }
+
+    #[test]
+    fn unrecognized_message_maps_to_none() {
+        assert_eq!(
+            handle_message(LPARAM(WM_MOUSEMOVE as isize)),
+            TrayAction::None
+        );
+    }
 }
