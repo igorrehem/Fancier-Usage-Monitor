@@ -673,10 +673,14 @@ impl Control for RgbaPicker {
                         return event;
                     }
                 }
-                // Outside the closed row, the swatch grid, the "Custom…" row, and any
-                // revealed slider: dismiss without changing the value (see struct doc
-                // comment / `Dropdown`'s identical outside-click convention).
-                self.close();
+                // Anywhere else inside the popover's own bounds (e.g. the padding margin
+                // around the swatch grid, or the gaps between swatch cells) is a dead zone:
+                // a no-op, not a dismissal. Only a click genuinely outside `popover_rect`
+                // dismisses the popover (see struct doc comment / `Dropdown`'s identical
+                // outside-click convention).
+                if !self.point_in(x, y, self.popover_rect(rect)) {
+                    self.close();
+                }
                 None
             }
             WM_MOUSEMOVE => {
@@ -1813,6 +1817,62 @@ mod popover_tests {
         // A click far outside both the row and the popover.
         let _ = picker.on_mouse(WM_LBUTTONDOWN, 500, 500, rect);
         assert!(!picker.open, "an outside click must close the popover");
+    }
+
+    #[test]
+    fn click_in_swatch_grid_gap_stays_open_and_is_a_no_op() {
+        // Regression test: a click that lands inside `popover_rect`'s bounds but in a
+        // "dead zone" (here, the `POPOVER_SWATCH_GAP` gap between quick-swatch cells 0 and
+        // 1) must be a no-op, not a dismissal. Before this fix, any click not specifically
+        // matched by the row/swatch/Custom-row/slider checks fell through to `close()`,
+        // even when it was still clearly inside the open popover.
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        picker.open = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+
+        // Cell 0 spans x in [4, 28); cell 1 starts at x = 32 (POPOVER_SWATCH_GAP = 4 wide).
+        // x = 30, y = 30 falls in that horizontal gap, within the grid's row-0 vertical
+        // band (y in [24, 48)) but outside every swatch cell.
+        let cell0 = picker.swatch_cell_rect(0, rect);
+        let cell1 = picker.swatch_cell_rect(1, rect);
+        assert!(cell0.right < cell1.left, "expected a real gap between adjacent swatch cells");
+        let gap_x = cell0.right + (cell1.left - cell0.right) / 2;
+        let gap_y = cell0.top + 6;
+        assert!(picker.swatch_at(gap_x, gap_y, rect).is_none(), "test point must miss every cell");
+        assert!(
+            picker.point_in(gap_x, gap_y, picker.popover_rect(rect)),
+            "test point must still be inside the popover's own bounds"
+        );
+
+        let event = picker.on_mouse(WM_LBUTTONDOWN, gap_x, gap_y, rect);
+        assert!(event.is_none(), "a dead-zone click inside the popover must not fire an event");
+        assert!(picker.open, "a dead-zone click inside the popover must not close it");
+    }
+
+    #[test]
+    fn click_on_revealed_slider_label_column_stays_open_and_is_a_no_op() {
+        // Companion regression test: a click on the "R"/"G"/"B"/"A" label column of a
+        // *revealed* popover slider row (custom_expanded == true) is also a dead zone —
+        // it's inside `popover_rect` but doesn't hit `popover_slider_row_at` (which
+        // excludes the label column, same as the legacy `row_at`). Before this fix it fell
+        // through to the outside-click branch and closed the whole popover; the legacy
+        // always-visible sliders already treated the equivalent click as inert (see
+        // `rgba_picker_label_click_does_not_zero_slider_value`), so the popover-mode
+        // sliders should match.
+        let mut picker = RgbaPicker::new(Rgba { r: 10, g: 20, b: 30, a: 255 });
+        picker.open = true;
+        picker.custom_expanded = true;
+        let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
+
+        let row0 = picker.popover_slider_row_rect(0, rect);
+        let label_x = row0.left + 2; // inside the "R" label column (< LABEL_WIDTH)
+        let label_y = (row0.top + row0.bottom) / 2;
+        assert!(picker.popover_slider_row_at(label_x, label_y, rect).is_none());
+
+        let event = picker.on_mouse(WM_LBUTTONDOWN, label_x, label_y, rect);
+        assert!(event.is_none(), "a label-column click must not fire an event");
+        assert!(picker.open, "a label-column click must not close the popover");
+        assert_eq!(picker.value.r, 10, "the R channel must not be zeroed");
     }
 
     #[test]
