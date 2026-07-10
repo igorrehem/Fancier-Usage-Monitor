@@ -1,16 +1,17 @@
 //! Settings window shell (Task 11) plus live preview (Task 12) plus per-section controls
-//! (Task 13): a top-level, titled `CcumConfig` window with a left section-nav list, and a
-//! right content panel split into a top preview strip -- a WYSIWYG live preview of `draft`
-//! (via `window::paint_widget`, the same paint path the real widget uses) with a running demo
-//! animation -- and, below it, the active section's controls, all bound directly to `draft`
-//! fields. Dragging/clicking a control updates `draft` and repaints the preview immediately;
-//! nothing here ever touches the real widget's global settings/animation state (that only
-//! happens via `window::set_settings`, wired up in Task 14/15's Save button).
+//! (Task 13) plus Save/Cancel/Reset (Task 14): a top-level, titled `CcumConfig` window with a
+//! left section-nav list, and a right content panel split into a top preview strip -- a
+//! WYSIWYG live preview of `draft` (via `window::paint_widget`, the same paint path the real
+//! widget uses) with a running demo animation -- and, below it, the active section's controls,
+//! all bound directly to `draft` fields. Dragging/clicking a control updates `draft` and
+//! repaints the preview immediately; nothing here touches the real widget's global settings/
+//! animation state until the bottom button bar's Save is clicked (`window::set_settings`) --
+//! Cancel discards `draft`, Reset snaps it back to the real widget's current settings (see
+//! `handle_button_action`).
 //!
 //! Scope for this task: Appearance/Font/Size/Animations/Update sections get real controls;
 //! Presets stays a placeholder (its buttons + `apply_preset` are Task 16, and `presets.rs`
-//! doesn't exist yet). Still no Save/Cancel/Reset (Task 14), no menu/tray entry point
-//! (Task 15).
+//! doesn't exist yet). Still no menu/tray entry point (Task 15).
 //!
 //! # Threading / message-loop architecture
 //!
@@ -73,6 +74,12 @@ const SECTION_TOP_PAD: i32 = 16;
 const SECTION_TEXT_INSET: i32 = 20;
 const BUTTON_BAR_H: i32 = 56;
 const ACCENT_BAR_W: i32 = 3;
+
+// --- Save/Cancel/Reset button bar (Task 14) ---
+const BTN_W: i32 = 84;
+const BTN_H: i32 = 30;
+const BTN_GAP: i32 = 10;
+const BTN_BAR_PAD: i32 = 16;
 
 // --- Per-section control layout (Task 13) ---
 //
@@ -704,7 +711,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         &divider,
     );
 
-    // Divider above the (currently empty) button bar.
+    // Divider above the button bar.
     fill_rect(
         hdc,
         RECT {
@@ -715,6 +722,8 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         },
         &divider,
     );
+
+    draw_button_bar(hdc, client_w, client_h, dpi, dark);
 
     let _ = SetBkMode(hdc, TRANSPARENT);
     let font_name = native_interop::wide_str("Segoe UI");
@@ -839,6 +848,195 @@ fn split_content(content_rect: RECT, dpi: u32) -> (RECT, RECT) {
         bottom: (content_rect.bottom - pad).max(controls_top),
     };
     (preview_rect, controls_area)
+}
+
+// --- Save/Cancel/Reset button bar (Task 14) ---
+
+/// Which button (if any) a click landed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ButtonAction {
+    Save,
+    Cancel,
+    Reset,
+}
+
+/// Rects for the three button-bar buttons, given the window's current client size: `Reset`
+/// pinned to the left edge, `Cancel`/`Save` pinned to the right edge (`Save` rightmost,
+/// matching the common OK-is-rightmost convention), all vertically centered in the bar.
+/// Shared by `paint` (drawing) and the `WM_LBUTTONDOWN` handler (hit-testing) so the two can
+/// never drift apart, the same discipline used by `split_content`/`content_rect_for` above.
+fn button_rects(client_w: i32, client_h: i32, dpi: u32) -> (RECT, RECT, RECT) {
+    let bar_h = scale(BUTTON_BAR_H, dpi);
+    let body_bottom = client_h - bar_h;
+    let btn_w = scale(BTN_W, dpi);
+    let btn_h = scale(BTN_H, dpi);
+    let gap = scale(BTN_GAP, dpi);
+    let pad = scale(BTN_BAR_PAD, dpi);
+
+    let top = body_bottom + (bar_h - btn_h) / 2;
+    let bottom = top + btn_h;
+
+    let save_right = client_w - pad;
+    let save_left = save_right - btn_w;
+    let save = RECT { left: save_left, top, right: save_right, bottom };
+
+    let cancel_right = save_left - gap;
+    let cancel_left = cancel_right - btn_w;
+    let cancel = RECT { left: cancel_left, top, right: cancel_right, bottom };
+
+    let reset_left = pad;
+    let reset_right = reset_left + btn_w;
+    let reset = RECT { left: reset_left, top, right: reset_right, bottom };
+
+    (reset, cancel, save)
+}
+
+/// `button_rects` computed fresh from `hwnd`'s live client size/DPI, mirroring
+/// `content_rect_for`.
+fn button_rects_for(hwnd: HWND) -> (RECT, RECT, RECT) {
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    let dpi = effective_dpi(hwnd);
+    button_rects(client.right - client.left, client.bottom - client.top, dpi)
+}
+
+/// Which button (if any) contains client point `(x, y)`.
+fn button_at(x: i32, y: i32, reset: RECT, cancel: RECT, save: RECT) -> Option<ButtonAction> {
+    let hit = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+    if hit(save) {
+        Some(ButtonAction::Save)
+    } else if hit(cancel) {
+        Some(ButtonAction::Cancel)
+    } else if hit(reset) {
+        Some(ButtonAction::Reset)
+    } else {
+        None
+    }
+}
+
+/// Draws one button: `Save` as a filled accent "primary" button, `Cancel`/`Reset` as bordered
+/// "secondary" buttons -- the same accent color and dark-mode-aware neutral tones `paint` (the
+/// sidebar's active-section highlight) already uses elsewhere in this window, rather than
+/// inventing a new palette just for these three buttons.
+unsafe fn draw_button(hdc: HDC, rect: RECT, dark: bool, label: &str, primary: bool) {
+    let accent = Color::new(0xd9, 0x77, 0x57);
+    let (bg, text_color, border) = if primary {
+        (accent, Color::new(0xff, 0xff, 0xff), None)
+    } else {
+        let bg = if dark {
+            Color::new(0x2a, 0x2a, 0x2a)
+        } else {
+            Color::new(0xff, 0xff, 0xff)
+        };
+        let text = if dark {
+            Color::new(0xf0, 0xf0, 0xf0)
+        } else {
+            Color::new(0x20, 0x20, 0x20)
+        };
+        let border = if dark {
+            Color::new(0x45, 0x45, 0x45)
+        } else {
+            Color::new(0xc0, 0xc0, 0xc0)
+        };
+        (bg, text, Some(border))
+    };
+
+    fill_rect(hdc, rect, &bg);
+    if let Some(border) = border {
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(border.to_colorref()));
+        let old_pen = SelectObject(hdc, pen);
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+    }
+
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+    let mut wide: Vec<u16> = label.encode_utf16().collect();
+    let mut r = rect;
+    let _ = DrawTextW(hdc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+/// Draws the three buttons into the button bar, given the window's client size/DPI. Called
+/// from `paint` after the divider above the bar.
+unsafe fn draw_button_bar(hdc: HDC, client_w: i32, client_h: i32, dpi: u32, dark: bool) {
+    let (reset, cancel, save) = button_rects(client_w, client_h, dpi);
+
+    let font_name = native_interop::wide_str("Segoe UI");
+    let font = CreateFontW(
+        -scale(13, dpi),
+        0,
+        0,
+        0,
+        FW_MEDIUM.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_TT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        PCWSTR::from_raw(font_name.as_ptr()),
+    );
+    let old_font = SelectObject(hdc, font);
+
+    draw_button(hdc, reset, dark, "Reset", false);
+    draw_button(hdc, cancel, dark, "Cancel", false);
+    draw_button(hdc, save, dark, "Save", true);
+
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+/// Runs a button's effect. `Save` persists `draft` to disk and applies it to the real widget
+/// (via `window::set_settings`, which also repaints the real widget immediately), then closes
+/// the window. `Cancel` closes the window without touching disk or the real widget at all --
+/// `draft` is simply dropped along with the rest of `ConfigState` in the `WM_DESTROY` handler.
+/// `Reset` replaces `draft` with `Settings::default_preserving_position` of the *real widget's
+/// current* settings (not `draft` -- resetting should snap all the way back to what's on disk
+/// today, undoing any in-progress edits too) and rebuilds `state.controls` from it so the
+/// section controls' own displayed values (each `Slider`/`RgbaPicker`/etc. holds its own copy,
+/// not a live view of `draft`) stay in sync; it does not close the window or touch disk/the
+/// real widget, so the user can keep editing or still Cancel afterward.
+unsafe fn handle_button_action(hwnd: HWND, action: ButtonAction) {
+    match action {
+        ButtonAction::Save => {
+            let draft = {
+                let guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|s| s.draft.clone())
+            };
+            if let Some(draft) = draft {
+                crate::settings::save(&draft);
+                window::set_settings(draft);
+            }
+            let _ = ReleaseCapture();
+            let _ = DestroyWindow(hwnd);
+        }
+        ButtonAction::Cancel => {
+            let _ = ReleaseCapture();
+            let _ = DestroyWindow(hwnd);
+        }
+        ButtonAction::Reset => {
+            let dark = theme::is_dark_mode();
+            {
+                let mut guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(state) = guard.as_mut() {
+                    let current = window::current_settings();
+                    state.draft = Settings::default_preserving_position(current);
+                    state.controls = SectionControls::from_settings(&state.draft, dark);
+                    state.preview_clock.apply_settings(&state.draft.animation);
+                    state.preview_last_tick = None;
+                }
+            }
+            let _ = SetTimer(hwnd, IDT_PREVIEW_ANIM, 16, None);
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
 }
 
 /// Render `draft` via the same `paint_widget` the real widget uses (with a small hardcoded
@@ -1658,6 +1856,13 @@ unsafe extern "system" fn config_wnd_proc(
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let dpi = effective_dpi(hwnd);
+            // Button-bar clicks act immediately on down (matching the section-nav click below)
+            // and are handled before capture/dispatch since Save/Cancel destroy the window.
+            let (reset_rect, cancel_rect, save_rect) = button_rects_for(hwnd);
+            if let Some(action) = button_at(x, y, reset_rect, cancel_rect, save_rect) {
+                handle_button_action(hwnd, action);
+                return LRESULT(0);
+            }
             // Capture the mouse for the duration of the click/drag so WM_MOUSEMOVE keeps
             // arriving (and WM_LBUTTONUP is guaranteed to arrive) even if the cursor leaves
             // the client area mid-drag -- harmless to call even for a plain section-nav click

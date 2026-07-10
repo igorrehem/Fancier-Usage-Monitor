@@ -396,6 +396,35 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// A fresh `Settings::default()` with the state-derived fields copied over from `current`
+    /// instead of reset: `tray_offset`, `taskbar_index`, `poll_interval_ms`, `language`,
+    /// `last_update_check_unix`, `widget_visible`, `show_claude_code`, `show_codex`,
+    /// `show_antigravity`. Everything else (appearance/typography/geometry/animation) comes
+    /// back as `Settings::default()`'s values.
+    ///
+    /// This is the settings window's Reset button: the user wants the widget's *look* put back
+    /// to factory defaults without also relocating it, changing its poll cadence, losing which
+    /// models it's tracking, forgetting a language override, or re-triggering an update check
+    /// that already happened. The field list mirrors exactly what `window::save_state_settings`
+    /// treats as "state-derived, must survive" a settings write -- these two lists must be kept
+    /// in sync if either grows a new state-derived field.
+    pub fn default_preserving_position(current: Settings) -> Settings {
+        Settings {
+            tray_offset: current.tray_offset,
+            taskbar_index: current.taskbar_index,
+            poll_interval_ms: current.poll_interval_ms,
+            language: current.language,
+            last_update_check_unix: current.last_update_check_unix,
+            widget_visible: current.widget_visible,
+            show_claude_code: current.show_claude_code,
+            show_codex: current.show_codex,
+            show_antigravity: current.show_antigravity,
+            ..Settings::default()
+        }
+    }
+}
+
 pub fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata)
@@ -453,6 +482,52 @@ mod tests {
         assert_eq!(s.widget_visible, false);
         assert_eq!(s.show_claude_code, true);
         assert_eq!(s.appearance.opacity, 1.0);
+    }
+
+    #[test]
+    fn default_preserving_position_resets_appearance_but_keeps_state_fields() {
+        let mut current = Settings::default();
+        // Non-default appearance/typography/geometry/animation, so we can confirm it's reset.
+        current.appearance.opacity = 0.4;
+        current.appearance.background = Some(Rgba { r: 9, g: 9, b: 9, a: 255 });
+        current.typography.family = "Comic Sans MS".to_string();
+        current.typography.size_pt = 24.0;
+        current.geometry.height = 99;
+        current.animation.fill.on = false;
+        current.animation.reduce_motion = true;
+        // State-derived fields the Reset button must preserve.
+        current.tray_offset = 123;
+        current.taskbar_index = 2;
+        current.poll_interval_ms = 60_000;
+        current.language = Some("pt-BR".to_string());
+        current.last_update_check_unix = Some(1_700_000_000);
+        current.widget_visible = false;
+        current.show_claude_code = false;
+        current.show_codex = true;
+        current.show_antigravity = true;
+
+        let reset = Settings::default_preserving_position(current);
+
+        // Appearance/typography/geometry/animation reset to Settings::default()'s values.
+        let defaults = Settings::default();
+        assert_eq!(reset.appearance.opacity, defaults.appearance.opacity);
+        assert_eq!(reset.appearance.background, None);
+        assert_eq!(reset.typography.family, defaults.typography.family);
+        assert_eq!(reset.typography.size_pt, defaults.typography.size_pt);
+        assert_eq!(reset.geometry.height, defaults.geometry.height);
+        assert_eq!(reset.animation.fill.on, true);
+        assert_eq!(reset.animation.reduce_motion, false);
+
+        // State-derived fields preserved from `current`.
+        assert_eq!(reset.tray_offset, 123);
+        assert_eq!(reset.taskbar_index, 2);
+        assert_eq!(reset.poll_interval_ms, 60_000);
+        assert_eq!(reset.language.as_deref(), Some("pt-BR"));
+        assert_eq!(reset.last_update_check_unix, Some(1_700_000_000));
+        assert_eq!(reset.widget_visible, false);
+        assert_eq!(reset.show_claude_code, false);
+        assert_eq!(reset.show_codex, true);
+        assert_eq!(reset.show_antigravity, true);
     }
 
     #[test]
