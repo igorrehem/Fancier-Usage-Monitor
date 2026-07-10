@@ -1337,26 +1337,40 @@ fn physical_rect_to_baseline(r: RECT, dpi: u32) -> RECT {
     RECT { left: 0, top: 0, right: width, bottom: height }
 }
 
+/// Sentinel, zero-area `RECT` passed to `clamp_geometry` when the real taskbar rect can't be
+/// resolved (no tracked `taskbar_hwnd` yet, or `get_taskbar_rect` failed). `clamp_geometry`'s
+/// taskbar-size-dependent sections (`taskbar_height > 0` / `taskbar_width > 0`) are written to
+/// treat a zero-area rect as "no taskbar constraint" and skip themselves, so this still runs
+/// the per-field sane-bounds section unconditionally -- exactly the behavior needed here: no
+/// real taskbar to compare against, but the corrupted/hand-edited-settings guard must still
+/// apply. Safe by construction: every arithmetic step downstream of `taskbar_height`/
+/// `taskbar_width` is gated behind a `> 0` check before it's used, so a zero rect can't drive a
+/// divide-by-zero or clamp any field to a degenerate (zero/negative) value.
+const NO_TASKBAR_RECT: RECT = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+
 /// Resolves the real, currently-tracked taskbar's rect and DPI, converts it to baseline
 /// pixels, and runs `clamp_geometry` against it. For callers (the settings window's Save
 /// handler, `config_window::handle_button_action`) that only have a `Geometry` in hand and no
 /// taskbar info of their own. Always queries fresh (no caching) since Save is a rare,
 /// user-initiated action where correctness matters more than avoiding one extra query --
 /// contrast with `clamp_geometry_for_render`, which is on the ~60fps animation path and
-/// deliberately caches. Falls back to returning `g` unchanged if the taskbar handle or its
-/// rect can't be resolved right now, matching this module's existing best-effort posture
-/// around taskbar queries (e.g. `position_at_taskbar`'s own early-return arms) -- Save must
-/// never fail just because Explorer.exe is momentarily unavailable.
+/// deliberately caches. If the taskbar handle or its rect can't be resolved right now, still
+/// runs `clamp_geometry` against `NO_TASKBAR_RECT` so the per-field sanity bounds (guarding
+/// against a corrupted/hand-edited `settings.json`) are never skipped -- only the
+/// taskbar-size-dependent height/width caps are skipped, matching this module's existing
+/// best-effort posture around taskbar queries (e.g. `position_at_taskbar`'s own early-return
+/// arms): Save must never fail just because Explorer.exe is momentarily unavailable, but it
+/// must also never persist a raw, unclamped `Geometry`.
 pub(crate) fn clamp_geometry_to_current_taskbar(g: settings::Geometry) -> settings::Geometry {
     let taskbar_hwnd = {
         let state = lock_state();
         state.as_ref().and_then(|s| s.taskbar_hwnd)
     };
     let Some(taskbar_hwnd) = taskbar_hwnd else {
-        return g;
+        return clamp_geometry(g, NO_TASKBAR_RECT);
     };
     let Some(rect) = native_interop::get_taskbar_rect(taskbar_hwnd) else {
-        return g;
+        return clamp_geometry(g, NO_TASKBAR_RECT);
     };
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
     clamp_geometry(g, physical_rect_to_baseline(rect, dpi))
@@ -1389,16 +1403,18 @@ fn taskbar_rect_for_render_clamp(taskbar_hwnd: HWND) -> Option<RECT> {
 
 /// Defensive variant of `clamp_geometry_to_current_taskbar` for the `render_layered` hot path
 /// -- see `taskbar_rect_for_render_clamp`'s doc comment for why it caches. Same best-effort
-/// fallback: returns `g` unchanged if the taskbar can't be resolved.
+/// fallback as `clamp_geometry_to_current_taskbar`: when the taskbar can't be resolved, still
+/// runs `clamp_geometry` against `NO_TASKBAR_RECT` so the per-field sanity bounds keep applying
+/// (see `NO_TASKBAR_RECT`'s doc comment) -- only the taskbar-size-dependent caps are skipped.
 fn clamp_geometry_for_render(
     g: settings::Geometry,
     taskbar_hwnd: Option<HWND>,
 ) -> settings::Geometry {
     let Some(taskbar_hwnd) = taskbar_hwnd else {
-        return g;
+        return clamp_geometry(g, NO_TASKBAR_RECT);
     };
     let Some(rect) = taskbar_rect_for_render_clamp(taskbar_hwnd) else {
-        return g;
+        return clamp_geometry(g, NO_TASKBAR_RECT);
     };
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
     clamp_geometry(g, physical_rect_to_baseline(rect, dpi))
@@ -4153,5 +4169,60 @@ mod clamp_geometry_tests {
         let twice = clamp_geometry(once, taskbar);
 
         assert_eq!(once, twice, "clamping an already-clamped Geometry must be a no-op");
+    }
+
+    // --- Regression: per-field sanity bounds must still apply when the taskbar rect can't be
+    // resolved (`clamp_geometry_to_current_taskbar` / `clamp_geometry_for_render` fall back to
+    // `NO_TASKBAR_RECT`, a zero-area RECT, rather than skipping `clamp_geometry` entirely). ---
+    #[test]
+    fn zero_area_taskbar_rect_still_applies_per_field_sanity_bounds() {
+        // A corrupted/hand-edited settings.json with an out-of-range negative text_width and
+        // an absurdly large spacing -- exactly the class of value the per-field bounds exist
+        // to catch, reaching clamp_geometry with no real taskbar rect to compare against
+        // (taskbar_hwnd not yet resolved, or get_taskbar_rect transiently failing).
+        let g = settings::Geometry {
+            text_width: -50,
+            spacing: 999_999,
+            height: -1,
+            corner_radius: -1,
+            bar_thickness: 0,
+            label_width: -1,
+        };
+
+        let clamped = clamp_geometry(g, NO_TASKBAR_RECT);
+
+        assert!(
+            clamped.text_width >= MIN_TEXT_WIDTH_BASELINE,
+            "text_width {} not bounded to sane minimum despite unresolvable taskbar",
+            clamped.text_width
+        );
+        assert!(
+            clamped.spacing <= MAX_SPACING_BASELINE,
+            "spacing {} not bounded to sane maximum despite unresolvable taskbar",
+            clamped.spacing
+        );
+        assert!(clamped.height >= MIN_HEIGHT_BASELINE);
+        assert!(clamped.height <= MAX_HEIGHT_BASELINE);
+        assert!(clamped.corner_radius >= 0);
+        assert!(clamped.bar_thickness >= MIN_BAR_THICKNESS_BASELINE);
+        assert!(clamped.label_width >= MIN_LABEL_WIDTH_BASELINE);
+    }
+
+    #[test]
+    fn zero_area_taskbar_rect_does_not_apply_size_dependent_caps() {
+        // With no real taskbar to compare against, the taskbar-size-dependent height/width
+        // caps must be skipped entirely -- a Geometry that's merely large (but still within
+        // the generous per-field bounds) should pass through those specific caps unchanged.
+        let g = settings::Geometry {
+            height: MAX_HEIGHT_BASELINE,
+            ..settings::Geometry::default()
+        };
+
+        let clamped = clamp_geometry(g, NO_TASKBAR_RECT);
+
+        assert_eq!(
+            clamped.height, MAX_HEIGHT_BASELINE,
+            "height was capped against a zero-area taskbar rect instead of only the per-field maximum"
+        );
     }
 }
