@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "Cancel",
     button_save: "Save",
     presets_intro: "Click a preset to apply it to Appearance and Animations below. Save to keep it, Cancel to discard.",
+    rgba_custom: "Custom…",
+    preset_category_builtin: "Built-in",
+    preset_category_editors: "Code editors",
+    preset_category_apps: "Apps",
 };

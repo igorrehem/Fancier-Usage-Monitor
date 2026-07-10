@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "Cancelar",
     button_save: "Salvar",
     presets_intro: "Clique numa predefinição para aplicá-la à Aparência e às Animações abaixo. Salve para manter, Cancele para descartar.",
+    rgba_custom: "Personalizado…",
+    preset_category_builtin: "Integrado",
+    preset_category_editors: "Editores de código",
+    preset_category_apps: "Aplicativos",
 };

@@ -62,6 +62,89 @@ fn rgba(r: u8, g: u8, b: u8) -> Rgba {
     Rgba { r, g, b, a: 255 }
 }
 
+/// Which of the three Presets-grid groupings (Task 5) a preset belongs in. English-only
+/// display concerns live in this module rather than `Strings` because preset/category names
+/// here are proper nouns / a fixed 3-way UI grouping, not user-facing prose that needs
+/// translating (see `theme_category`'s doc comment for the exact split).
+#[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetCategory {
+    Builtin,
+    Editors,
+    Apps,
+}
+
+/// The literal, untranslated English display name for preset `id` (proper nouns per the
+/// design spec -- unlike `preset_default`/`preset_glass`/`preset_neon`/`preset_minimal` in
+/// `Strings`, which predate this task and stay localized, these 20 new names are deliberately
+/// NOT part of `Strings` and render identically in every locale). Total match, no wildcard
+/// arm, over all 24 `PresetId` variants -- adding a 25th variant is a compile error here until
+/// this function is updated, the same safety net `apply_preset` relies on.
+#[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
+pub fn theme_display_name(id: PresetId) -> &'static str {
+    match id {
+        PresetId::Default => "Default",
+        PresetId::Glass => "Glass",
+        PresetId::Neon => "Neon",
+        PresetId::Minimal => "Minimal",
+        PresetId::Dracula => "Dracula",
+        PresetId::Nord => "Nord",
+        PresetId::SolarizedDark => "Solarized Dark",
+        PresetId::SolarizedLight => "Solarized Light",
+        PresetId::Gruvbox => "Gruvbox",
+        PresetId::Catppuccin => "Catppuccin",
+        PresetId::TokyoNight => "Tokyo Night",
+        PresetId::OneDark => "One Dark",
+        PresetId::Monokai => "Monokai",
+        PresetId::Material => "Material",
+        PresetId::GitHubDark => "GitHub Dark",
+        PresetId::Discord => "Discord",
+        PresetId::Spotify => "Spotify",
+        PresetId::RosePine => "Rosé Pine",
+        PresetId::Everforest => "Everforest",
+        PresetId::Kanagawa => "Kanagawa",
+        PresetId::SynthwaveEighty4 => "Synthwave '84",
+        PresetId::Ayu => "Ayu",
+        PresetId::Palenight => "Palenight",
+        PresetId::Cyberpunk => "Cyberpunk",
+    }
+}
+
+/// Which of the 3 Presets-grid category groups (Task 5, `strings.preset_category_*`) preset
+/// `id` belongs to: `Builtin` for the original 4 (Default/Glass/Neon/Minimal), `Apps` for the
+/// 2 real-app themes (Discord/Spotify), and `Editors` for the remaining 18 -- including the
+/// neon-leaning Synthwave '84/Cyberpunk and the Material Design-derived Material, which the
+/// design spec folds into "Code editors" rather than giving either its own single/two-item
+/// category, keeping exactly 3 groups total. Total match, no wildcard arm, over all 24
+/// `PresetId` variants.
+#[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
+pub fn theme_category(id: PresetId) -> PresetCategory {
+    match id {
+        PresetId::Default | PresetId::Glass | PresetId::Neon | PresetId::Minimal => {
+            PresetCategory::Builtin
+        }
+        PresetId::Discord | PresetId::Spotify => PresetCategory::Apps,
+        PresetId::Dracula
+        | PresetId::Nord
+        | PresetId::SolarizedDark
+        | PresetId::SolarizedLight
+        | PresetId::Gruvbox
+        | PresetId::Catppuccin
+        | PresetId::TokyoNight
+        | PresetId::OneDark
+        | PresetId::Monokai
+        | PresetId::Material
+        | PresetId::GitHubDark
+        | PresetId::RosePine
+        | PresetId::Everforest
+        | PresetId::Kanagawa
+        | PresetId::SynthwaveEighty4
+        | PresetId::Ayu
+        | PresetId::Palenight
+        | PresetId::Cyberpunk => PresetCategory::Editors,
+    }
+}
+
 /// Mutates `s.appearance` and `s.animation` in place to match built-in preset `id`.
 /// `s.geometry` and `s.typography` are never touched.
 pub fn apply_preset(id: PresetId, s: &mut Settings) {
@@ -863,5 +946,85 @@ mod tests {
             apply_preset(id, &mut s);
             assert_eq!(s.animation.preset, Some(id), "{id:?}");
         }
+    }
+
+    #[test]
+    fn theme_display_name_and_category_are_total_over_all_24_presets() {
+        // `theme_display_name`/`theme_category` are exhaustive `match`es with no wildcard arm,
+        // so this test compiling and running at all (rather than a missing-arm compile error)
+        // is itself part of the totality proof; this loop additionally checks each result is
+        // non-empty / one of the 3 known categories.
+        for id in ALL_24_PRESETS {
+            let name = theme_display_name(id);
+            assert!(!name.is_empty(), "{id:?} has an empty display name");
+            match theme_category(id) {
+                PresetCategory::Builtin | PresetCategory::Editors | PresetCategory::Apps => {}
+            }
+        }
+    }
+
+    #[test]
+    fn theme_display_name_matches_the_brief_s_table_for_a_few_spot_checks() {
+        assert_eq!(theme_display_name(PresetId::Default), "Default");
+        assert_eq!(theme_display_name(PresetId::Dracula), "Dracula");
+        assert_eq!(theme_display_name(PresetId::SolarizedDark), "Solarized Dark");
+        assert_eq!(theme_display_name(PresetId::SolarizedLight), "Solarized Light");
+        assert_eq!(theme_display_name(PresetId::RosePine), "Rosé Pine");
+        assert_eq!(theme_display_name(PresetId::SynthwaveEighty4), "Synthwave '84");
+        assert_eq!(theme_display_name(PresetId::GitHubDark), "GitHub Dark");
+        assert_eq!(theme_display_name(PresetId::OneDark), "One Dark");
+    }
+
+    #[test]
+    fn theme_category_groups_match_the_design_spec() {
+        // Built-in: the original 4.
+        for id in [PresetId::Default, PresetId::Glass, PresetId::Neon, PresetId::Minimal] {
+            assert_eq!(theme_category(id), PresetCategory::Builtin, "{id:?}");
+        }
+        // Apps: exactly Discord and Spotify.
+        for id in [PresetId::Discord, PresetId::Spotify] {
+            assert_eq!(theme_category(id), PresetCategory::Apps, "{id:?}");
+        }
+        // Editors: everything else, including the neon-leaning and Material-derived themes the
+        // design spec folds into "Code editors" rather than a 4th/5th category.
+        for id in [
+            PresetId::Dracula,
+            PresetId::Nord,
+            PresetId::SolarizedDark,
+            PresetId::SolarizedLight,
+            PresetId::Gruvbox,
+            PresetId::Catppuccin,
+            PresetId::TokyoNight,
+            PresetId::OneDark,
+            PresetId::Monokai,
+            PresetId::Material,
+            PresetId::GitHubDark,
+            PresetId::RosePine,
+            PresetId::Everforest,
+            PresetId::Kanagawa,
+            PresetId::SynthwaveEighty4,
+            PresetId::Ayu,
+            PresetId::Palenight,
+            PresetId::Cyberpunk,
+        ] {
+            assert_eq!(theme_category(id), PresetCategory::Editors, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn exactly_three_categories_and_counts_match_the_design_spec() {
+        // Builtin: 4, Apps: 2, Editors: 18 -- the exact 4/2/18 split (17+Material=18) the
+        // design spec calls for, keeping the grid to exactly 3 groups.
+        let (mut builtin, mut editors, mut apps) = (0, 0, 0);
+        for id in ALL_24_PRESETS {
+            match theme_category(id) {
+                PresetCategory::Builtin => builtin += 1,
+                PresetCategory::Editors => editors += 1,
+                PresetCategory::Apps => apps += 1,
+            }
+        }
+        assert_eq!(builtin, 4);
+        assert_eq!(apps, 2);
+        assert_eq!(editors, 18);
     }
 }

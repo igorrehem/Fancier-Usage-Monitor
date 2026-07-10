@@ -229,6 +229,14 @@ pub struct Strings {
     pub button_cancel: &'static str,
     pub button_save: &'static str,
     pub presets_intro: &'static str,
+    // --- RgbaPicker popover + Presets grid categories (Task 4) ---
+    pub rgba_custom: &'static str,
+    #[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
+    pub preset_category_builtin: &'static str,
+    #[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
+    pub preset_category_editors: &'static str,
+    #[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
+    pub preset_category_apps: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

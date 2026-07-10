@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "취소",
     button_save: "저장",
     presets_intro: "프리셋을 클릭하면 아래의 외관과 애니메이션에 적용됩니다. 저장하면 유지되고, 취소하면 취소됩니다.",
+    rgba_custom: "사용자 지정…",
+    preset_category_builtin: "기본 제공",
+    preset_category_editors: "코드 편집기",
+    preset_category_apps: "앱",
 };

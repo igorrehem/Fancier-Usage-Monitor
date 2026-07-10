@@ -241,11 +241,18 @@ pub struct RgbaPicker {
     /// Whether, within the open popover, "Custom…" has been picked and the manual R/G/B/A
     /// sliders are revealed.
     custom_expanded: bool,
+    /// The localized "Custom…" row label (`Strings::rgba_custom`, Task 4). Stored as an owned
+    /// `String` set once at construction, matching `Dropdown::items`'/`Segmented`'s existing
+    /// convention for getting localized text into a control: `draw`'s `Control` trait signature
+    /// takes no `Strings`/language parameter, so callers that have one (the settings window,
+    /// via `SectionControls::from_settings`) bake the resolved text into the control itself
+    /// instead.
+    custom_label: String,
 }
 
 impl RgbaPicker {
     #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
-    pub fn new(value: Rgba) -> Self {
+    pub fn new(value: Rgba, custom_label: String) -> Self {
         Self {
             r_slider: Slider::new(value.r as f32, 0.0, 255.0),
             g_slider: Slider::new(value.g as f32, 0.0, 255.0),
@@ -255,6 +262,7 @@ impl RgbaPicker {
             active: None,
             open: false,
             custom_expanded: false,
+            custom_label,
         }
     }
 
@@ -611,7 +619,7 @@ impl Control for RgbaPicker {
             }
 
             let custom_row = self.custom_row_rect(rect);
-            let mut custom_wide: Vec<u16> = "Custom\u{2026}".encode_utf16().collect();
+            let mut custom_wide: Vec<u16> = self.custom_label.encode_utf16().collect();
             let mut custom_rect = RECT {
                 left: custom_row.left + POPOVER_PAD * 2,
                 top: custom_row.top,
@@ -1373,7 +1381,7 @@ mod tests {
             g: 150,
             b: 100,
             a: 255,
-        });
+        }, "Custom…".to_string());
         let rect = RECT {
             left: 0,
             top: 0,
@@ -1398,7 +1406,7 @@ mod tests {
             g: 150,
             b: 100,
             a: 255,
-        });
+        }, "Custom…".to_string());
         let rect = RECT {
             left: 0,
             top: 0,
@@ -1810,7 +1818,7 @@ mod popover_tests {
 
     #[test]
     fn closed_row_is_one_row_tall() {
-        let picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 }, "Custom…".to_string());
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
         // The closed control's own draw rect is exactly what's passed in — no
         // extra height is consumed until `open` is true.
@@ -1821,7 +1829,7 @@ mod popover_tests {
 
     #[test]
     fn click_on_closed_row_opens_popover() {
-        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 }, "Custom…".to_string());
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
         let _ = picker.on_mouse(WM_LBUTTONDOWN, 10, 10, rect);
         assert!(picker.open, "clicking the closed row must open the popover");
@@ -1829,7 +1837,7 @@ mod popover_tests {
 
     #[test]
     fn click_outside_when_open_closes_it() {
-        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 }, "Custom…".to_string());
         picker.open = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
         // A click far outside both the row and the popover.
@@ -1844,7 +1852,7 @@ mod popover_tests {
         // 1) must be a no-op, not a dismissal. Before this fix, any click not specifically
         // matched by the row/swatch/Custom-row/slider checks fell through to `close()`,
         // even when it was still clearly inside the open popover.
-        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 }, "Custom…".to_string());
         picker.open = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
 
@@ -1877,7 +1885,7 @@ mod popover_tests {
         // always-visible sliders already treated the equivalent click as inert (see
         // `rgba_picker_label_click_does_not_zero_slider_value`), so the popover-mode
         // sliders should match.
-        let mut picker = RgbaPicker::new(Rgba { r: 10, g: 20, b: 30, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 10, g: 20, b: 30, a: 255 }, "Custom…".to_string());
         picker.open = true;
         picker.custom_expanded = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
@@ -1895,7 +1903,7 @@ mod popover_tests {
 
     #[test]
     fn close_forces_open_false() {
-        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 217, g: 119, b: 87, a: 255 }, "Custom…".to_string());
         picker.open = true;
         picker.close();
         assert!(!picker.open);
@@ -1903,7 +1911,7 @@ mod popover_tests {
 
     #[test]
     fn clicking_a_quick_swatch_sets_value_and_closes() {
-        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 }, "Custom…".to_string());
         picker.open = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
         let popover = picker.popover_rect(rect);
@@ -1916,7 +1924,7 @@ mod popover_tests {
 
     #[test]
     fn clicking_custom_reveals_sliders_without_closing() {
-        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 }, "Custom…".to_string());
         picker.open = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
         let custom_row = picker.custom_row_rect(rect);
@@ -1930,7 +1938,7 @@ mod popover_tests {
         // Beyond the brief's literal test list: exercises the full open -> Custom ->
         // drag-a-slider path end to end, including that dragging one channel's slider
         // doesn't perturb the other three (a scenario none of the brief's tests cover).
-        let mut picker = RgbaPicker::new(Rgba { r: 10, g: 20, b: 30, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 10, g: 20, b: 30, a: 255 }, "Custom…".to_string());
         picker.open = true;
         picker.custom_expanded = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
@@ -1965,7 +1973,7 @@ mod popover_tests {
         // checks `value` and `open`, but not that the four `Slider`s were kept in sync — if
         // they weren't, reopening the popover and choosing "Custom…" afterward would show
         // stale slider positions that don't match the swatch just picked.
-        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 });
+        let mut picker = RgbaPicker::new(Rgba { r: 0, g: 0, b: 0, a: 255 }, "Custom…".to_string());
         picker.open = true;
         let rect = RECT { left: 0, top: 0, right: 200, bottom: 20 };
         let cell = picker.swatch_cell_rect(3, rect); // QUICK_SWATCHES[3] = green

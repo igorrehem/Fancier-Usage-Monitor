@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "キャンセル",
     button_save: "保存",
     presets_intro: "プリセットをクリックすると、下の外観とアニメーションに適用されます。保存すると変更が確定し、キャンセルすると破棄されます。",
+    rgba_custom: "カスタム…",
+    preset_category_builtin: "内蔵",
+    preset_category_editors: "コードエディター",
+    preset_category_apps: "アプリ",
 };

@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "取消",
     button_save: "儲存",
     presets_intro: "按一下預設集，即可套用至下方的外觀與動畫。儲存以保留變更，取消以放棄變更。",
+    rgba_custom: "自訂…",
+    preset_category_builtin: "內建",
+    preset_category_editors: "程式碼編輯器",
+    preset_category_apps: "應用程式",
 };

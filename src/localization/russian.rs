@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "Отмена",
     button_save: "Сохранить",
     presets_intro: "Нажмите на пресет, чтобы применить его к разделам «Внешний вид» и «Анимации» ниже. Сохраните, чтобы оставить, или отмените, чтобы отклонить.",
+    rgba_custom: "Свой…",
+    preset_category_builtin: "Встроенные",
+    preset_category_editors: "Редакторы кода",
+    preset_category_apps: "Приложения",
 };

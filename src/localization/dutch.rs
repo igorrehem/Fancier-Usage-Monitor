@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "Annuleren",
     button_save: "Opslaan",
     presets_intro: "Klik op een voorinstelling om deze toe te passen op Uiterlijk en Animaties hieronder. Opslaan om te bewaren, Annuleren om te verwerpen.",
+    rgba_custom: "Aangepast…",
+    preset_category_builtin: "Ingebouwd",
+    preset_category_editors: "Code-editors",
+    preset_category_apps: "Apps",
 };

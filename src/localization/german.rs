@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "Abbrechen",
     button_save: "Speichern",
     presets_intro: "Klicken Sie auf eine Voreinstellung, um sie auf Erscheinungsbild und Animationen unten anzuwenden. Speichern zum Behalten, Abbrechen zum Verwerfen.",
+    rgba_custom: "Benutzerdefiniert…",
+    preset_category_builtin: "Integriert",
+    preset_category_editors: "Code-Editoren",
+    preset_category_apps: "Apps",
 };

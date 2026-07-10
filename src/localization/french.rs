@@ -94,4 +94,8 @@ pub(super) const STRINGS: Strings = Strings {
     button_cancel: "Annuler",
     button_save: "Enregistrer",
     presets_intro: "Cliquez sur un préréglage pour l'appliquer à Apparence et Animations ci-dessous. Enregistrer pour le conserver, Annuler pour l'abandonner.",
+    rgba_custom: "Personnalisé…",
+    preset_category_builtin: "Intégré",
+    preset_category_editors: "Éditeurs de code",
+    preset_category_apps: "Applications",
 };

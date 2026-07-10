@@ -365,12 +365,12 @@ impl SectionControls {
             .unwrap_or_else(|| Rgba::from_color(divider_default));
         let appearance = AppearanceControls {
             pickers: [
-                RgbaPicker::new(palette.calm),
-                RgbaPicker::new(palette.attention),
-                RgbaPicker::new(palette.critical),
-                RgbaPicker::new(background),
-                RgbaPicker::new(text),
-                RgbaPicker::new(divider),
+                RgbaPicker::new(palette.calm, strings.rgba_custom.to_string()),
+                RgbaPicker::new(palette.attention, strings.rgba_custom.to_string()),
+                RgbaPicker::new(palette.critical, strings.rgba_custom.to_string()),
+                RgbaPicker::new(background, strings.rgba_custom.to_string()),
+                RgbaPicker::new(text, strings.rgba_custom.to_string()),
+                RgbaPicker::new(divider, strings.rgba_custom.to_string()),
             ],
             opacity: Slider::new(s.appearance.opacity, 0.0, 1.0),
         };
