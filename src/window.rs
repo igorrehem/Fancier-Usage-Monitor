@@ -15,6 +15,7 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::animation::{AnimationClock, AnimationFrame};
+use crate::config_window;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
@@ -131,6 +132,9 @@ const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+/// Opens the settings window (`config_window::open_config_window`). Placed after
+/// `tray_icon::IDM_TOGGLE_WIDGET` (70) to avoid colliding with any existing menu id.
+const IDM_OPEN_SETTINGS: u16 = 71;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -2941,6 +2945,9 @@ unsafe extern "system" fn wnd_proc(
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
+                IDM_OPEN_SETTINGS => {
+                    config_window::open_config_window();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -2952,6 +2959,9 @@ unsafe extern "system" fn wnd_proc(
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
                     show_context_menu(hwnd);
+                }
+                tray_icon::TrayAction::OpenSettings => {
+                    config_window::open_config_window();
                 }
                 tray_icon::TrayAction::None => {}
             }
@@ -3024,6 +3034,16 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             1,
             PCWSTR::from_raw(refresh_str.as_ptr()),
+        );
+
+        // Opens the settings window (Task 15). Placed near the top since it's the primary
+        // entry point to the settings window feature.
+        let open_settings_str = native_interop::wide_str(strings.open_settings);
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_SETTINGS as usize,
+            PCWSTR::from_raw(open_settings_str.as_ptr()),
         );
 
         // Update Frequency submenu

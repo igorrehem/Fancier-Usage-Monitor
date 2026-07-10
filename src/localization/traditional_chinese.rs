@@ -15,6 +15,7 @@ pub(super) const STRINGS: Strings = Strings {
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "設定",
+    open_settings: "設定…",
     start_with_windows: "開機時啟動",
     reset_position: "重置位置",
     language: "語言",

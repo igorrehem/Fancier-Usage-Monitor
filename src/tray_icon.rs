@@ -22,6 +22,7 @@ pub enum TrayAction {
     None,
     ToggleWidget,
     ShowContextMenu,
+    OpenSettings,
 }
 
 #[derive(Clone, Copy)]
@@ -447,11 +448,18 @@ pub fn remove_all(hwnd: HWND) {
 }
 
 /// Interpret a tray callback message and return the action to take.
+///
+/// Note: Windows delivers `WM_LBUTTONUP` for the first click of a double-click before
+/// `WM_LBUTTONDBLCLK` fires for the second, so a real double-click will also toggle the
+/// widget once (via the single-click handler) before opening settings. This mirrors the
+/// behavior of many tray icons (e.g. Explorer's), where the single click still fires; we
+/// accept it rather than add a debounce/timer to suppress the first click.
 pub fn handle_message(lparam: LPARAM) -> TrayAction {
     let mouse_msg = lparam.0 as u32;
     match mouse_msg {
         WM_LBUTTONUP => TrayAction::ToggleWidget,
         WM_RBUTTONUP => TrayAction::ShowContextMenu,
+        WM_LBUTTONDBLCLK => TrayAction::OpenSettings,
         _ => TrayAction::None,
     }
 }

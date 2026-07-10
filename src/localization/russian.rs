@@ -15,6 +15,7 @@ pub(super) const STRINGS: Strings = Strings {
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "Настройки",
+    open_settings: "Настройки…",
     start_with_windows: "Запускать вместе с Windows",
     reset_position: "Сбросить позицию",
     language: "Язык",

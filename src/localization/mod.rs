@@ -149,6 +149,7 @@ pub struct Strings {
     pub codex_model: &'static str,
     pub antigravity_model: &'static str,
     pub settings: &'static str,
+    pub open_settings: &'static str,
     pub start_with_windows: &'static str,
     pub reset_position: &'static str,
     pub language: &'static str,
