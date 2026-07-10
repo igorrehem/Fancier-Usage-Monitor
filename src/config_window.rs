@@ -115,10 +115,15 @@ const CTRL_HEADER_H: i32 = 18;
 const CTRL_HEADER_GAP: i32 = 4;
 const CTRL_GROUP_GAP: i32 = 12;
 
-// RgbaPicker cells (Appearance section): a small text label above each picker's body.
+// RgbaPicker cells (Appearance section): a small text label above each picker's body. The
+// picker's own *closed* row uses `CTRL_ROW_H`, the same single-row height every other control
+// in this file uses (Slider/Toggle/Dropdown/Segmented rows) -- before the popover (Task 1),
+// this used to be a dedicated `RGBA_PICKER_H = 84` tall enough for all four always-visible R/G/
+// B/A sliders; now that's however tall the popover itself needs, computed per-picker via
+// `RgbaPicker::popover_height()` and folded into the grid's row offsets (`appearance_row_offset`)
+// only while that picker is open.
 const RGBA_LABEL_H: i32 = 16;
 const RGBA_LABEL_GAP: i32 = 4;
-const RGBA_PICKER_H: i32 = 84;
 const RGBA_ROW_GAP: i32 = 12;
 const RGBA_COL_GAP: i32 = 16;
 
@@ -1297,26 +1302,65 @@ unsafe fn draw_field_label(hdc: HDC, rect: RECT, dark: bool, text: &str) {
     );
 }
 
+/// Extra vertical offset applied to grid row `row` (0-based: rows 0..3 are the picker grid's
+/// own rows, row 3 is the "virtual" row just below the grid -- the opacity row) when picker row
+/// `open_row` (if any) has its popover open, `popover_h` tall. Rows at or above `open_row` are
+/// unaffected (`row <= open_row` -- notably including `open_row` itself: the open picker's own
+/// closed-row rect doesn't grow, only what comes *after* it does); every row strictly below it
+/// shifts down by the full popover height to make room. Reflow always moves a whole grid row
+/// (both columns together, not just the column the popover opened in) so the 2-column grid
+/// stays vertically aligned rather than going jagged.
+///
+/// Pure function, split out of `appearance_grid` so the reflow math has direct unit-test
+/// coverage independent of DPI scaling / rect construction (see `appearance_row_offset_tests`
+/// below).
+fn appearance_row_offset(row: i32, open_row: Option<i32>, popover_h: i32) -> i32 {
+    match open_row {
+        Some(open_row) if row > open_row => popover_h,
+        _ => 0,
+    }
+}
+
+/// Which `AppearanceControls::pickers` index (if any) currently has its popover open, plus that
+/// picker's current popover height (0 if none is open). Single source of truth for the "which
+/// row needs reflow room" question, shared by `draw_appearance_controls` and
+/// `dispatch_appearance` via `appearance_layout` so painting and hit-testing can't drift apart.
+/// At most one picker is ever open at a time (enforced in `dispatch_appearance`), so the first
+/// match is the only one that matters.
+fn appearance_open_state(c: &AppearanceControls) -> (Option<usize>, i32) {
+    match c.pickers.iter().position(|p| p.is_open()) {
+        Some(i) => (Some(i), c.pickers[i].popover_height()),
+        None => (None, 0),
+    }
+}
+
 /// The six `RgbaPicker` cell rects (2 columns x 3 rows), each split into a label strip and a
 /// picker body, plus the y just below the grid (where the opacity row starts). Order matches
-/// `AppearanceControls::pickers`/`APPEARANCE_PICKER_LABELS`.
-fn appearance_grid(area: RECT, dpi: u32) -> ([RECT; 6], [RECT; 6], i32) {
+/// `AppearanceControls::pickers`/`APPEARANCE_PICKER_LABELS`. `open_index`/`popover_h` (from
+/// `appearance_open_state`) describe whichever picker currently has its popover open, if any:
+/// every grid row below `open_index`'s row -- and the opacity row past the grid entirely --
+/// shifts down by `popover_h` to make room (see `appearance_row_offset`).
+fn appearance_grid(area: RECT, dpi: u32, open_index: Option<usize>, popover_h: i32) -> ([RECT; 6], [RECT; 6], i32) {
     let cols = 2;
     let col_gap = scale(RGBA_COL_GAP, dpi);
     let row_gap = scale(RGBA_ROW_GAP, dpi);
     let cell_w = ((area.right - area.left) - col_gap * (cols - 1)).max(cols) / cols;
     let label_h = scale(RGBA_LABEL_H, dpi);
     let label_gap = scale(RGBA_LABEL_GAP, dpi);
-    let picker_h = scale(RGBA_PICKER_H, dpi);
+    // Closed-row height: the same single-row height every other control in this file uses (see
+    // `RGBA_LABEL_H`'s doc comment above for why this replaced the old always-4-slider height).
+    let picker_h = scale(CTRL_ROW_H, dpi);
     let cell_h = label_h + label_gap + picker_h;
+    let open_row = open_index.map(|i| i as i32 / cols);
 
     let mut labels = [RECT::default(); 6];
     let mut bodies = [RECT::default(); 6];
     for i in 0..6i32 {
         let col = i % cols;
         let row = i / cols;
+        let offset = appearance_row_offset(row, open_row, popover_h);
         let left = area.left + col * (cell_w + col_gap);
-        let top = area.top + row * (cell_h + row_gap);
+        let top = area.top + row * (cell_h + row_gap) + offset;
         labels[i as usize] = RECT {
             left,
             top,
@@ -1331,13 +1375,19 @@ fn appearance_grid(area: RECT, dpi: u32) -> ([RECT; 6], [RECT; 6], i32) {
         };
     }
     let rows = 3;
-    let grid_bottom = area.top + rows * cell_h + (rows - 1) * row_gap;
+    let grid_bottom =
+        area.top + rows * cell_h + (rows - 1) * row_gap + appearance_row_offset(rows, open_row, popover_h);
     (labels, bodies, grid_bottom)
 }
 
 /// Full Appearance section layout: the six picker cells plus the opacity row below them.
-fn appearance_layout(area: RECT, dpi: u32) -> ([RECT; 6], [RECT; 6], RECT, RECT) {
-    let (labels, bodies, grid_bottom) = appearance_grid(area, dpi);
+fn appearance_layout(
+    area: RECT,
+    dpi: u32,
+    open_index: Option<usize>,
+    popover_h: i32,
+) -> ([RECT; 6], [RECT; 6], RECT, RECT) {
+    let (labels, bodies, grid_bottom) = appearance_grid(area, dpi, open_index, popover_h);
     let mut cursor = RowCursor {
         left: area.left,
         right: area.right,
@@ -1349,10 +1399,14 @@ fn appearance_layout(area: RECT, dpi: u32) -> ([RECT; 6], [RECT; 6], RECT, RECT)
 }
 
 unsafe fn draw_appearance_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, c: &AppearanceControls, strings: &Strings) {
-    let (labels, bodies, opacity_label, opacity_control) = appearance_layout(area, dpi);
+    let (open_index, popover_h) = appearance_open_state(c);
+    let (labels, bodies, opacity_label, opacity_control) = appearance_layout(area, dpi, open_index, popover_h);
     let picker_labels = appearance_picker_labels(strings);
     for i in 0..6 {
         draw_field_label(hdc, labels[i], dark, picker_labels[i]);
+        // `bodies[i]` is only ever the picker's own closed row -- `RgbaPicker::draw` anchors its
+        // popover to `bodies[i].bottom` itself (via `popover_rect`), so the space the reflow
+        // above reserved for it is exactly where the popover lands; no taller rect needed here.
         c.pickers[i].draw(hdc, bodies[i], dark);
     }
     draw_field_label(hdc, opacity_label, dark, strings.field_opacity);
@@ -1368,11 +1422,33 @@ fn dispatch_appearance(
     x: i32,
     y: i32,
 ) -> bool {
-    let (_labels, bodies, _opacity_label, opacity_control) = appearance_layout(area, dpi);
+    let (open_index, popover_h) = appearance_open_state(c);
+    let (_labels, bodies, _opacity_label, opacity_control) = appearance_layout(area, dpi, open_index, popover_h);
     let mut changed = false;
     for i in 0..6 {
-        if dispatch_hit(msg, x, y, bodies[i]) && c.pickers[i].on_mouse(msg, x, y, bodies[i]).is_some() {
+        // No `dispatch_hit` gate here: like `Dropdown` (see `dispatch_font`'s identical
+        // reasoning below), `RgbaPicker` already fully self-validates every hit (`point_in`/
+        // `swatch_at`/`popover_slider_row_at`), and -- unlike a bare `Slider` -- its valid area
+        // legitimately extends *below* `bodies[i]` while open (the quick-swatch grid / "Custom…"
+        // sliders), so gating on `bodies[i]`'s own bounds would wrongly reject a click on an
+        // open popover. This also gives us "outside click closes the popover" for free: since
+        // grid cells never overlap, clicking a *different* picker's row is always outside the
+        // currently-open picker's own rect+popover, so it self-closes via its own `on_mouse`
+        // right here in this same loop.
+        if c.pickers[i].on_mouse(msg, x, y, bodies[i]).is_some() {
             changed = true;
+        }
+    }
+    // Enforce at most one open popover at a time as a defensive backstop (normal single-click
+    // interactions already end up with at most one open, per the self-close behavior noted
+    // above): if more than one picker somehow ended up open, keep only the first and force-close
+    // the rest. Keeps the reflow above bounded to "at most one open popover" and avoids
+    // overlapping popovers.
+    if let Some(open_i) = c.pickers.iter().position(|p| p.is_open()) {
+        for (j, p) in c.pickers.iter_mut().enumerate() {
+            if j != open_i {
+                p.close();
+            }
         }
     }
     if dispatch_hit(msg, x, y, opacity_control) && c.opacity.on_mouse(msg, x, y, opacity_control).is_some() {
@@ -2132,11 +2208,15 @@ unsafe extern "system" fn config_wnd_proc(
                     match guard.as_mut() {
                         Some(state) if state.active_section != idx => {
                             state.active_section = idx;
-                            // Force-close the Font section's family dropdown so navigating away
-                            // while it's open (the only WM_LBUTTONDOWN path that bypasses
-                            // dispatch_controls, which is what normally closes a dropdown on an
-                            // outside click) never leaves it rendering pre-expanded on return.
+                            // Force-close the Font section's family dropdown, and any open
+                            // Appearance `RgbaPicker` popover, so navigating away while one is
+                            // open (the only WM_LBUTTONDOWN path that bypasses dispatch_controls,
+                            // which is what normally closes either one on an outside click) never
+                            // leaves it rendering pre-expanded on return.
                             state.controls.font.family.close();
+                            for picker in &mut state.controls.appearance.pickers {
+                                picker.close();
+                            }
                             true
                         }
                         _ => false,
@@ -2290,7 +2370,7 @@ mod tests {
             right: 500,
             bottom: 800,
         };
-        let (labels, bodies, grid_bottom) = appearance_grid(area, 96);
+        let (labels, bodies, grid_bottom) = appearance_grid(area, 96, None, 0);
         for i in 0..6 {
             assert!(labels[i].bottom <= bodies[i].top); // label sits above its picker body
             assert!(bodies[i].right <= area.right);
@@ -2302,5 +2382,54 @@ mod tests {
         assert!(labels[2].top > labels[0].top);
         assert!(grid_bottom > area.top);
         assert!(grid_bottom <= area.bottom);
+    }
+
+    #[test]
+    fn appearance_grid_reflows_rows_below_an_open_picker() {
+        let area = RECT { left: 0, top: 0, right: 500, bottom: 800 };
+        let popover_h = 150;
+        // Open index 2: row 1, col 0 (index / 2 == 1). Rows 0 (indices 0,1) sit above it and
+        // must be untouched; row 1 (indices 2,3, the open picker's own row) and row 2 (indices
+        // 4,5) sit at/below it.
+        let (closed_labels, closed_bodies, closed_grid_bottom) = appearance_grid(area, 96, None, 0);
+        let (open_labels, open_bodies, open_grid_bottom) = appearance_grid(area, 96, Some(2), popover_h);
+
+        // Row 0 (indices 0, 1): unaffected by an open picker in row 1.
+        assert_eq!(open_labels[0].top, closed_labels[0].top);
+        assert_eq!(open_labels[1].top, closed_labels[1].top);
+        assert_eq!(open_bodies[0].top, closed_bodies[0].top);
+        assert_eq!(open_bodies[1].top, closed_bodies[1].top);
+
+        // Row 1 (indices 2, 3, the open picker's own row): also unaffected -- the open picker's
+        // own closed-row rect doesn't grow, only what comes after it does.
+        assert_eq!(open_labels[2].top, closed_labels[2].top);
+        assert_eq!(open_labels[3].top, closed_labels[3].top);
+
+        // Row 2 (indices 4, 5) and the opacity row past the grid: shifted down by exactly
+        // `popover_h`, and both columns move together (grid stays aligned).
+        assert_eq!(open_labels[4].top, closed_labels[4].top + popover_h);
+        assert_eq!(open_labels[5].top, closed_labels[5].top + popover_h);
+        assert_eq!(open_bodies[4].top, closed_bodies[4].top + popover_h);
+        assert_eq!(open_bodies[5].top, closed_bodies[5].top + popover_h);
+        assert_eq!(open_grid_bottom, closed_grid_bottom + popover_h);
+    }
+
+    #[test]
+    fn appearance_row_offset_pure_math() {
+        // No picker open: every row is at its base position.
+        assert_eq!(appearance_row_offset(0, None, 150), 0);
+        assert_eq!(appearance_row_offset(2, None, 150), 0);
+
+        // Open row 1: rows at/above it (0, 1) are unaffected; rows below it (2, and the
+        // "virtual" row 3 past the grid, e.g. the opacity row) shift by the full popover height.
+        assert_eq!(appearance_row_offset(0, Some(1), 150), 0);
+        assert_eq!(appearance_row_offset(1, Some(1), 150), 0);
+        assert_eq!(appearance_row_offset(2, Some(1), 150), 150);
+        assert_eq!(appearance_row_offset(3, Some(1), 150), 150);
+
+        // A zero popover height (shouldn't happen in practice -- `popover_height()` is always
+        // positive -- but the math should degrade gracefully) offsets by zero even below the
+        // open row.
+        assert_eq!(appearance_row_offset(2, Some(0), 0), 0);
     }
 }

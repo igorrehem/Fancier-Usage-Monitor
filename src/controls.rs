@@ -403,8 +403,9 @@ impl RgbaPicker {
     /// The full popover rect: the quick-swatch grid plus the "Custom…" row plus — while
     /// `custom_expanded` — the four R/G/B/A slider rows, directly below the closed `rect`.
     /// Mirrors `Dropdown::list_rect`'s shape (same width as `rect`, positioned directly
-    /// below it, height depending on current state).
-    fn popover_rect(&self, rect: RECT) -> RECT {
+    /// below it, height depending on current state). Public: the settings window's Appearance
+    /// section layout (`config_window.rs`) needs this to reflow rows below an open picker.
+    pub fn popover_rect(&self, rect: RECT) -> RECT {
         let custom = self.custom_row_rect(rect);
         let sliders_h = if self.custom_expanded {
             POPOVER_SLIDER_ROW_HEIGHT * 4
@@ -417,6 +418,15 @@ impl RgbaPicker {
             right: rect.right,
             bottom: custom.bottom + sliders_h,
         }
+    }
+
+    /// The popover's height alone (independent of `rect`'s position/width -- every input to
+    /// `popover_rect`'s height computation is either a fixed constant or `custom_expanded`).
+    /// Lets a caller doing vertical layout (`appearance_grid`) ask "how much extra space does
+    /// this picker's open popover need?" without constructing a throwaway anchor rect itself.
+    pub fn popover_height(&self) -> i32 {
+        let r = self.popover_rect(RECT { left: 0, top: 0, right: 0, bottom: 0 });
+        r.bottom - r.top
     }
 
     /// The full-width row (label + slider) for channel `index`, within the popover's
@@ -498,6 +508,14 @@ impl RgbaPicker {
     pub fn close(&mut self) {
         self.open = false;
         self.custom_expanded = false;
+    }
+
+    /// Whether the popover is currently open. `open` itself is private (module-internal
+    /// draw/hit-test logic reads it directly); this is the read-only view the settings window
+    /// (a sibling module) uses to find which picker (if any) needs reflow room, and to detect
+    /// open/closed transitions for single-open-at-a-time enforcement.
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 }
 
