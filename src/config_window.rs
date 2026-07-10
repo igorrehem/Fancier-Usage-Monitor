@@ -2075,7 +2075,36 @@ unsafe extern "system" fn config_wnd_proc(
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            paint(hdc, hwnd);
+
+            // `paint` issues dozens of separate GDI calls (fills, text, per-control draws, a
+            // BitBlt for the live preview). Run all of that against an off-screen bitmap sized
+            // to the *current* client rect, then blit the finished frame to the real surface in
+            // one shot -- otherwise each of those calls lands directly on the visible window in
+            // sequence, which is the classic GDI flicker pattern (worst during the preview's
+            // ~60fps grow-in/shimmer/glow animation, which invalidates the whole window on every
+            // tick via `tick_preview`). Mirrors the double-buffering `draw_preview` already does
+            // for its own sub-area, just lifted to cover the whole window.
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let w = (client.right - client.left).max(1);
+            let h = (client.bottom - client.top).max(1);
+
+            let mem_dc = CreateCompatibleDC(hdc);
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            if bmp.is_invalid() {
+                // Off-screen surface unavailable (e.g. exhausted GDI handles): fall back to
+                // painting straight to the window rather than dropping the frame entirely.
+                let _ = DeleteDC(mem_dc);
+                paint(hdc, hwnd);
+            } else {
+                let old_bmp = SelectObject(mem_dc, bmp);
+                paint(mem_dc, hwnd);
+                let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+                SelectObject(mem_dc, old_bmp);
+                let _ = DeleteObject(bmp);
+                let _ = DeleteDC(mem_dc);
+            }
+
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
