@@ -99,6 +99,29 @@ pub enum PresetId {
     Glass,
     Neon,
     Minimal,
+    Dracula,
+    Nord,
+    SolarizedDark,
+    SolarizedLight,
+    Gruvbox,
+    Catppuccin,
+    TokyoNight,
+    OneDark,
+    Monokai,
+    Material,
+    GitHubDark,
+    Discord,
+    Spotify,
+    RosePine,
+    Everforest,
+    Kanagawa,
+    /// Identifier for "Synthwave '84" -- Rust identifiers can't start with a digit or contain
+    /// `'`, so the enum variant is `SynthwaveEighty4`; its display name (added in a later task)
+    /// remains the literal string `"Synthwave '84"`.
+    SynthwaveEighty4,
+    Ayu,
+    Palenight,
+    Cyberpunk,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
