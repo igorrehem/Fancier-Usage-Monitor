@@ -92,6 +92,14 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+
+    /// One-shot guard: set when `WM_LBUTTONDBLCLK` opens Settings, so the trailing
+    /// `WM_LBUTTONUP` that Windows sends for the double-click's second (release) event
+    /// is recognized as "already consumed by the double-click" instead of being treated
+    /// as a fresh single click that re-arms the debounce timer. Cleared as soon as that
+    /// trailing `WM_LBUTTONUP` is seen (or ignored/consumed), so it never suppresses a
+    /// later, unrelated single click.
+    suppress_next_tray_click: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1376,6 +1384,7 @@ pub fn run() {
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                suppress_next_tray_click: false,
             });
         }
 
@@ -2961,19 +2970,56 @@ unsafe extern "system" fn wnd_proc(
         _ if msg == WM_APP_TRAY => {
             match tray_icon::handle_message(lparam) {
                 tray_icon::TrayAction::ToggleWidget => {
-                    // Don't toggle immediately: a real double-click delivers WM_LBUTTONUP
-                    // (this arm) for its first click before WM_LBUTTONDBLCLK fires for the
-                    // second. Debounce with a short one-shot timer instead; if the
-                    // double-click arrives before it fires, the OpenSettings arm below kills
-                    // it and the toggle never happens. A single click still toggles once the
-                    // timer expires, just delayed by GetDoubleClickTime() (imperceptible).
-                    let _ = SetTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE, GetDoubleClickTime(), None);
+                    // A real Win32 double-click on a legacy (non-NOTIFYICON_VERSION_4) tray
+                    // icon delivers FOUR messages in order: WM_LBUTTONDOWN, WM_LBUTTONUP,
+                    // WM_LBUTTONDBLCLK, WM_LBUTTONUP. Both WM_LBUTTONUPs map to
+                    // ToggleWidget here, so this arm runs twice per double-click:
+                    //   1. The first WM_LBUTTONUP (before WM_LBUTTONDBLCLK) - handled by the
+                    //      debounce timer below, same as a genuine single click.
+                    //   2. The trailing WM_LBUTTONUP (right after WM_LBUTTONDBLCLK, the
+                    //      release of the second click) - if we armed another debounce timer
+                    //      here, it would fire ~GetDoubleClickTime() ms after Settings opened
+                    //      and silently toggle+persist widget_visible anyway. The
+                    //      OpenSettings arm below sets suppress_next_tray_click for exactly
+                    //      this case; consume it here (one-shot) and skip arming the timer
+                    //      entirely instead of re-arming ToggleWidget's debounce.
+                    let already_consumed = {
+                        let mut guard = lock_state();
+                        if let Some(s) = guard.as_mut() {
+                            let was_set = s.suppress_next_tray_click;
+                            s.suppress_next_tray_click = false;
+                            was_set
+                        } else {
+                            false
+                        }
+                    };
+                    if !already_consumed {
+                        // Don't toggle immediately: a real double-click delivers
+                        // WM_LBUTTONUP (this arm) for its first click before
+                        // WM_LBUTTONDBLCLK fires for the second. Debounce with a short
+                        // one-shot timer instead; if the double-click arrives before it
+                        // fires, the OpenSettings arm below kills it and the toggle never
+                        // happens. A single click still toggles once the timer expires,
+                        // just delayed by GetDoubleClickTime() (imperceptible).
+                        let _ =
+                            SetTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE, GetDoubleClickTime(), None);
+                    }
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
                     show_context_menu(hwnd);
                 }
                 tray_icon::TrayAction::OpenSettings => {
                     let _ = KillTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE);
+                    // The second click of this double-click still has a WM_LBUTTONUP
+                    // (release) to come; mark it so the ToggleWidget arm above skips
+                    // arming a fresh debounce timer for it instead of treating it as a
+                    // new single click.
+                    {
+                        let mut guard = lock_state();
+                        if let Some(s) = guard.as_mut() {
+                            s.suppress_next_tray_click = true;
+                        }
+                    }
                     config_window::open_config_window();
                 }
                 tray_icon::TrayAction::None => {}

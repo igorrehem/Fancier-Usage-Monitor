@@ -450,12 +450,17 @@ pub fn remove_all(hwnd: HWND) {
 
 /// Interpret a tray callback message and return the action to take.
 ///
-/// Note: Windows delivers `WM_LBUTTONUP` for the first click of a double-click before
-/// `WM_LBUTTONDBLCLK` fires for the second. To keep a double-click from also toggling widget
-/// visibility, the caller (`window.rs`) does not act on `ToggleWidget` immediately — it starts
-/// a short one-shot debounce timer (`IDT_TRAY_CLICK_DEBOUNCE`) and only performs the toggle
-/// when that timer fires. If `WM_LBUTTONDBLCLK` arrives first, the caller kills the pending
-/// timer before opening settings, so the toggle is skipped entirely.
+/// Note: a real double-click on this (legacy, non-`NOTIFYICON_VERSION_4`) tray icon delivers
+/// FOUR messages in order: `WM_LBUTTONDOWN`, `WM_LBUTTONUP`, `WM_LBUTTONDBLCLK`,
+/// `WM_LBUTTONUP` — i.e. `WM_LBUTTONUP` fires both before AND after `WM_LBUTTONDBLCLK` (the
+/// first is the release of click 1, the trailing one is the release of click 2). Both map to
+/// `ToggleWidget` here since `handle_message` only looks at the raw message, not sequence
+/// state. To keep a double-click from also toggling widget visibility, the caller
+/// (`window.rs`) does not act on `ToggleWidget` immediately — it starts a short one-shot
+/// debounce timer (`IDT_TRAY_CLICK_DEBOUNCE`) and only performs the toggle when that timer
+/// fires. If `WM_LBUTTONDBLCLK` arrives first, the caller kills the pending timer before
+/// opening settings and also sets a one-shot guard so the trailing `WM_LBUTTONUP` (which
+/// arrives right after) is recognized as already consumed and doesn't re-arm the timer.
 pub fn handle_message(lparam: LPARAM) -> TrayAction {
     let mouse_msg = lparam.0 as u32;
     match mouse_msg {
