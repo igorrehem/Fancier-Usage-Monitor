@@ -1092,7 +1092,11 @@ unsafe fn handle_button_action(hwnd: HWND, action: ButtonAction) {
                 let guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
                 guard.as_ref().map(|s| s.draft.clone())
             };
-            if let Some(draft) = draft {
+            if let Some(mut draft) = draft {
+                // Clamp against the real taskbar before persisting, so a user can't save an
+                // oversized/off-taskbar geometry from the editor in the first place (see
+                // `window::clamp_geometry_to_current_taskbar`'s doc comment).
+                draft.geometry = window::clamp_geometry_to_current_taskbar(draft.geometry);
                 crate::settings::save(&draft);
                 window::set_settings(draft);
             }

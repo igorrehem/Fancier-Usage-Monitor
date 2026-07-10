@@ -197,7 +197,7 @@ fn d_spacing() -> i32 {
     1 // SEGMENT_GAP
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Geometry {
     #[serde(default = "d_height")]
     pub height: i32, // WIDGET_HEIGHT = 46

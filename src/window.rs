@@ -1185,6 +1185,225 @@ pub(crate) fn total_widget_width_for(active_models: i32, geometry: &settings::Ge
         + sc(RIGHT_MARGIN)
 }
 
+/// Same layout formula as `total_widget_width_for`, but without the DPI scaling (`sc()`)
+/// applied to every term -- i.e. the total width a `Geometry` would produce if it were
+/// painted at 96 DPI. Used only by `clamp_geometry`, which works entirely in that baseline
+/// pixel space (see its doc comment for why).
+fn baseline_total_width_for(active_models: i32, geometry: &settings::Geometry) -> i32 {
+    let bar_segments = row_bar_segment_count(active_models);
+    let model_width = (SEGMENT_W + geometry.spacing) * bar_segments - geometry.spacing
+        + BAR_RIGHT_MARGIN
+        + geometry.text_width;
+
+    LEFT_DIVIDER_W
+        + DIVIDER_RIGHT_MARGIN
+        + geometry.label_width
+        + LABEL_RIGHT_MARGIN
+        + model_width * active_models
+        + MODEL_RIGHT_MARGIN * (active_models - 1)
+        + RIGHT_MARGIN
+}
+
+/// Sane, non-degenerate bounds for individual `Geometry` fields, applied by `clamp_geometry`
+/// regardless of the taskbar's own size. Guards against a corrupted/hand-edited
+/// `settings.json` (zero, negative, or absurdly large values) breaking layout math or
+/// rendering (e.g. `text_width <= 0` clipping every label to nothing, `bar_thickness <= 0`
+/// making the usage bar invisible). Chosen generously around the shipped defaults
+/// (height=46, corner_radius=2, bar_thickness=13, label_width=18, text_width=62, spacing=1)
+/// so any value a user would plausibly want in the Size section stays untouched.
+const MIN_HEIGHT_BASELINE: i32 = 20;
+const MAX_HEIGHT_BASELINE: i32 = 400;
+const MAX_CORNER_RADIUS_BASELINE: i32 = 40;
+const MIN_BAR_THICKNESS_BASELINE: i32 = 4;
+const MAX_BAR_THICKNESS_BASELINE: i32 = 60;
+const MIN_LABEL_WIDTH_BASELINE: i32 = 4;
+const MAX_LABEL_WIDTH_BASELINE: i32 = 200;
+const MIN_TEXT_WIDTH_BASELINE: i32 = 8;
+const MAX_TEXT_WIDTH_BASELINE: i32 = 300;
+const MAX_SPACING_BASELINE: i32 = 20;
+
+/// Breathing-room margin subtracted from the taskbar's own baseline height before capping
+/// `Geometry::height` -- a widget exactly as tall as the whole taskbar reads as flush/clipped
+/// against its top and bottom edges. 2px baseline is small enough that the shipped default
+/// (`height` = 46) stays untouched against a stock Windows 11 taskbar (48px baseline @100%
+/// scaling) while still trimming anything actually oversized.
+const HEIGHT_MARGIN_BASELINE: i32 = 2;
+
+/// Width cap per this task's brief: `min(taskbar_width / 2, 800px @96dpi)`.
+const MAX_TOTAL_WIDTH_BASELINE: i32 = 800;
+
+/// Worst-case active-model count used to evaluate the derived total width against the cap
+/// (see `clamp_geometry`'s doc comment for why 3, not the currently-active count).
+const CLAMP_WORST_CASE_ACTIVE_MODELS: i32 = 3;
+
+/// Clamps `g` so it can never produce a widget taller than, or too wide relative to, the
+/// taskbar described by `taskbar_rect`, and bounds every individual field to a sane range
+/// regardless of the taskbar's size. Deterministic and idempotent: clamping an
+/// already-in-range `Geometry` is a no-op, and clamping twice produces the same result as
+/// clamping once.
+///
+/// Called from two places (see `clamp_geometry_to_current_taskbar` and
+/// `clamp_geometry_for_render`): defensively in `render_layered` (so a corrupted/hand-edited
+/// `settings.json`, or a future bug, can't paint an off-taskbar or oversized widget at
+/// runtime) and from the settings window's Save handler (so a user can't persist an oversized
+/// geometry from the editor in the first place).
+///
+/// DPI handling: `Geometry`'s fields are always baseline (96-DPI) pixel values, scaled to
+/// physical pixels only at paint/hit-test time via `sc()` (see its doc comment). This
+/// function stays in that same baseline space rather than doing DPI conversion itself: it's
+/// pure, touches no `CURRENT_DPI` global, and is trivially unit-testable with plain `RECT`
+/// literals. Callers that only have a *physical* taskbar `RECT` (as returned by
+/// `native_interop::get_taskbar_rect`) must convert it to baseline pixels first --
+/// see `physical_rect_to_baseline`.
+///
+/// Derived-width handling: `Geometry` has no literal "width" field -- `total_widget_width_for`
+/// derives it per-active-model-count, and the same `Geometry` renders a different total width
+/// depending on how many of Claude/Codex/Antigravity are enabled. This clamps against the
+/// width `CLAMP_WORST_CASE_ACTIVE_MODELS` (3, i.e. all three enabled) would produce, since
+/// that's the only model-count-independent guarantee: the cap must hold no matter which
+/// models are later toggled on, without needing to re-run the clamp every time
+/// `show_claude_code`/`show_codex`/`show_antigravity` change.
+///
+/// If the derived width is still over the cap after clamping `text_width`, `label_width`, and
+/// `spacing` down to their individual minimums (an extremely narrow taskbar), the result is
+/// accepted as the narrowest representable `Geometry` rather than looping forever or
+/// producing degenerate (zero/negative) fields.
+pub(crate) fn clamp_geometry(mut g: settings::Geometry, taskbar_rect: RECT) -> settings::Geometry {
+    // --- Per-field sane bounds, independent of the taskbar's own size ---
+    g.corner_radius = g.corner_radius.clamp(0, MAX_CORNER_RADIUS_BASELINE);
+    g.bar_thickness = g
+        .bar_thickness
+        .clamp(MIN_BAR_THICKNESS_BASELINE, MAX_BAR_THICKNESS_BASELINE);
+    g.label_width = g
+        .label_width
+        .clamp(MIN_LABEL_WIDTH_BASELINE, MAX_LABEL_WIDTH_BASELINE);
+    g.text_width = g
+        .text_width
+        .clamp(MIN_TEXT_WIDTH_BASELINE, MAX_TEXT_WIDTH_BASELINE);
+    g.spacing = g.spacing.clamp(0, MAX_SPACING_BASELINE);
+    g.height = g.height.clamp(MIN_HEIGHT_BASELINE, MAX_HEIGHT_BASELINE);
+
+    // --- Height vs. the real taskbar ---
+    let taskbar_height = (taskbar_rect.bottom - taskbar_rect.top).max(0);
+    if taskbar_height > 0 {
+        let height_cap = (taskbar_height - HEIGHT_MARGIN_BASELINE).max(MIN_HEIGHT_BASELINE);
+        g.height = g.height.min(height_cap);
+    }
+    // A corner radius bigger than half the (possibly just-clamped) height draws artifacts.
+    g.corner_radius = g.corner_radius.min(g.height / 2);
+
+    // --- Derived total width vs. the real taskbar ---
+    let taskbar_width = (taskbar_rect.right - taskbar_rect.left).max(0);
+    let mut width_cap = MAX_TOTAL_WIDTH_BASELINE;
+    if taskbar_width > 0 {
+        width_cap = width_cap.min(taskbar_width / 2);
+    }
+    // Never shrink below what every field at its own individual minimum would already need --
+    // guards the loop below against spinning forever against a degenerate (near-zero)
+    // taskbar_rect.
+    let floor_width = baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &{
+        let mut floor = g;
+        floor.text_width = MIN_TEXT_WIDTH_BASELINE;
+        floor.label_width = MIN_LABEL_WIDTH_BASELINE;
+        floor.spacing = 0;
+        floor
+    });
+    let width_cap = width_cap.max(floor_width);
+
+    while baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &g) > width_cap {
+        if g.text_width > MIN_TEXT_WIDTH_BASELINE {
+            g.text_width -= 1;
+        } else if g.label_width > MIN_LABEL_WIDTH_BASELINE {
+            g.label_width -= 1;
+        } else if g.spacing > 0 {
+            g.spacing -= 1;
+        } else {
+            break;
+        }
+    }
+
+    g
+}
+
+/// Converts a taskbar `RECT` in physical (DPI-scaled) screen pixels -- as returned by
+/// `native_interop::get_taskbar_rect` -- into an equivalent `RECT` expressing width/height in
+/// baseline (96-DPI) pixels, the unit `clamp_geometry` works in (see its doc comment). Only
+/// the width/height *deltas* matter to `clamp_geometry`, so `left`/`top` are left at 0 rather
+/// than also converting the taskbar's (possibly negative, multi-monitor) screen position.
+fn physical_rect_to_baseline(r: RECT, dpi: u32) -> RECT {
+    let dpi = (dpi.max(1)) as f64;
+    let width = ((r.right - r.left) as f64 * 96.0 / dpi).round() as i32;
+    let height = ((r.bottom - r.top) as f64 * 96.0 / dpi).round() as i32;
+    RECT { left: 0, top: 0, right: width, bottom: height }
+}
+
+/// Resolves the real, currently-tracked taskbar's rect and DPI, converts it to baseline
+/// pixels, and runs `clamp_geometry` against it. For callers (the settings window's Save
+/// handler, `config_window::handle_button_action`) that only have a `Geometry` in hand and no
+/// taskbar info of their own. Always queries fresh (no caching) since Save is a rare,
+/// user-initiated action where correctness matters more than avoiding one extra query --
+/// contrast with `clamp_geometry_for_render`, which is on the ~60fps animation path and
+/// deliberately caches. Falls back to returning `g` unchanged if the taskbar handle or its
+/// rect can't be resolved right now, matching this module's existing best-effort posture
+/// around taskbar queries (e.g. `position_at_taskbar`'s own early-return arms) -- Save must
+/// never fail just because Explorer.exe is momentarily unavailable.
+pub(crate) fn clamp_geometry_to_current_taskbar(g: settings::Geometry) -> settings::Geometry {
+    let taskbar_hwnd = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.taskbar_hwnd)
+    };
+    let Some(taskbar_hwnd) = taskbar_hwnd else {
+        return g;
+    };
+    let Some(rect) = native_interop::get_taskbar_rect(taskbar_hwnd) else {
+        return g;
+    };
+    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
+    clamp_geometry(g, physical_rect_to_baseline(rect, dpi))
+}
+
+/// Short-lived cache for the taskbar rect used by the defensive clamp in `render_layered`.
+/// `render_layered` runs on every ~16ms animation tick while an animation is active
+/// (`IDT_ANIM`); querying the taskbar rect (`SHAppBarMessage`, a synchronous round-trip to
+/// Explorer) on every single frame would add needless syscall/IPC overhead to the hot render
+/// path for a check whose whole purpose is catching *rare* situations (corrupted settings, a
+/// future bug) rather than tracking the taskbar's live size every frame. A short TTL keeps
+/// the defensive check meaningfully fresh (e.g. after a taskbar resize or DPI change) without
+/// paying the query cost on every frame.
+static RENDER_CLAMP_TASKBAR_CACHE: Mutex<Option<(Instant, RECT)>> = Mutex::new(None);
+const RENDER_CLAMP_TASKBAR_CACHE_TTL: Duration = Duration::from_millis(500);
+
+fn taskbar_rect_for_render_clamp(taskbar_hwnd: HWND) -> Option<RECT> {
+    let mut cache = RENDER_CLAMP_TASKBAR_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((fetched_at, rect)) = *cache {
+        if fetched_at.elapsed() < RENDER_CLAMP_TASKBAR_CACHE_TTL {
+            return Some(rect);
+        }
+    }
+    let rect = native_interop::get_taskbar_rect(taskbar_hwnd)?;
+    *cache = Some((Instant::now(), rect));
+    Some(rect)
+}
+
+/// Defensive variant of `clamp_geometry_to_current_taskbar` for the `render_layered` hot path
+/// -- see `taskbar_rect_for_render_clamp`'s doc comment for why it caches. Same best-effort
+/// fallback: returns `g` unchanged if the taskbar can't be resolved.
+fn clamp_geometry_for_render(
+    g: settings::Geometry,
+    taskbar_hwnd: Option<HWND>,
+) -> settings::Geometry {
+    let Some(taskbar_hwnd) = taskbar_hwnd else {
+        return g;
+    };
+    let Some(rect) = taskbar_rect_for_render_clamp(taskbar_hwnd) else {
+        return g;
+    };
+    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
+    clamp_geometry(g, physical_rect_to_baseline(rect, dpi))
+}
+
 fn total_widget_width_for_state(state: &AppState) -> i32 {
     let geometry = current_settings().geometry;
     total_widget_width_for(
@@ -1671,6 +1890,7 @@ fn render_layered() {
         show_codex,
         show_antigravity,
         bar_fracts,
+        taskbar_hwnd,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1695,6 +1915,7 @@ fn render_layered() {
                 s.show_codex,
                 s.show_antigravity,
                 ordered_bar_fracts(s),
+                s.taskbar_hwnd,
             ),
             None => return,
         }
@@ -1712,7 +1933,12 @@ fn render_layered() {
 
     // Read settings once per render; everything below uses `cfg` instead of re-locking
     // the global.
-    let cfg = current_settings();
+    let mut cfg = current_settings();
+    // Defensive clamp: a corrupted/hand-edited settings.json (or a future bug) must not be
+    // able to paint an off-taskbar or oversized embedded widget. See
+    // `clamp_geometry_for_render`'s doc comment for why this uses a short-lived cache
+    // instead of querying the taskbar on every ~16ms animation frame.
+    cfg.geometry = clamp_geometry_for_render(cfg.geometry, taskbar_hwnd);
 
     // --- Animation tick ---
     // `dt` is measured against the previous tick; the first tick after a timer restart (or
@@ -3797,5 +4023,135 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod clamp_geometry_tests {
+    use super::*;
+
+    /// A generously large taskbar (1920x48 baseline-equivalent) that comfortably fits the
+    /// shipped default `Geometry` unchanged -- used by tests asserting no-op / pass-through
+    /// behavior for already-sane values.
+    fn roomy_taskbar_rect() -> RECT {
+        RECT { left: 0, top: 0, right: 1920, bottom: 48 }
+    }
+
+    fn short_taskbar_rect(height: i32) -> RECT {
+        RECT { left: 0, top: 0, right: 1920, bottom: height }
+    }
+
+    // --- Step 1 (brief-literal): oversized height clamps to taskbar height ---
+    #[test]
+    fn oversized_height_clamps_to_taskbar_height() {
+        let g = settings::Geometry { height: 5000, ..settings::Geometry::default() };
+        let taskbar = short_taskbar_rect(48);
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert!(
+            clamped.height <= 48,
+            "clamped height {} exceeds taskbar height 48",
+            clamped.height
+        );
+        assert!(clamped.height > 0, "clamped height must stay positive");
+    }
+
+    #[test]
+    fn oversized_width_contributor_clamps_derived_width_under_cap() {
+        // text_width alone, at the worst-case 3-active-model count, would blow the derived
+        // width far past both the 800px baseline cap and half of this taskbar's width.
+        let g = settings::Geometry { text_width: 999_999, ..settings::Geometry::default() };
+        let taskbar = roomy_taskbar_rect();
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        let cap = (taskbar.right / 2).min(MAX_TOTAL_WIDTH_BASELINE);
+        let derived = baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &clamped);
+        assert!(
+            derived <= cap,
+            "derived width {derived} exceeds cap {cap} after clamping text_width={}",
+            clamped.text_width
+        );
+    }
+
+    #[test]
+    fn already_in_range_geometry_is_a_no_op() {
+        let g = settings::Geometry::default();
+        let taskbar = roomy_taskbar_rect();
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert_eq!(clamped, g, "clamp_geometry mutated an already-sane default Geometry");
+    }
+
+    #[test]
+    fn negative_and_zero_component_values_bound_to_sane_minimums() {
+        let g = settings::Geometry {
+            height: -10,
+            corner_radius: -5,
+            bar_thickness: 0,
+            label_width: -1,
+            text_width: 0,
+            spacing: -3,
+        };
+        let taskbar = roomy_taskbar_rect();
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert!(clamped.height >= MIN_HEIGHT_BASELINE);
+        assert!(clamped.corner_radius >= 0);
+        assert!(clamped.bar_thickness >= MIN_BAR_THICKNESS_BASELINE);
+        assert!(clamped.label_width >= MIN_LABEL_WIDTH_BASELINE);
+        assert!(clamped.text_width >= MIN_TEXT_WIDTH_BASELINE);
+        assert!(clamped.spacing >= 0);
+    }
+
+    #[test]
+    fn width_cap_never_below_taskbar_half_width_for_a_narrow_taskbar() {
+        // A narrow taskbar (e.g. a small secondary monitor) should still cap the derived
+        // width at (roughly) half its own width, not just fall back to the 800px baseline.
+        let g = settings::Geometry { text_width: 500, label_width: 150, ..settings::Geometry::default() };
+        let taskbar = RECT { left: 0, top: 0, right: 300, bottom: 48 };
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        let derived = baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &clamped);
+        // Some slack is allowed only if every shrinkable field already hit its own minimum
+        // (this taskbar is narrow enough that the width floor may exceed width/2).
+        let floor = baseline_total_width_for(
+            CLAMP_WORST_CASE_ACTIVE_MODELS,
+            &settings::Geometry {
+                text_width: MIN_TEXT_WIDTH_BASELINE,
+                label_width: MIN_LABEL_WIDTH_BASELINE,
+                spacing: 0,
+                ..clamped
+            },
+        );
+        assert!(
+            derived <= (taskbar.right / 2).max(floor),
+            "derived width {derived} not bounded relative to taskbar half-width for a narrow taskbar"
+        );
+    }
+
+    #[test]
+    fn corner_radius_bounded_by_clamped_height() {
+        let g = settings::Geometry { corner_radius: 1000, height: 5000, ..settings::Geometry::default() };
+        let taskbar = short_taskbar_rect(30);
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert!(clamped.corner_radius <= clamped.height / 2);
+    }
+
+    #[test]
+    fn clamp_is_idempotent() {
+        let g = settings::Geometry { height: 9000, text_width: 5000, ..settings::Geometry::default() };
+        let taskbar = short_taskbar_rect(48);
+
+        let once = clamp_geometry(g, taskbar);
+        let twice = clamp_geometry(once, taskbar);
+
+        assert_eq!(once, twice, "clamping an already-clamped Geometry must be a no-op");
     }
 }
