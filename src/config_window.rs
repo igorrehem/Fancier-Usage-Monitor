@@ -2896,4 +2896,123 @@ mod tests {
         assert_eq!(presets_scrollbar_thumb(0, 0, 1000, 0, 500), (0, 0));
         assert_eq!(presets_scrollbar_thumb(400, 400, 0, 0, 0), (0, 0));
     }
+
+    /// Minimal `ConfigState` for exercising `dispatch_presets` directly, without going through
+    /// `open_config_window` (which needs a live `HWND`). `dispatch_presets` itself only reads
+    /// `draft`/`presets_scroll_offset` and, on a hit, overwrites `controls` wholesale via
+    /// `SectionControls::from_settings` (exactly mirroring `open_config_window`'s own
+    /// construction) -- it never reads `preview_clock`/`preview_frame`/`preview_last_tick`/
+    /// `active_section`, so those only need to be *some* validly-typed value. `dark` is hardcoded
+    /// to `false` (rather than `theme::is_dark_mode()`, a live registry read) to keep the test
+    /// hermetic and deterministic regardless of the host machine's theme.
+    fn test_config_state(draft: Settings, presets_scroll_offset: i32) -> ConfigState {
+        let strings = strings_for(&draft);
+        let controls = SectionControls::from_settings(&draft, false, &strings);
+        let preview_clock = AnimationClock::new(&draft.animation);
+        let last_synced_poll_interval_ms = draft.poll_interval_ms;
+        ConfigState {
+            draft,
+            active_section: 5, // Presets section index (see draw_section_controls's `_ =>` arm).
+            preview_clock,
+            preview_frame: AnimationFrame::default(),
+            preview_last_tick: None,
+            controls,
+            last_synced_poll_interval_ms,
+            presets_scroll_offset,
+        }
+    }
+
+    /// End-to-end regression test for the finding the mutual-inverses unit test above doesn't
+    /// cover: it proves the algebraic relationship, but never actually calls `presets_layout`,
+    /// `preset_grid_order`, or `dispatch_presets` together. This test ties them together the way
+    /// the real app does: compute a card's true on-screen position the same way
+    /// `draw_presets_controls` does (`presets_layout` + `offset_rect_y(.., -scroll_offset)`), then
+    /// feed that exact on-screen point into `dispatch_presets` and assert the *correct* preset
+    /// (via `draft.animation.preset`, exactly what `apply_preset` sets) was applied -- not a
+    /// neighbor, and not what a sign-flipped/omitted scroll-offset would have resolved to.
+    #[test]
+    fn dispatch_presets_hit_test_matches_the_actual_on_screen_draw_position() {
+        // Short area: presets_max_scroll_offset_matches_content_minus_visible_when_short (above)
+        // already establishes this fixture requires real scrolling to reach every card.
+        let area = RECT { left: 0, top: 0, right: 500, bottom: 300 };
+        let dpi = 96;
+        let layout = presets_layout(area, dpi);
+        let order = preset_grid_order();
+
+        // --- Case 1: scroll_offset = 0, a card near the top (sanity baseline). ---
+        {
+            let card = layout.cards[0];
+            let onscreen = offset_rect_y(card, 0); // -scroll_offset with scroll_offset = 0
+            let x = (onscreen.left + onscreen.right) / 2;
+            let y = (onscreen.top + onscreen.bottom) / 2;
+
+            let mut state = test_config_state(Settings::default(), 0);
+            let handled = dispatch_presets(&mut state, area, dpi, WM_LBUTTONDOWN, x, y);
+            assert!(handled, "click on card 0's on-screen position must be handled");
+            assert_eq!(
+                state.draft.animation.preset,
+                Some(order[0]),
+                "clicking card 0 at scroll_offset=0 must apply card 0's own preset"
+            );
+        }
+
+        // --- Case 2: a card only reachable/visible at a non-zero scroll offset -- the case that
+        // actually exercises the scroll math, using the real clamp helper (not a made-up value).
+        {
+            let max_offset = presets_max_scroll_offset(area, dpi);
+            assert!(max_offset > 0, "fixture must actually require scrolling");
+            let scroll_offset = clamp_scroll_offset(max_offset, max_offset);
+
+            // Find a card that (a) is NOT visible at scroll_offset = 0 (its unscrolled top is
+            // below the visible area, i.e. it's genuinely only reachable by scrolling) and (b) IS
+            // fully visible once scrolled all the way down by `scroll_offset`.
+            let (target_idx, onscreen) = layout
+                .cards
+                .iter()
+                .enumerate()
+                .find_map(|(i, &card)| {
+                    let not_visible_unscrolled = card.top >= area.bottom;
+                    let onscreen = offset_rect_y(card, -scroll_offset);
+                    let visible_scrolled =
+                        onscreen.top >= area.top && onscreen.bottom <= area.bottom;
+                    (not_visible_unscrolled && visible_scrolled).then_some((i, onscreen))
+                })
+                .expect("fixture must contain a card only reachable by scrolling");
+
+            let x = (onscreen.left + onscreen.right) / 2;
+            let y = (onscreen.top + onscreen.bottom) / 2;
+
+            // What a *broken* hit-test (scroll offset ignored entirely) would have resolved to
+            // at this same on-screen click point, against the same unscrolled card rects -- used
+            // below to prove this test would actually catch that regression, not just happen to
+            // pass by coincidence.
+            let naive_hit_ignoring_scroll = layout
+                .cards
+                .iter()
+                .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+                .map(|i| order[i]);
+
+            let mut state = test_config_state(Settings::default(), scroll_offset);
+            let handled = dispatch_presets(&mut state, area, dpi, WM_LBUTTONDOWN, x, y);
+            assert!(
+                handled,
+                "click on card {target_idx}'s real on-screen position (scroll_offset={scroll_offset}) must be handled"
+            );
+            assert_eq!(
+                state.draft.animation.preset,
+                Some(order[target_idx]),
+                "clicking card {target_idx} at its true scrolled on-screen position must apply \
+                 that card's own preset, not a neighbor's"
+            );
+            // Guards against a sign-flip/omitted-offset regression: with scroll ignored, this
+            // same screen point either hits nothing (still visible-region-shaped but the wrong
+            // rect) or a *different* card than the one actually drawn there.
+            assert_ne!(
+                state.draft.animation.preset,
+                naive_hit_ignoring_scroll,
+                "this click must NOT resolve to whatever a scroll-ignoring hit-test would have \
+                 picked -- if it does, the scroll offset isn't actually being applied"
+            );
+        }
+    }
 }
