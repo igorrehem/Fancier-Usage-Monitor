@@ -62,11 +62,42 @@ fn rgba(r: u8, g: u8, b: u8) -> Rgba {
     Rgba { r, g, b, a: 255 }
 }
 
+/// All 24 `PresetId` variants (4 original + 20 added in Task 3), in `PresetId`'s own
+/// declaration order. `pub(crate)` (rather than test-only) because the Presets grid
+/// (`config_window.rs`, Task 5) needs this exact 24-entry list to build its card grid, and the
+/// unit tests below reuse the same const rather than duplicating the 24-entry literal a second
+/// time.
+pub(crate) const ALL_PRESET_IDS: [PresetId; 24] = [
+    PresetId::Default,
+    PresetId::Glass,
+    PresetId::Neon,
+    PresetId::Minimal,
+    PresetId::Dracula,
+    PresetId::Nord,
+    PresetId::SolarizedDark,
+    PresetId::SolarizedLight,
+    PresetId::Gruvbox,
+    PresetId::Catppuccin,
+    PresetId::TokyoNight,
+    PresetId::OneDark,
+    PresetId::Monokai,
+    PresetId::Material,
+    PresetId::GitHubDark,
+    PresetId::Discord,
+    PresetId::Spotify,
+    PresetId::RosePine,
+    PresetId::Everforest,
+    PresetId::Kanagawa,
+    PresetId::SynthwaveEighty4,
+    PresetId::Ayu,
+    PresetId::Palenight,
+    PresetId::Cyberpunk,
+];
+
 /// Which of the three Presets-grid groupings (Task 5) a preset belongs in. English-only
 /// display concerns live in this module rather than `Strings` because preset/category names
 /// here are proper nouns / a fixed 3-way UI grouping, not user-facing prose that needs
 /// translating (see `theme_category`'s doc comment for the exact split).
-#[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresetCategory {
     Builtin,
@@ -80,7 +111,6 @@ pub enum PresetCategory {
 /// NOT part of `Strings` and render identically in every locale). Total match, no wildcard
 /// arm, over all 24 `PresetId` variants -- adding a 25th variant is a compile error here until
 /// this function is updated, the same safety net `apply_preset` relies on.
-#[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
 pub fn theme_display_name(id: PresetId) -> &'static str {
     match id {
         PresetId::Default => "Default",
@@ -117,7 +147,6 @@ pub fn theme_display_name(id: PresetId) -> &'static str {
 /// design spec folds into "Code editors" rather than giving either its own single/two-item
 /// category, keeping exactly 3 groups total. Total match, no wildcard arm, over all 24
 /// `PresetId` variants.
-#[allow(dead_code)] // consumed by the Presets grid (Task 5), not yet wired up
 pub fn theme_category(id: PresetId) -> PresetCategory {
     match id {
         PresetId::Default | PresetId::Glass | PresetId::Neon | PresetId::Minimal => {
@@ -830,34 +859,11 @@ mod tests {
         }
     }
 
-    /// All 24 `PresetId` variants (4 original + 20 added in Task 3), used by the
-    /// parameterized "never touches geometry/typography" tests below.
-    const ALL_24_PRESETS: [PresetId; 24] = [
-        PresetId::Default,
-        PresetId::Glass,
-        PresetId::Neon,
-        PresetId::Minimal,
-        PresetId::Dracula,
-        PresetId::Nord,
-        PresetId::SolarizedDark,
-        PresetId::SolarizedLight,
-        PresetId::Gruvbox,
-        PresetId::Catppuccin,
-        PresetId::TokyoNight,
-        PresetId::OneDark,
-        PresetId::Monokai,
-        PresetId::Material,
-        PresetId::GitHubDark,
-        PresetId::Discord,
-        PresetId::Spotify,
-        PresetId::RosePine,
-        PresetId::Everforest,
-        PresetId::Kanagawa,
-        PresetId::SynthwaveEighty4,
-        PresetId::Ayu,
-        PresetId::Palenight,
-        PresetId::Cyberpunk,
-    ];
+    // `ALL_24_PRESETS` used to be duplicated here as a test-local const; it's now
+    // `ALL_PRESET_IDS` at module scope (see above), reused by both these tests and
+    // `config_window.rs`'s Presets grid (Task 5). Kept as a local alias so the rest of this
+    // test module doesn't need a mechanical rename of every call site.
+    use super::ALL_PRESET_IDS as ALL_24_PRESETS;
 
     // `settings::d_shimmer_speed()` (the default shimmer speed, 0.5) is a private helper on the
     // `settings` module, not reachable from here -- per the task brief, we don't add a new

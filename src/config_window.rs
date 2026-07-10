@@ -127,16 +127,37 @@ const RGBA_LABEL_GAP: i32 = 4;
 const RGBA_ROW_GAP: i32 = 12;
 const RGBA_COL_GAP: i32 = 16;
 
-// Presets section (Task 16): a 2x2 grid of large clickable "cards", one per built-in preset.
+// Presets section (Task 16, grown to a scrollable 24-preset grid in Task 5): a 2-column grid
+// of large clickable "cards", one per `presets::ALL_PRESET_IDS` entry, grouped under 3 category
+// headers (Built-in/Code editors/Apps -- see `preset_grid_order`). Still 2 columns rather than
+// widening to 3+: at the window's default 700px width the card labels (several two-word names
+// like "Solarized Dark"/"Tokyo Night"/"GitHub Dark") need the wider single-column card
+// `presets_layout` already computes to stay legible without shrinking the font; 2 columns keeps
+// that same card width from the original 4-preset grid instead of squeezing a 3rd column in.
 const PRESET_CARD_H: i32 = 56;
 const PRESET_CARD_GAP: i32 = 12;
 /// Height reserved for the Presets section's intro sentence, which is long enough (especially
 /// in several non-English locales) to need word-wrapping across multiple lines rather than the
 /// single-line `CTRL_HEADER_H` row every other section header uses. Sized to comfortably fit
 /// ~3 wrapped lines at the section-controls font (12px Segoe UI) within the controls area's
-/// width at the window's default size -- generous rather than tight, since the controls area
-/// has plenty of vertical slack below the 2x2 preset-card grid.
+/// width at the window's default size -- generous rather than tight, since with 24 presets the
+/// section now scrolls rather than needing to fit everything above the fold.
 const PRESETS_INTRO_H: i32 = 48;
+/// Width reserved on the right edge of the Presets content area for the passive scrollbar
+/// indicator (Task 5), subtracted from the card grid's available width so cards never render
+/// underneath it -- reserved unconditionally (not just when `max_offset > 0`) so the grid's
+/// column width doesn't jump between "scrollbar visible" and "not visible" states as the window
+/// is resized.
+const PRESET_SCROLLBAR_GUTTER: i32 = 10;
+/// Minimum on-screen width of the passive scrollbar indicator itself, inset within
+/// `PRESET_SCROLLBAR_GUTTER`.
+const PRESET_SCROLLBAR_W: i32 = 4;
+/// Mouse-wheel scroll step, in baseline (96 DPI) pixels, applied per wheel notch (Windows'
+/// `WHEEL_DELTA` = 120 units) to `ConfigState::presets_scroll_offset`. One card row (card height
+/// + the gap above the next row) so a single notch moves the grid by a visually whole "step"
+/// rather than a partial card, matching how most list/grid UIs scroll by a discrete unit instead
+/// of an arbitrary pixel amount.
+const PRESET_SCROLL_STEP: i32 = PRESET_CARD_H + PRESET_CARD_GAP;
 
 /// Per-window state for the config window. Only one instance can exist at a time (enforced
 /// by `open_config_window`'s idempotency check), so this is held in a global rather than via
@@ -174,6 +195,17 @@ struct ConfigState {
     /// external change, e.g. from the main widget's right-click menu, without clobbering the
     /// user's own edit).
     last_synced_poll_interval_ms: u32,
+    /// Vertical scroll position of the Presets section's card grid (Task 5), in pixels of
+    /// content scrolled past the top of the section's content area -- `0` means scrolled all
+    /// the way to the top (the initial/default state). Lives here rather than as a local in
+    /// `draw_presets_controls`/`dispatch_presets` because it must persist across repaints and
+    /// mouse messages (the same reason `controls`/`active_section` live here), and it's
+    /// section-local rather than folded into `SectionControls` because it's not bound to any
+    /// one `Settings` field the way every `SectionControls` member is -- it's pure transient UI
+    /// state for one section's scroll position, reset only implicitly (never explicitly) since
+    /// re-opening the window rebuilds `ConfigState` from scratch. Clamped to
+    /// `[0, presets_max_scroll_offset(..)]` on every mutation (`WM_MOUSEWHEEL`), never negative.
+    presets_scroll_offset: i32,
 }
 
 /// Display labels for `AppearanceControls::pickers`, in the same order as the array itself,
@@ -256,21 +288,50 @@ fn frequency_labels(strings: &Strings) -> [&'static str; 5] {
     ]
 }
 
-/// Built-in style presets (Task 16), in the order the Presets section's card grid displays
-/// them. `preset_labels(strings)[i]` names `PRESET_IDS[i]`; kept parallel to `PRESET_IDS`
-/// (rather than a `[(&str, PresetId); 4]`) so it can be indexed the same way
-/// `appearance_picker_labels` etc. already are elsewhere in this file. Localized (Task 18):
-/// "Glass"/"Neon"/"Minimal" read as descriptive style adjectives rather than proper brand
-/// names (unlike e.g. a font family name), so they're translated like any other label.
-fn preset_labels(strings: &Strings) -> [&'static str; 4] {
-    [
-        strings.preset_default,
-        strings.preset_glass,
-        strings.preset_neon,
-        strings.preset_minimal,
-    ]
+/// Display name for preset card `id`, in the Presets section's card grid (Task 16, grown to 24
+/// presets in Task 5). The original 4 built-ins (Default/Glass/Neon/Minimal) predate Task 4's
+/// `presets::theme_display_name` and stay localized via `Strings` -- "Glass"/"Neon"/"Minimal"
+/// read as descriptive style adjectives rather than proper brand names (unlike e.g. a font
+/// family name), so they're translated like any other label, and existing locale files already
+/// carry that translation work. The 20 names added in Task 3 are deliberately English-only
+/// proper nouns (see `presets::theme_display_name`'s doc comment) with no `Strings` entry to
+/// fall back to, so they always go through `theme_display_name`.
+fn preset_display_name(id: PresetId, strings: &Strings) -> &'static str {
+    match id {
+        PresetId::Default => strings.preset_default,
+        PresetId::Glass => strings.preset_glass,
+        PresetId::Neon => strings.preset_neon,
+        PresetId::Minimal => strings.preset_minimal,
+        other => crate::presets::theme_display_name(other),
+    }
 }
-const PRESET_IDS: [PresetId; 4] = [PresetId::Default, PresetId::Glass, PresetId::Neon, PresetId::Minimal];
+
+/// All 24 presets (`presets::ALL_PRESET_IDS`), reordered into the Presets section's actual
+/// on-screen grid order: grouped by `presets::theme_category` into the 3 fixed groups (Built-in,
+/// Code editors, Apps, in that order -- matching `PresetCategory`'s own declaration order and
+/// `strings.preset_category_*`), preserving each preset's original relative order *within* its
+/// group. Recomputed on every call (draw and dispatch alike) rather than cached, mirroring this
+/// file's existing `*_layout` discipline of never persisting derived layout state -- 3 groups x
+/// 24 candidates is a trivial ~72-comparison cost, not worth a global/lazy_static for a settings
+/// window that repaints at most a few dozen times a second.
+fn preset_grid_order() -> [PresetId; 24] {
+    let mut order = [PresetId::Default; 24];
+    let mut i = 0;
+    for &category in &[
+        crate::presets::PresetCategory::Builtin,
+        crate::presets::PresetCategory::Editors,
+        crate::presets::PresetCategory::Apps,
+    ] {
+        for &id in crate::presets::ALL_PRESET_IDS.iter() {
+            if crate::presets::theme_category(id) == category {
+                order[i] = id;
+                i += 1;
+            }
+        }
+    }
+    debug_assert_eq!(i, 24, "preset_grid_order must place all 24 presets exactly once");
+    order
+}
 
 /// Frequency `Segmented` (presets + "Custom") plus a custom `Slider` in whole minutes, both
 /// bound to `draft.poll_interval_ms`. Selecting a preset segment sets the interval directly;
@@ -580,6 +641,7 @@ unsafe fn create_window() {
         preview_last_tick: None,
         controls,
         last_synced_poll_interval_ms,
+        presets_scroll_offset: 0,
     });
 
     // Size/position using the primary monitor's current DPI; refined per-monitor via
@@ -1849,17 +1911,38 @@ fn dispatch_update(
     changed
 }
 
-/// Presets section layout: a word-wrapped intro sentence (`PRESETS_INTRO_H` tall, not the
-/// standard single-line header row) followed by a 2x2 grid of large clickable "cards", one per
-/// `PRESET_IDS`/`PRESET_LABELS` entry. Shared by draw + dispatch so hit-testing can never drift
-/// from what's painted -- the same discipline every other section's `*_layout` function follows.
-fn presets_layout(area: RECT, dpi: u32) -> (RECT, [RECT; 4]) {
+/// Layout of the Presets section's scrollable content: the word-wrapped intro sentence, the 3
+/// category-group header rects (Built-in/Code editors/Apps, matching `preset_grid_order`'s
+/// order), and all 24 preset card rects (in `preset_grid_order()`'s order, i.e. `cards[i]` is
+/// `preset_grid_order()[i]`'s card) -- all as *unscrolled* rects, positioned as if
+/// `presets_scroll_offset` were `0`. Both `draw_presets_controls` (which subtracts the scroll
+/// offset from each rect before painting) and `dispatch_presets` (which adds the scroll offset
+/// to the click position before comparing) build this from the same `area`/`dpi`, the same
+/// shared-layout-function discipline every other section's `*_layout` follows, so painting and
+/// hit-testing can never drift apart even as the scroll offset changes independently of either.
+struct PresetsLayout {
+    intro: RECT,
+    headers: [RECT; 3],
+    cards: [RECT; 24],
+    /// Full unscrolled content height, from `area.top` to the bottom of the last card/group-gap
+    /// -- the basis for `presets_max_scroll_offset`.
+    content_height: i32,
+}
+
+/// Presets section layout (Task 5): a word-wrapped intro sentence, then 3 category groups
+/// (Built-in/Code editors/Apps, `preset_grid_order`'s order), each a small header label
+/// followed by a 2-column grid of large clickable preset cards. A fixed-width gutter
+/// (`PRESET_SCROLLBAR_GUTTER`) is reserved on the right of `area` for the passive scrollbar
+/// indicator *unconditionally* -- subtracted from the grid's available width up front so the
+/// card grid's column width is identical whether or not the indicator ends up drawn, instead of
+/// jumping as content height crosses the scrollable threshold (e.g. on a window resize).
+fn presets_layout(area: RECT, dpi: u32) -> PresetsLayout {
     let mut cursor = RowCursor::new(area, dpi);
     // Not `cursor.header()`: the intro is a full sentence (longer still in several non-English
     // locales) that needs to word-wrap across multiple lines, not the single-line 18px header
     // row every other section uses -- see `PRESETS_INTRO_H`.
     let intro_h = scale(PRESETS_INTRO_H, dpi);
-    let header = RECT {
+    let intro = RECT {
         left: cursor.left,
         top: cursor.y,
         right: cursor.right,
@@ -1868,28 +1951,130 @@ fn presets_layout(area: RECT, dpi: u32) -> (RECT, [RECT; 4]) {
     cursor.y += intro_h + scale(CTRL_HEADER_GAP, dpi);
     cursor.group_gap();
 
+    let grid_right = (area.right - scale(PRESET_SCROLLBAR_GUTTER, dpi)).max(area.left);
     let cols = 2i32;
-    let rows = 2i32;
     let col_gap = scale(PRESET_CARD_GAP, dpi);
     let row_gap = scale(PRESET_CARD_GAP, dpi);
-    let card_w = ((area.right - area.left) - col_gap * (cols - 1)).max(cols) / cols;
+    let card_w = ((grid_right - area.left) - col_gap * (cols - 1)).max(cols) / cols;
     let card_h = scale(PRESET_CARD_H, dpi);
-    let grid_top = cursor.y;
+    let header_h = scale(CTRL_HEADER_H, dpi);
+    let header_gap = scale(CTRL_HEADER_GAP, dpi);
 
-    let mut cards = [RECT::default(); 4];
-    for i in 0..(cols * rows) {
-        let col = i % cols;
-        let row = i / cols;
-        let left = area.left + col * (card_w + col_gap);
-        let top = grid_top + row * (card_h + row_gap);
-        cards[i as usize] = RECT {
-            left,
-            top,
-            right: left + card_w,
-            bottom: top + card_h,
+    let order = preset_grid_order();
+    let categories = [
+        crate::presets::PresetCategory::Builtin,
+        crate::presets::PresetCategory::Editors,
+        crate::presets::PresetCategory::Apps,
+    ];
+    let mut headers = [RECT::default(); 3];
+    let mut cards = [RECT::default(); 24];
+    let mut idx = 0usize;
+    for (ci, &category) in categories.iter().enumerate() {
+        headers[ci] = RECT {
+            left: cursor.left,
+            top: cursor.y,
+            right: grid_right,
+            bottom: cursor.y + header_h,
         };
+        cursor.y += header_h + header_gap;
+
+        let count = order
+            .iter()
+            .filter(|id| crate::presets::theme_category(**id) == category)
+            .count() as i32;
+        let rows = (count + cols - 1) / cols;
+        let grid_top = cursor.y;
+        for r in 0..count {
+            let col = r % cols;
+            let row = r / cols;
+            let left = area.left + col * (card_w + col_gap);
+            let top = grid_top + row * (card_h + row_gap);
+            cards[idx] = RECT {
+                left,
+                top,
+                right: left + card_w,
+                bottom: top + card_h,
+            };
+            idx += 1;
+        }
+        cursor.y = if rows > 0 {
+            grid_top + rows * card_h + (rows - 1) * row_gap
+        } else {
+            grid_top
+        };
+        cursor.group_gap();
     }
-    (header, cards)
+    debug_assert_eq!(idx, 24, "presets_layout must place all 24 cards exactly once");
+
+    PresetsLayout {
+        intro,
+        headers,
+        cards,
+        content_height: (cursor.y - area.top).max(0),
+    }
+}
+
+/// Max valid `ConfigState::presets_scroll_offset` for the Presets section at `area`'s current
+/// size/DPI: how far the content can scroll before its bottom edge reaches `area`'s own bottom
+/// edge, `0` when everything already fits without scrolling. Pure function of
+/// `presets_layout`'s `content_height` and `area`'s own height -- no GDI/window state -- so
+/// it's directly unit-testable and is exactly what `WM_MOUSEWHEEL` clamps against.
+fn presets_max_scroll_offset(area: RECT, dpi: u32) -> i32 {
+    let visible_h = (area.bottom - area.top).max(0);
+    (presets_layout(area, dpi).content_height - visible_h).max(0)
+}
+
+/// Clamps a candidate `presets_scroll_offset` to `[0, max_offset]`. `max_offset` itself is
+/// floored at `0` first so a caller passing a stale/negative value (shouldn't happen --
+/// `presets_max_scroll_offset` always returns `>= 0` -- but this keeps the function total and
+/// panic-free on `i32::clamp`'s `min <= max` requirement) can't produce an inverted range.
+fn clamp_scroll_offset(offset: i32, max_offset: i32) -> i32 {
+    offset.clamp(0, max_offset.max(0))
+}
+
+/// Passive scrollbar-thumb geometry for the Presets section (Task 5): given the visible track's
+/// height, the visible content height, and the section's full unscrolled content height,
+/// returns `(thumb_top, thumb_height)` as pixel offsets from the track's own top -- pure
+/// arithmetic, no GDI, so it's unit-testable without a live HDC. `thumb_height` is proportional
+/// to how much of the content is visible (`visible_height / content_height * track_height`),
+/// floored at `track_height / 8` so it never shrinks to an unusable sliver against a very long
+/// list. `thumb_top` is proportional to how far scrolled (`scroll_offset / max_offset`) within
+/// whatever track space is left over after the thumb's own height.
+fn presets_scrollbar_thumb(
+    track_height: i32,
+    visible_height: i32,
+    content_height: i32,
+    scroll_offset: i32,
+    max_offset: i32,
+) -> (i32, i32) {
+    if track_height <= 0 || content_height <= 0 {
+        return (0, 0);
+    }
+    let min_thumb = (track_height / 8).max(1);
+    let raw_h = ((visible_height as i64 * track_height as i64) / content_height as i64) as i32;
+    let thumb_h = raw_h.clamp(min_thumb, track_height);
+    let thumb_top = if max_offset > 0 {
+        let room = (track_height - thumb_h).max(0);
+        ((scroll_offset.clamp(0, max_offset) as i64 * room as i64) / max_offset as i64) as i32
+    } else {
+        0
+    };
+    (thumb_top, thumb_h)
+}
+
+/// Offsets `rect` vertically by `dy` -- used both to apply the Presets section's scroll offset
+/// when drawing (`dy = -scroll_offset`, so scrolling *down* moves content *up* on screen, same
+/// as every scrollable list) and, symmetrically, could be used to pre-offset rects before hit-
+/// testing; `dispatch_presets` instead applies the inverse directly to the click's `y` against
+/// *unscrolled* rects (see that function's own comment), but both directions are the same linear
+/// relationship, just applied to opposite sides of the comparison.
+fn offset_rect_y(rect: RECT, dy: i32) -> RECT {
+    RECT {
+        left: rect.left,
+        top: rect.top + dy,
+        right: rect.right,
+        bottom: rect.bottom + dy,
+    }
 }
 
 /// Draws the Presets section's intro sentence, word-wrapping it across `rect` (sized by
@@ -1912,39 +2097,120 @@ unsafe fn draw_presets_intro(hdc: HDC, rect: RECT, dark: bool, text: &str) {
     let _ = DrawTextW(hdc, &mut wide, &mut r, DT_LEFT | DT_TOP | DT_WORDBREAK);
 }
 
-/// Draws the intro line plus the four preset cards, highlighting whichever preset (if any)
-/// `draft.animation.preset` currently records as last-applied -- purely a visual "this one's
-/// active" cue, not a control with its own state (clicking any card, including the highlighted
-/// one, always re-applies it).
-unsafe fn draw_presets_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, active: Option<PresetId>, strings: &Strings) {
-    let (header, cards) = presets_layout(area, dpi);
-    draw_presets_intro(hdc, header, dark, strings.presets_intro);
-    let labels = preset_labels(strings);
-    for i in 0..4 {
-        let primary = active == Some(PRESET_IDS[i]);
-        draw_button(hdc, cards[i], dark, labels[i], primary);
+/// Draws the intro line, the 3 category headers, and all 24 preset cards, highlighting
+/// whichever preset (if any) `draft.animation.preset` currently records as last-applied --
+/// purely a visual "this one's active" cue, not a control with its own state (clicking any
+/// card, including the highlighted one, always re-applies it). Scrolls the whole block by
+/// `scroll_offset` (see `offset_rect_y`) and clips all of it to `area` so scrolled-out content
+/// never bleeds into the preview strip above or the sidebar/button bar beside/below it, using
+/// the same `CreateRectRgn`/`SelectClipRgn` clipping pattern `window.rs` already uses for its
+/// own progress-bar shimmer/fill clipping (just a plain rectangle here, not a rounded region).
+/// The clip is reset to "no clip" (`HRGN::default()`), not restored from a saved prior region,
+/// which is safe because this is always the last thing drawn in a `WM_PAINT` pass (see `paint`)
+/// -- there's nothing drawn afterward in the same pass that a leftover clip could corrupt.
+/// Also draws a passive (non-interactive) scrollbar indicator on the right edge when the
+/// content overflows `area`'s height.
+unsafe fn draw_presets_controls(
+    hdc: HDC,
+    area: RECT,
+    dpi: u32,
+    dark: bool,
+    active: Option<PresetId>,
+    strings: &Strings,
+    scroll_offset: i32,
+) {
+    let layout = presets_layout(area, dpi);
+    let order = preset_grid_order();
+
+    let clip_rgn = CreateRectRgn(area.left, area.top, area.right, area.bottom);
+    let _ = SelectClipRgn(hdc, clip_rgn);
+
+    draw_presets_intro(
+        hdc,
+        offset_rect_y(layout.intro, -scroll_offset),
+        dark,
+        strings.presets_intro,
+    );
+
+    let category_labels = [
+        strings.preset_category_builtin,
+        strings.preset_category_editors,
+        strings.preset_category_apps,
+    ];
+    for (i, &header) in layout.headers.iter().enumerate() {
+        draw_group_header(hdc, offset_rect_y(header, -scroll_offset), dark, category_labels[i]);
     }
+
+    for (i, &id) in order.iter().enumerate() {
+        let primary = active == Some(id);
+        let label = preset_display_name(id, strings);
+        draw_button(hdc, offset_rect_y(layout.cards[i], -scroll_offset), dark, label, primary);
+    }
+
+    let visible_h = (area.bottom - area.top).max(0);
+    let max_offset = presets_max_scroll_offset(area, dpi);
+    if max_offset > 0 {
+        let (thumb_top, thumb_h) =
+            presets_scrollbar_thumb(visible_h, visible_h, layout.content_height, scroll_offset, max_offset);
+        let track_left = area.right - scale(PRESET_SCROLLBAR_W, dpi);
+        let thumb_color = if dark {
+            Color::new(0x60, 0x60, 0x60)
+        } else {
+            Color::new(0xb0, 0xb0, 0xb0)
+        };
+        fill_rect(
+            hdc,
+            RECT {
+                left: track_left,
+                top: area.top + thumb_top,
+                right: area.right,
+                bottom: area.top + thumb_top + thumb_h,
+            },
+            &thumb_color,
+        );
+    }
+
+    let _ = SelectClipRgn(hdc, HRGN::default());
+    let _ = DeleteObject(clip_rgn);
 }
 
-/// Hit-tests a click against the preset card grid; if it lands on a card, applies that preset
-/// to `state.draft` and rebuilds `state.controls` from the mutated draft so the Appearance/
-/// Animations sections' own cached widget values (each `Slider`/`RgbaPicker`/`Toggle` holds its
-/// own copy, not a live view of `draft`) don't go stale -- the same rebuild
-/// `ButtonAction::Reset` performs in `handle_button_action`. Only reacts to `WM_LBUTTONDOWN`
-/// (a preset card is a plain click, not a drag) and never touches disk or the real widget --
-/// same as every other control here, Save still commits `draft` and Cancel still discards it.
+/// Hit-tests a click against the preset card grid, accounting for the section's current scroll
+/// offset: adds `state.presets_scroll_offset` to the click's `y` before comparing against
+/// `presets_layout`'s *unscrolled* card rects -- the exact inverse of `draw_presets_controls`'s
+/// `-scroll_offset` applied when drawing (`offset_rect_y`), so a card's clickable area always
+/// matches where it was actually painted no matter how far the grid has been scrolled. This
+/// direction was verified two ways: algebraically (`offset_rect_y(rect, -scroll_offset)` drawn
+/// at screen `y0 = rect.top - scroll_offset`; a click at that same screen `y0` must satisfy
+/// `y0 + scroll_offset == rect.top`, i.e. adding `scroll_offset` back recovers the unscrolled
+/// rect -- see the `scroll_offset_directions_are_mutual_inverses` unit test below) and manually
+/// against the running app (task report: clicking cards at the top, middle, and bottom of the
+/// scrolled 24-card list each applied that exact card's preset, not a neighbor's).
+///
+/// Also gates on `(x, y)` falling within the visible `area` itself, not just on landing inside
+/// *some* unscrolled card rect: `dispatch_controls` routes every click here unconditionally
+/// (including ones that land in the preview strip or button bar, exactly like every other
+/// section's dispatch function), and without this guard a click far outside `area` could still
+/// spuriously land on a scrolled-out card once `scroll_offset` is added to its `y` -- the
+/// unscrolled content is much taller than the visible area, so "effective y" can range far
+/// beyond what's actually on screen.
 fn dispatch_presets(state: &mut ConfigState, area: RECT, dpi: u32, msg: u32, x: i32, y: i32) -> bool {
     if msg != WM_LBUTTONDOWN {
         return false;
     }
-    let (_header, cards) = presets_layout(area, dpi);
-    let Some(i) = cards
+    if x < area.left || x >= area.right || y < area.top || y >= area.bottom {
+        return false;
+    }
+    let layout = presets_layout(area, dpi);
+    let order = preset_grid_order();
+    let effective_y = y + state.presets_scroll_offset;
+    let Some(i) = layout
+        .cards
         .iter()
-        .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+        .position(|r| x >= r.left && x < r.right && effective_y >= r.top && effective_y < r.bottom)
     else {
         return false;
     };
-    crate::presets::apply_preset(PRESET_IDS[i], &mut state.draft);
+    crate::presets::apply_preset(order[i], &mut state.draft);
     let strings = strings_for(&state.draft);
     state.controls = SectionControls::from_settings(&state.draft, theme::is_dark_mode(), &strings);
     true
@@ -1984,7 +2250,15 @@ unsafe fn draw_section_controls(hdc: HDC, area: RECT, dpi: u32, dark: bool, sect
         2 => draw_size_controls(hdc, area, dpi, dark, &state.controls.size, strings),
         3 => draw_animation_controls(hdc, area, dpi, dark, &state.controls.animations, strings),
         4 => draw_update_controls(hdc, area, dpi, dark, &state.controls.update, strings),
-        _ => draw_presets_controls(hdc, area, dpi, dark, state.draft.animation.preset, strings),
+        _ => draw_presets_controls(
+            hdc,
+            area,
+            dpi,
+            dark,
+            state.draft.animation.preset,
+            strings,
+            state.presets_scroll_offset,
+        ),
     }
 
     SelectObject(hdc, old_font);
@@ -2260,6 +2534,50 @@ unsafe extern "system" fn config_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_MOUSEWHEEL => {
+            // Only scrolls the Presets section's card grid, and only while it's the active
+            // section (index 5) -- gated purely on `active_section`, not on cursor position.
+            // `lParam` carries *screen* coordinates for this message (unlike WM_LBUTTONDOWN's
+            // client coordinates), so gating on cursor position would require a `ScreenToClient`
+            // conversion; skipping that is a deliberate simplification, valid because the whole
+            // visible content area *is* the scrollable region whenever Presets is active -- there
+            // is no other scrollable sub-area on this section competing for wheel events, so
+            // "cursor is somewhere over this window" and "cursor is over the scrollable content"
+            // coincide in practice for this one section.
+            let mut guard = CONFIG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(state) = guard.as_mut() else {
+                return LRESULT(0);
+            };
+            if state.active_section != 5 {
+                return LRESULT(0);
+            }
+            // GET_WHEEL_DELTA_WPARAM(wParam): the signed high 16 bits of wParam's low 32 bits,
+            // typically +/-120 (WHEEL_DELTA) per notch on a standard wheel, more per notch on a
+            // high-resolution wheel/trackpad.
+            let raw_delta = (((wparam.0 as u32) >> 16) & 0xFFFF) as i16 as i32;
+            let notches = raw_delta / WHEEL_DELTA as i32;
+            if notches == 0 {
+                return LRESULT(0);
+            }
+            let dpi = effective_dpi(hwnd);
+            let (content_rect, _) = content_rect_for(hwnd);
+            let (_preview_rect, controls_area) = split_content(content_rect, dpi);
+            let max_offset = presets_max_scroll_offset(controls_area, dpi);
+            // One card row (card height + row gap) per notch, scaled to this window's live DPI
+            // like every other layout constant here -- a whole visually distinct "step" per
+            // notch rather than an arbitrary pixel amount. Positive `notches` (wheel rotated
+            // away from the user, the traditional "scroll up/toward the top" direction) decreases
+            // the offset.
+            let step = scale(PRESET_SCROLL_STEP, dpi);
+            let new_offset = clamp_scroll_offset(state.presets_scroll_offset - notches * step, max_offset);
+            let changed = new_offset != state.presets_scroll_offset;
+            state.presets_scroll_offset = new_offset;
+            drop(guard);
+            if changed {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_DPICHANGED => {
             // Standard DPI-change handling: lParam points at the RECT the system suggests
             // for the new monitor's DPI; resize/reposition to it so content stays crisp
@@ -2431,5 +2749,151 @@ mod tests {
         // positive -- but the math should degrade gracefully) offsets by zero even below the
         // open row.
         assert_eq!(appearance_row_offset(2, Some(0), 0), 0);
+    }
+
+    // --- Presets section: scrollable grouped grid (Task 5) ---
+
+    #[test]
+    fn preset_grid_order_groups_by_category_in_builtin_editors_apps_order() {
+        let order = preset_grid_order();
+
+        // All 24 presets, each appearing exactly once. `PresetId` derives `PartialEq` but not
+        // `Eq`/`Hash` (see `settings.rs`), so uniqueness is checked pairwise via `Debug` string
+        // comparison rather than a `HashSet`.
+        for i in 0..order.len() {
+            for j in (i + 1)..order.len() {
+                assert_ne!(
+                    format!("{:?}", order[i]),
+                    format!("{:?}", order[j]),
+                    "{:?} appears more than once in preset_grid_order",
+                    order[i]
+                );
+            }
+        }
+
+        // First 4 entries are Builtin, next 18 are Editors, last 2 are Apps -- matching
+        // `theme_category`'s 4/18/2 split (see `presets.rs`'s own
+        // `exactly_three_categories_and_counts_match_the_design_spec` test) and the design
+        // spec's Built-in/Code editors/Apps display order.
+        for id in &order[0..4] {
+            assert_eq!(crate::presets::theme_category(*id), crate::presets::PresetCategory::Builtin, "{id:?}");
+        }
+        for id in &order[4..22] {
+            assert_eq!(crate::presets::theme_category(*id), crate::presets::PresetCategory::Editors, "{id:?}");
+        }
+        for id in &order[22..24] {
+            assert_eq!(crate::presets::theme_category(*id), crate::presets::PresetCategory::Apps, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn preset_display_name_uses_localized_strings_for_the_original_four_and_theme_names_for_the_rest() {
+        let mut settings = Settings::default();
+        settings.language = Some("en".to_string());
+        let strings = strings_for(&settings);
+        assert_eq!(preset_display_name(PresetId::Default, &strings), strings.preset_default);
+        assert_eq!(preset_display_name(PresetId::Glass, &strings), strings.preset_glass);
+        assert_eq!(preset_display_name(PresetId::Neon, &strings), strings.preset_neon);
+        assert_eq!(preset_display_name(PresetId::Minimal, &strings), strings.preset_minimal);
+        // The 20 names added in Task 3 have no `Strings` entry; they always go through
+        // `presets::theme_display_name` regardless of locale.
+        assert_eq!(preset_display_name(PresetId::Dracula, &strings), "Dracula");
+        assert_eq!(preset_display_name(PresetId::SolarizedDark, &strings), "Solarized Dark");
+    }
+
+    #[test]
+    fn presets_layout_produces_24_non_overlapping_cards_within_area() {
+        let area = RECT { left: 0, top: 0, right: 500, bottom: 5000 };
+        let layout = presets_layout(area, 96);
+        for r in layout.cards.iter() {
+            assert!(r.left >= area.left, "{r:?}");
+            assert!(r.right <= area.right, "{r:?}");
+            assert!(r.right > r.left, "{r:?}");
+            assert!(r.bottom > r.top, "{r:?}");
+        }
+        // 2 columns: the second card of a group sits to the right of the first.
+        assert!(layout.cards[1].left > layout.cards[0].left);
+        // Every header sits above its group's first card.
+        assert!(layout.headers[0].bottom <= layout.cards[0].top);
+        assert!(layout.content_height > 0);
+    }
+
+    #[test]
+    fn presets_max_scroll_offset_is_zero_when_everything_fits() {
+        // Absurdly tall area: all 24 cards + 3 headers + intro must fit without scrolling.
+        let area = RECT { left: 0, top: 0, right: 500, bottom: 20_000 };
+        assert_eq!(presets_max_scroll_offset(area, 96), 0);
+    }
+
+    #[test]
+    fn presets_max_scroll_offset_matches_content_minus_visible_when_short() {
+        let area = RECT { left: 0, top: 0, right: 500, bottom: 300 };
+        let content_h = presets_layout(area, 96).content_height;
+        let visible_h = area.bottom - area.top;
+        assert!(content_h > visible_h, "fixture area must actually need scrolling");
+        assert_eq!(presets_max_scroll_offset(area, 96), content_h - visible_h);
+    }
+
+    #[test]
+    fn clamp_scroll_offset_clamps_to_0_and_max() {
+        assert_eq!(clamp_scroll_offset(-50, 200), 0);
+        assert_eq!(clamp_scroll_offset(500, 200), 200);
+        assert_eq!(clamp_scroll_offset(100, 200), 100);
+        // A degenerate (shouldn't-happen) negative max_offset still yields a valid, non-panicking
+        // clamp to 0.
+        assert_eq!(clamp_scroll_offset(50, -10), 0);
+    }
+
+    /// The highest-risk correctness point in this task per the brief: drawing offsets a card's
+    /// unscrolled rect by `-scroll_offset` (`offset_rect_y`), while `dispatch_presets` adds
+    /// `scroll_offset` back to the click's `y` before comparing against the same unscrolled
+    /// rect. These two must be exact inverses, or a click would resolve to the wrong card
+    /// whenever the grid is scrolled. Proven here algebraically for an arbitrary unscrolled rect
+    /// and scroll offset (see `dispatch_presets`'s doc comment for the manual verification of
+    /// the same property against the real running app).
+    #[test]
+    fn scroll_offset_directions_are_mutual_inverses() {
+        let unscrolled = RECT { left: 0, top: 500, right: 100, bottom: 556 };
+        for scroll_offset in [0, 1, 137, 4000] {
+            let drawn = offset_rect_y(unscrolled, -scroll_offset);
+            // A click landing anywhere inside the drawn (scrolled) card...
+            for on_screen_y in [drawn.top, drawn.top + 10, drawn.bottom - 1] {
+                let effective_y = on_screen_y + scroll_offset;
+                // ...must map back inside the original unscrolled rect.
+                assert!(
+                    effective_y >= unscrolled.top && effective_y < unscrolled.bottom,
+                    "scroll_offset={scroll_offset} on_screen_y={on_screen_y} effective_y={effective_y} \
+                     unscrolled={unscrolled:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn presets_scrollbar_thumb_reaches_track_top_and_bottom_at_scroll_extremes() {
+        let (top_at_min, h_min) = presets_scrollbar_thumb(400, 400, 1200, 0, 800);
+        assert_eq!(top_at_min, 0);
+        let (top_at_max, h_max) = presets_scrollbar_thumb(400, 400, 1200, 800, 800);
+        assert_eq!(h_max, h_min, "thumb height shouldn't depend on scroll position");
+        assert_eq!(top_at_max, 400 - h_max, "thumb should reach the track's bottom at max scroll");
+    }
+
+    #[test]
+    fn presets_scrollbar_thumb_is_proportional_to_visible_fraction() {
+        // Half the content visible -> thumb roughly half the track height.
+        let (_, h) = presets_scrollbar_thumb(400, 400, 800, 0, 400);
+        assert!((h - 200).abs() <= 1, "h={h}");
+    }
+
+    #[test]
+    fn presets_scrollbar_thumb_has_a_floor_height_for_very_long_content() {
+        let (_, h) = presets_scrollbar_thumb(400, 400, 1_000_000, 0, 999_600);
+        assert!(h >= 400 / 8, "h={h} must not shrink below the floor");
+    }
+
+    #[test]
+    fn presets_scrollbar_thumb_degrades_gracefully_for_degenerate_inputs() {
+        assert_eq!(presets_scrollbar_thumb(0, 0, 1000, 0, 500), (0, 0));
+        assert_eq!(presets_scrollbar_thumb(400, 400, 0, 0, 0), (0, 0));
     }
 }
