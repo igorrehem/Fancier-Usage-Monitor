@@ -7,8 +7,9 @@
 //! 2. Converting a real `ccum_core::poller::poll()` result into the widget's per-frame
 //!    `render::bars::UsageData` shape (`build_usage_data`), or synthesizing visibly-changing
 //!    placeholder data when polling fails (`fallback_usage_data`).
-//! 3. The Task-9 click-handler stub (`handle_click`) -- see that function's doc comment for
-//!    exactly where Task 9 should wire in real popup-toggle behavior.
+//! 3. Classifying raw `TrayIconEvent`s (`handle_click`) into "should this toggle the popup
+//!    panel" -- see that function's doc comment for why the actual toggle (creating/showing/
+//!    hiding `panel::Panel`) happens in `main.rs`, not here.
 //!
 //! The actual `TrayIcon` construction, the non-blocking background-thread poll mechanism, and
 //! the `winit::event_loop::EventLoopProxy` wiring that wakes the event loop when a poll
@@ -16,14 +17,15 @@
 //! `App::user_event`) because they need direct access to `App`'s own state (the `AnimationClock`-
 //! adjacent fields, the event loop's `ActiveEventLoop`, etc.) -- this module stays a plain
 //! function library with no `winit`/thread-spawning of its own, so it's easy to unit-test the
-//! pure data-shaping logic (`build_usage_data`/`fallback_usage_data`) in isolation.
+//! pure data-shaping logic (`build_usage_data`/`fallback_usage_data`/`handle_click`) in
+//! isolation.
 
 use ccum_core::localization::LanguageId;
 use ccum_core::models::AppUsageData;
 use ccum_core::poller;
 use ccum_core::settings::Settings;
 
-use tray_icon::{BadIcon, Icon, TrayIconEvent};
+use tray_icon::{BadIcon, Icon, MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::render::bars::{self, UsageData};
 use crate::render::Canvas;
@@ -162,38 +164,44 @@ pub fn tooltip_text(usage: &UsageData) -> String {
     lines.join("\n")
 }
 
-/// Task 9 STUB: `ccum-unix` has no popup panel yet (that's Task 9's job -- the popup-panel shell
-/// + section-nav sidebar, ported from `ccum-windows`'s settings window). Once it exists, this is
-/// the ONE place that needs to change: replace the `eprintln!` calls below with whatever toggles
-/// that popup's visibility (mirroring `ccum-windows/src/window.rs`'s tray-icon
-/// `WM_LBUTTONUP`/`WM_LBUTTONDBLCLK` handling, which calls `toggle_widget_visible`-equivalent
-/// logic instead of just logging). `main.rs::App::user_event`'s `AppEvent::Tray(event) =>
-/// tray::handle_click(&event)` call site does not need to change at all -- only this function's
-/// body does.
+/// Classifies one `TrayIconEvent`, returning `true` iff it should toggle the popup panel's
+/// visibility (`main.rs::App::handle_tray_event` acts on that return value by calling
+/// `panel::Panel::toggle`). The toggle itself doesn't happen HERE -- creating/showing/hiding a
+/// `winit` window needs an `&ActiveEventLoop`, which this module deliberately has no access to
+/// (see this module's doc comment: it stays a plain, winit-free function library) -- so this
+/// function's only job is deciding WHETHER a click counts as a toggle-worthy one.
 ///
-/// Only `Click`/`DoubleClick` are logged; `Enter`/`Move`/`Leave` fire continuously while the
-/// cursor merely hovers the icon (confirmed by reading `tray-icon`'s own `TrayIconEvent`
-/// variants) and would spam stderr on every mouse-move, so they're intentionally ignored here.
-pub fn handle_click(event: &TrayIconEvent) {
+/// Only `Click { button: Left, button_state: Up }` toggles. Rationale for each exclusion,
+/// confirmed by reading `tray-icon` 0.24.1's own Windows backend (`platform_impl/windows/mod.rs`):
+/// - `Click` actually fires TWICE per physical click -- once with `button_state: Down` (on
+///   `WM_LBUTTONDOWN`) and once with `Up` (on `WM_LBUTTONUP`). Gating on `Up` only avoids
+///   toggling twice per click (which would immediately re-close/re-open the panel).
+/// - Right/middle-button `Click`s are ignored -- this app has no context menu or other
+///   right-click behavior defined yet, and a stray toggle on right-click would be surprising.
+/// - `DoubleClick` is logged but does NOT also toggle: its first click already delivered a
+///   `Click{Up}` (real double-clicks are `Down, Up, DoubleClick, Up` on Windows -- see
+///   `ccum-windows/src/window.rs`'s own `WM_LBUTTONUP`/`WM_LBUTTONDBLCLK` comment for the exact
+///   same four-message sequence on that platform's raw Win32 messages), so a second toggle here
+///   would just close what the first click already opened.
+/// - `Enter`/`Move`/`Leave` fire continuously while the cursor merely hovers the icon (confirmed
+///   by reading `tray-icon`'s own `TrayIconEvent` variants) and would spam stderr on every
+///   mouse-move if logged, so they're silently ignored (and never a toggle).
+pub fn handle_click(event: &TrayIconEvent) -> bool {
     match event {
         TrayIconEvent::Click { button, button_state, .. } => {
-            eprintln!(
-                "ccum-unix: tray icon clicked ({button:?}, {button_state:?}) -- TODO(Task 9): \
-                 toggle the popup panel's visibility here instead of logging"
-            );
+            eprintln!("ccum-unix: tray icon clicked ({button:?}, {button_state:?})");
+            *button == MouseButton::Left && *button_state == MouseButtonState::Up
         }
         TrayIconEvent::DoubleClick { button, .. } => {
-            eprintln!(
-                "ccum-unix: tray icon double-clicked ({button:?}) -- TODO(Task 9): toggle the \
-                 popup panel's visibility here instead of logging"
-            );
+            eprintln!("ccum-unix: tray icon double-clicked ({button:?})");
+            false
         }
         // Enter/Move/Leave (matched above) plus a wildcard for any future variant --
         // `TrayIconEvent` is `#[non_exhaustive]` upstream (confirmed in tray-icon-0.24.1's
         // lib.rs), so a wildcard arm is required even though every variant that exists today is
         // already matched.
-        TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. } | TrayIconEvent::Leave { .. } => {}
-        _ => {}
+        TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. } | TrayIconEvent::Leave { .. } => false,
+        _ => false,
     }
 }
 
@@ -201,7 +209,7 @@ pub fn handle_click(event: &TrayIconEvent) {
 mod tests {
     use super::*;
     use tray_icon::dpi::PhysicalPosition;
-    use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconId};
+    use tray_icon::{Rect, TrayIconId};
 
     // Task 8 verification note: this dev machine's automation environment could not deliver a
     // genuine OS-level tray-icon click end to end -- confirmed (by reading
@@ -222,29 +230,48 @@ mod tests {
     }
 
     #[test]
-    fn handle_click_does_not_panic_on_every_current_variant() {
-        // No assertion beyond "doesn't panic" is possible without capturing stderr (which
-        // `eprintln!` writes to directly, outside of what `#[test]` can intercept) -- this at
-        // least guarantees every variant `handle_click`'s `match` claims to handle actually
-        // compiles/executes against the real enum shape, so a future upstream field rename
-        // would fail this test at compile time.
+    fn handle_click_toggles_only_on_left_click_up() {
         let id = TrayIconId::new("test");
-        handle_click(&TrayIconEvent::Click {
+        assert!(handle_click(&TrayIconEvent::Click {
             id: id.clone(),
             position: PhysicalPosition::new(1.0, 2.0),
             rect: sample_rect(),
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
-        });
-        handle_click(&TrayIconEvent::DoubleClick {
+        }));
+        // Down (the button-press half of the same physical click) must NOT also toggle, or a
+        // single click would toggle twice (open then immediately close again).
+        assert!(!handle_click(&TrayIconEvent::Click {
             id: id.clone(),
             position: PhysicalPosition::new(1.0, 2.0),
             rect: sample_rect(),
             button: MouseButton::Left,
-        });
-        handle_click(&TrayIconEvent::Enter { id: id.clone(), position: PhysicalPosition::new(0.0, 0.0), rect: sample_rect() });
-        handle_click(&TrayIconEvent::Move { id: id.clone(), position: PhysicalPosition::new(0.0, 0.0), rect: sample_rect() });
-        handle_click(&TrayIconEvent::Leave { id, position: PhysicalPosition::new(0.0, 0.0), rect: sample_rect() });
+            button_state: MouseButtonState::Down,
+        }));
+        assert!(!handle_click(&TrayIconEvent::Click {
+            id: id.clone(),
+            position: PhysicalPosition::new(1.0, 2.0),
+            rect: sample_rect(),
+            button: MouseButton::Right,
+            button_state: MouseButtonState::Up,
+        }));
+        assert!(!handle_click(&TrayIconEvent::DoubleClick {
+            id: id.clone(),
+            position: PhysicalPosition::new(1.0, 2.0),
+            rect: sample_rect(),
+            button: MouseButton::Left,
+        }));
+        assert!(!handle_click(&TrayIconEvent::Enter {
+            id: id.clone(),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: sample_rect()
+        }));
+        assert!(!handle_click(&TrayIconEvent::Move {
+            id: id.clone(),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: sample_rect()
+        }));
+        assert!(!handle_click(&TrayIconEvent::Leave { id, position: PhysicalPosition::new(0.0, 0.0), rect: sample_rect() }));
     }
 
     #[test]

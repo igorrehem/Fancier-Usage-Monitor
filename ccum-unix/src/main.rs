@@ -58,6 +58,16 @@
 // the older `EventLoop::run(closure)` API (deprecated in 0.30, removed later). See
 // https://docs.rs/winit/0.30.13/winit/application/trait.ApplicationHandler.html.
 //
+// Task 9 scope: a second, independent `winit` window (`panel::Panel`) -- the popup settings
+// panel's shell + section-nav sidebar, toggled open/closed by a tray-icon left-click. See
+// `panel.rs`'s own module doc comment for the window-creation/positioning/decoration reasoning
+// and the sidebar port; this file's job is just routing: `App::window_event` dispatches each
+// incoming `WindowEvent` to whichever window's `WindowId` it belongs to (`self.panel.window_id()`
+// vs the pre-existing demo window), and `App::handle_tray_event` (called from `user_event`)
+// turns a toggle-worthy tray click (`tray::handle_click`'s classification) into
+// `self.panel.toggle(..)`, passing along the tray icon's live on-screen rect (via
+// `tray_icon::TrayIcon::rect()`) as the popup's positioning anchor.
+//
 // softbuffer 0.4's API: a `Context<D>` (bound to a display handle) plus a `Surface<D, W>`
 // (bound to a window handle) created from it; `Surface::resize` before every present (its
 // size must always match the window's current size), `Surface::buffer_mut` to get a
@@ -69,6 +79,7 @@
 // `HasDisplayHandle`/`HasWindowHandle`, which `Rc<Window>` satisfies via `winit`'s blanket
 // impls, same as a bare `Window` would, but shareable).
 
+mod panel;
 mod render;
 mod tray;
 
@@ -90,6 +101,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+use panel::Panel;
 use render::bars::{self, UsageData};
 use render::text::TextRenderer;
 
@@ -187,6 +199,11 @@ struct App {
     /// call, feeding `tray::fallback_usage_data`'s synthetic oscillation -- see that function's
     /// doc comment.
     poll_tick: u64,
+
+    // --- Task 9: popup settings panel ---
+    /// The popup panel's own window/surface/section-nav state -- see `panel.rs`'s module doc
+    /// comment. Lives for the whole process; its window is created lazily on first open.
+    panel: Panel,
 }
 
 impl App {
@@ -225,6 +242,7 @@ impl App {
             poll_interval,
             real_poll_ever_succeeded: false,
             poll_tick: 0,
+            panel: Panel::new(),
         }
     }
 }
@@ -321,14 +339,27 @@ impl ApplicationHandler<AppEvent> for App {
 
     /// Handles both `AppEvent` variants this app's `EventLoopProxy` can wake the loop with --
     /// see this file's top-of-module comment ("Non-blocking polling mechanism").
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::PollComplete(result) => self.handle_poll_result(result),
-            AppEvent::Tray(event) => tray::handle_click(&event),
+            AppEvent::Tray(event) => self.handle_tray_event(event_loop, &event),
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    /// Routes every `WindowEvent` to whichever window it actually belongs to -- the Tasks 6-7
+    /// demo window (this function's own `match`, unchanged from before Task 9) or the Task 9
+    /// popup panel (`self.panel.handle_window_event`, checked first via `window_id`). Both
+    /// windows are live members of the SAME event loop (`ActiveEventLoop::create_window` was
+    /// called twice -- once in `resumed` for the demo window, once lazily in
+    /// `panel::Panel::show` for the popup), so this dispatch-by-`WindowId` is the only thing
+    /// keeping their `RedrawRequested`/`CloseRequested`/mouse-input handling from interfering
+    /// with each other.
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        if self.panel.window_id() == Some(window_id) {
+            self.panel.handle_window_event(&event, &mut self.text);
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(_) => {
@@ -563,6 +594,26 @@ impl App {
             }
             Err(err) => eprintln!("ccum-unix: failed to render tray icon bitmap: {err}"),
         }
+    }
+
+    /// Task 9: reacts to a raw `TrayIconEvent` (forwarded via `AppEvent::Tray`, see this file's
+    /// top-of-module comment). `tray::handle_click` does the actual event-shape classification
+    /// (which button, up vs down, single vs double click) and just returns whether this event
+    /// should toggle the popup panel; if so, this method looks up the tray icon's current
+    /// on-screen rect (`TrayIcon::rect()` -- `None` on Linux, where that method is documented
+    /// unsupported, or on a transient query failure) and hands it to `panel::Panel::toggle` as
+    /// the popup's positioning anchor (see `panel.rs`'s doc comment for how that rect is used).
+    fn handle_tray_event(&mut self, event_loop: &ActiveEventLoop, event: &TrayIconEvent) {
+        if !tray::handle_click(event) {
+            return;
+        }
+        let anchor = self.tray_icon.as_ref().and_then(TrayIcon::rect).map(|r| panel::TrayAnchor {
+            x: r.position.x,
+            y: r.position.y,
+            width: f64::from(r.size.width),
+            height: f64::from(r.size.height),
+        });
+        self.panel.toggle(event_loop, anchor);
     }
 }
 
