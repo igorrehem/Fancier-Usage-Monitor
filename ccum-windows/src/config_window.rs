@@ -10,7 +10,7 @@
 //! `handle_button_action`).
 //!
 //! Appearance/Font/Size/Animations/Update/Presets sections all get real controls. Presets
-//! (Task 16) is a 2x2 grid of clickable cards, one per `crate::presets::apply_preset` built-in
+//! (Task 16) is a 2x2 grid of clickable cards, one per `ccum_core::presets::apply_preset` built-in
 //! (Default/Glass/Neon/Minimal): clicking one mutates `draft`'s appearance+animation in place,
 //! rebuilds `state.controls` from it (so Appearance/Animations' own cached widget values don't
 //! go stale), and repaints the preview -- same as any other control, and same rebuild-on-
@@ -44,14 +44,14 @@ use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::animation::{AnimationClock, AnimationFrame};
 use crate::controls::{Control, Dropdown, RgbaPicker, Segmented, Slider, Toggle};
-use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::native_interop::{self, Color, IDT_PREVIEW_ANIM};
-use crate::settings::{PaletteStops, PresetId, Rgba, Settings, Weight};
 use crate::theme;
 use crate::window::{self, UsageData};
+use ccum_core::animation::{AnimationClock, AnimationFrame};
+use ccum_core::diagnose;
+use ccum_core::settings::{PaletteStops, PresetId, Settings, Weight};
 
 const CLASS_NAME: &str = "CcumConfig";
 
@@ -302,7 +302,7 @@ fn preset_display_name(id: PresetId, strings: &Strings) -> &'static str {
         PresetId::Glass => strings.preset_glass,
         PresetId::Neon => strings.preset_neon,
         PresetId::Minimal => strings.preset_minimal,
-        other => crate::presets::theme_display_name(other),
+        other => ccum_core::presets::theme_display_name(other),
     }
 }
 
@@ -318,12 +318,12 @@ fn preset_grid_order() -> [PresetId; 24] {
     let mut order = [PresetId::Default; 24];
     let mut i = 0;
     for &category in &[
-        crate::presets::PresetCategory::Builtin,
-        crate::presets::PresetCategory::Editors,
-        crate::presets::PresetCategory::Apps,
+        ccum_core::presets::PresetCategory::Builtin,
+        ccum_core::presets::PresetCategory::Editors,
+        ccum_core::presets::PresetCategory::Apps,
     ] {
-        for &id in crate::presets::ALL_PRESET_IDS.iter() {
-            if crate::presets::theme_category(id) == category {
+        for &id in ccum_core::presets::ALL_PRESET_IDS.iter() {
+            if ccum_core::presets::theme_category(id) == category {
                 order[i] = id;
                 i += 1;
             }
@@ -383,9 +383,9 @@ fn adaptive_default_colors(is_dark: bool) -> (Color, Color, Color) {
 /// green/amber/red usage-severity gradient for the picker to open with.
 fn default_palette_seed() -> PaletteStops {
     PaletteStops {
-        calm: Rgba::from_color(Color::from_hex("#4CAF7A")),
-        attention: Rgba::from_color(Color::from_hex("#E8A33D")),
-        critical: Rgba::from_color(Color::from_hex("#D9534F")),
+        calm: native_interop::color_to_rgba(Color::from_hex("#4CAF7A")),
+        attention: native_interop::color_to_rgba(Color::from_hex("#E8A33D")),
+        critical: native_interop::color_to_rgba(Color::from_hex("#D9534F")),
     }
 }
 
@@ -415,15 +415,15 @@ impl SectionControls {
         let background = s
             .appearance
             .background
-            .unwrap_or_else(|| Rgba::from_color(bg_default));
+            .unwrap_or_else(|| native_interop::color_to_rgba(bg_default));
         let text = s
             .appearance
             .text
-            .unwrap_or_else(|| Rgba::from_color(text_default));
+            .unwrap_or_else(|| native_interop::color_to_rgba(text_default));
         let divider = s
             .appearance
             .divider
-            .unwrap_or_else(|| Rgba::from_color(divider_default));
+            .unwrap_or_else(|| native_interop::color_to_rgba(divider_default));
         let appearance = AppearanceControls {
             pickers: [
                 RgbaPicker::new(palette.calm, strings.rgba_custom.to_string()),
@@ -1171,7 +1171,7 @@ unsafe fn handle_button_action(hwnd: HWND, action: ButtonAction) {
                 // oversized/off-taskbar geometry from the editor in the first place (see
                 // `window::clamp_geometry_to_current_taskbar`'s doc comment).
                 draft.geometry = window::clamp_geometry_to_current_taskbar(draft.geometry);
-                crate::settings::save(&draft);
+                ccum_core::settings::save(&draft);
                 window::set_settings(draft);
             }
             let _ = ReleaseCapture();
@@ -1962,9 +1962,9 @@ fn presets_layout(area: RECT, dpi: u32) -> PresetsLayout {
 
     let order = preset_grid_order();
     let categories = [
-        crate::presets::PresetCategory::Builtin,
-        crate::presets::PresetCategory::Editors,
-        crate::presets::PresetCategory::Apps,
+        ccum_core::presets::PresetCategory::Builtin,
+        ccum_core::presets::PresetCategory::Editors,
+        ccum_core::presets::PresetCategory::Apps,
     ];
     let mut headers = [RECT::default(); 3];
     let mut cards = [RECT::default(); 24];
@@ -1980,7 +1980,7 @@ fn presets_layout(area: RECT, dpi: u32) -> PresetsLayout {
 
         let count = order
             .iter()
-            .filter(|id| crate::presets::theme_category(**id) == category)
+            .filter(|id| ccum_core::presets::theme_category(**id) == category)
             .count() as i32;
         let rows = (count + cols - 1) / cols;
         let grid_top = cursor.y;
@@ -2210,7 +2210,7 @@ fn dispatch_presets(state: &mut ConfigState, area: RECT, dpi: u32, msg: u32, x: 
     else {
         return false;
     };
-    crate::presets::apply_preset(order[i], &mut state.draft);
+    ccum_core::presets::apply_preset(order[i], &mut state.draft);
     let strings = strings_for(&state.draft);
     state.controls = SectionControls::from_settings(&state.draft, theme::is_dark_mode(), &strings);
     true
@@ -2776,13 +2776,13 @@ mod tests {
         // `exactly_three_categories_and_counts_match_the_design_spec` test) and the design
         // spec's Built-in/Code editors/Apps display order.
         for id in &order[0..4] {
-            assert_eq!(crate::presets::theme_category(*id), crate::presets::PresetCategory::Builtin, "{id:?}");
+            assert_eq!(ccum_core::presets::theme_category(*id), ccum_core::presets::PresetCategory::Builtin, "{id:?}");
         }
         for id in &order[4..22] {
-            assert_eq!(crate::presets::theme_category(*id), crate::presets::PresetCategory::Editors, "{id:?}");
+            assert_eq!(ccum_core::presets::theme_category(*id), ccum_core::presets::PresetCategory::Editors, "{id:?}");
         }
         for id in &order[22..24] {
-            assert_eq!(crate::presets::theme_category(*id), crate::presets::PresetCategory::Apps, "{id:?}");
+            assert_eq!(ccum_core::presets::theme_category(*id), ccum_core::presets::PresetCategory::Apps, "{id:?}");
         }
     }
 

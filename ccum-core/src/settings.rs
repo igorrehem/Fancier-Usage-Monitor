@@ -12,8 +12,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::native_interop::Color;
-
 /// Current on-disk schema version. Bump this if a future migration needs to distinguish
 /// old-shape files from new-shape files at runtime.
 pub const CURRENT_VERSION: u32 = 1;
@@ -45,36 +43,18 @@ fn default_show_antigravity() -> bool {
     false
 }
 
-/// Plain serializable RGBA color, decoupled from the native `Color` helper so the settings
-/// schema doesn't depend on native_interop's Windows-specific conversions.
+/// Plain serializable RGBA color, decoupled from any native/GDI color helper so the settings
+/// schema (this crate, `ccum-core`) has zero dependency on OS-specific rendering code. Platforms
+/// (`ccum-windows`'s `native_interop::Color`, and in a later task `ccum-unix`'s own color type)
+/// convert to/from this at their own boundary via free functions local to that crate --
+/// `ccum-windows`'s `native_interop::rgba_to_color`/`color_to_rgba`, for example -- rather than
+/// this struct knowing about any native color type.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Rgba {
     pub r: u8,
     pub g: u8,
     pub b: u8,
     pub a: u8,
-}
-
-impl Rgba {
-    #[allow(dead_code)] // used by the settings window / renderer in a later task
-    pub fn to_color(&self) -> Color {
-        Color {
-            r: self.r,
-            g: self.g,
-            b: self.b,
-            a: self.a,
-        }
-    }
-
-    #[allow(dead_code)] // used by the settings window / renderer in a later task
-    pub fn from_color(c: Color) -> Rgba {
-        Rgba {
-            r: c.r,
-            g: c.g,
-            b: c.b,
-            a: c.a,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]

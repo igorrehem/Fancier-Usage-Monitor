@@ -1,49 +1,11 @@
-[package]
-name = "claude-code-usage-monitor"
-version = "1.5.0"
-edition = "2021"
-license = "MIT"
-description = "Claude Code Usage Monitor"
-homepage = "https://codezeno.com.au"
-repository = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor"
+[workspace]
+resolver = "2"
+members = ["ccum-core", "ccum-windows"]
+default-members = ["ccum-windows"]
 
-[package.metadata.winres]
-CompanyName = "Code Zeno Pty Ltd"
-ProductName = "Claude Code Usage Monitor"
-FileDescription = "Claude Code Usage Monitor"
-OriginalFilename = "claude-code-usage-monitor.exe"
-InternalName = "ClaudeCodeUsageMonitor"
-Comments = "https://codezeno.com.au"
-LegalCopyright = "Copyright (C) 2026 Code Zeno Pty Ltd"
-
-[dependencies]
-ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
-native-tls = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-dirs = "6"
-
-[dependencies.windows]
-version = "0.58"
-features = [
-    "Win32_Foundation",
-    "Win32_Globalization",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Accessibility",
-    "Win32_System_Registry",
-    "Win32_System_Threading",
-    "Win32_Security",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_HiDpi",
-]
-
-[build-dependencies]
-winres = "0.1"
-
+# Shared release profile for every workspace member. `[profile.*]` sections are only honored in
+# the workspace root manifest (this file is now a virtual `[workspace]` manifest with no
+# `[package]` of its own), so this moved here verbatim from the pre-workspace root Cargo.toml.
 [profile.release]
 opt-level = "z"
 lto = true
