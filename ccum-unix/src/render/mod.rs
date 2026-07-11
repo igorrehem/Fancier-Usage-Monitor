@@ -18,10 +18,15 @@
 //! entirely on this module's `Canvas` primitives -- see `ccum-unix/src/main.rs`'s
 //! double-buffering wiring for how the two fit together each frame.
 
+pub mod animations;
 pub mod appearance;
 pub mod bars;
 pub mod controls;
+pub mod font;
+mod layout;
+pub mod size;
 pub mod text;
+pub mod update;
 
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Transform};
 

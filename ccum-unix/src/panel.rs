@@ -118,9 +118,13 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
+use crate::render::animations::{self, AnimationControls};
 use crate::render::appearance::{self, AppearanceControls};
 use crate::render::controls::{LRect, MouseMsg};
+use crate::render::font::{self, FontControls};
+use crate::render::size::{self, SizeControls};
 use crate::render::text::TextRenderer;
+use crate::render::update::{self, UpdateControls};
 use crate::render::{Canvas, Color, Rect};
 
 /// Section-nav labels -- see this module's doc comment ("Porting notes") for why these are
@@ -140,8 +144,21 @@ pub const SECTIONS: [&str; 6] = ["Appearance", "Font", "Size", "Animations", "Up
 // non-resizable window. `ccum-windows/src/config_window.rs`'s own settings window is 700x700 for
 // the same reason (`WINDOW_W`/`WINDOW_H`) -- this is a smaller popup, not the full window, but
 // needed the same kind of widening once real content (not a placeholder) had to fit inside it.
+//
+// `PANEL_H` was heightened again by Task 11 (from 460 to 520): the Animations section's own
+// content (`render::animations::animation_layout` -- 4 header+row groups plus a trailing
+// reduce-motion row, stacked with `layout::RowCursor`) needs ~458px of vertical room below
+// `content_area()`'s top, i.e. a content-area bottom of at least `16 (CTRL_PAD) + 458 = 474`px
+// -- at the old `PANEL_H` (460), `content_area().bottom` was only 444px, which left the
+// `reduce_motion` toggle (and the tail of the Fade/Slide group) drawn *and hit-tested* past the
+// bottom of the actual window: real content there is simply unreachable by a real mouse click,
+// since the OS never delivers pointer events outside a window's own client area. This was caught
+// by Task 11's own native-Windows-run verification (see that task's report), not by any unit
+// test -- `dispatch_hit`/`RowCursor`'s pure layout math has no way to know it's being asked to
+// lay out more content than the window is tall enough to show. 520 gives content-area bottom
+// 504px, ~30px of slack past the 474px actually needed.
 const PANEL_W: i32 = 520;
-const PANEL_H: i32 = 460;
+const PANEL_H: i32 = 520;
 const SIDEBAR_W: i32 = 150;
 const SECTION_ITEM_H: i32 = 36;
 const SECTION_TOP_PAD: i32 = 12;
@@ -222,6 +239,14 @@ pub struct Panel {
     /// same moment `draft` itself is seeded. `None` until the panel's window has been created
     /// once (see `create`).
     appearance: Option<AppearanceControls>,
+
+    // --- Task 11: Font/Size/Animations/Update section content ---
+    // Same seed-once-alongside-`draft`, `None`-until-first-`create` lifecycle as `appearance`
+    // above -- see that field's doc comment.
+    font: Option<FontControls>,
+    size: Option<SizeControls>,
+    animations: Option<AnimationControls>,
+    update: Option<UpdateControls>,
 }
 
 impl Panel {
@@ -237,6 +262,10 @@ impl Panel {
             focus_lost_at: None,
             draft: None,
             appearance: None,
+            font: None,
+            size: None,
+            animations: None,
+            update: None,
         }
     }
 
@@ -267,12 +296,17 @@ impl Panel {
     /// point `main.rs::App::handle_tray_event` calls for every tray-icon left-click. `settings`
     /// is only actually consumed the FIRST time the panel is ever shown (see `create`'s doc
     /// comment on `draft`) -- passed on every call anyway so the caller doesn't need to track
-    /// which call is "the first one".
-    pub fn toggle(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>, settings: &Settings) {
+    /// which call is "the first one". `text` is likewise only read on that same first show, to
+    /// enumerate installed font families for the Font section's `Dropdown` (see
+    /// `render::text::TextRenderer::font_families`) -- `main.rs::App` owns the one persistent
+    /// `TextRenderer` this crate has, so it must be threaded in from there rather than the panel
+    /// building its own (which would duplicate `FontSystem::new()`'s expensive font-discovery
+    /// work -- see that type's own doc comment on why it's built once and shared).
+    pub fn toggle(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>, settings: &Settings, text: &TextRenderer) {
         if self.visible {
             self.hide();
         } else if !self.suppress_reopen() {
-            self.show(event_loop, anchor, settings);
+            self.show(event_loop, anchor, settings, text);
         }
     }
 
@@ -296,8 +330,8 @@ impl Panel {
         }
     }
 
-    fn show(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>, settings: &Settings) {
-        if self.window.is_none() && !self.create(event_loop, settings) {
+    fn show(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>, settings: &Settings, text: &TextRenderer) {
+        if self.window.is_none() && !self.create(event_loop, settings, text) {
             return;
         }
         let Some(window) = &self.window else { return };
@@ -328,7 +362,7 @@ impl Panel {
     /// fails, mirroring `main.rs::App::resumed`'s own error handling for the demo window --
     /// except a failure here only disables the popup panel, not the whole process
     /// (`event_loop.exit()` is NOT called).
-    fn create(&mut self, event_loop: &ActiveEventLoop, settings: &Settings) -> bool {
+    fn create(&mut self, event_loop: &ActiveEventLoop, settings: &Settings, text: &TextRenderer) -> bool {
         let attributes = Window::default_attributes()
             .with_title("Claude Code Usage Monitor \u{2014} Settings")
             .with_inner_size(PhysicalSize::new(PANEL_W as u32, PANEL_H as u32))
@@ -371,6 +405,10 @@ impl Panel {
             // `is_dark: true` -- no OS dark/light-mode detection wired up yet, matching
             // `render::bars`/this module's own `paint` (see that function's doc comment).
             self.appearance = Some(AppearanceControls::from_settings(&draft.appearance, true));
+            self.font = Some(FontControls::from_settings(&draft.typography, text.font_families()));
+            self.size = Some(SizeControls::from_settings(&draft.geometry));
+            self.animations = Some(AnimationControls::from_settings(&draft.animation));
+            self.update = Some(UpdateControls::from_settings(draft.poll_interval_ms));
             self.draft = Some(draft);
         }
 
@@ -430,8 +468,16 @@ impl Panel {
         if let Some(idx) = section_at(self.cursor.0, self.cursor.1, size.width, size.height) {
             if idx != self.active_section {
                 self.active_section = idx;
+                // Force-close every popover/dropdown that extends outside its own control rect
+                // (see `AppearanceControls::close_all_popovers`'s doc comment): navigating away
+                // while one is open must never leave it rendering pre-expanded on return.
+                // `Segmented`/`Toggle`/bare `Slider` have no such open/closed state, so Size/
+                // Animations/Update need no equivalent close call here.
                 if let Some(appearance) = &mut self.appearance {
                     appearance.close_all_popovers();
+                }
+                if let Some(font) = &mut self.font {
+                    font.close_dropdown();
                 }
                 self.request_redraw();
             }
@@ -440,25 +486,39 @@ impl Panel {
         self.dispatch_content_mouse(MouseMsg::Down);
     }
 
-    /// Routes a mouse message to the active section's content controls (currently only
-    /// Appearance -- the other 5 sections stay placeholders until Tasks 11-12) and requests a
-    /// repaint if anything changed. A no-op while Appearance isn't the active section, or
-    /// before the panel's window (and thus `draft`/`appearance`) has ever been created.
+    /// Routes a mouse message to the active section's content controls (Presets, section index
+    /// 5, is still a placeholder -- Task 12's job) and requests a repaint if anything changed.
+    /// A no-op before the panel's window (and thus `draft`/the section controls) has ever been
+    /// created.
     fn dispatch_content_mouse(&mut self, msg: MouseMsg) {
-        if self.active_section != 0 {
-            return;
-        }
-        let (Some(draft), Some(appearance)) = (&mut self.draft, &mut self.appearance) else {
+        let Some(draft) = &mut self.draft else {
             return;
         };
-        let changed = appearance::dispatch_appearance(
-            appearance,
-            draft,
-            content_area(),
-            msg,
-            self.cursor.0 as f32,
-            self.cursor.1 as f32,
-        );
+        let area = content_area();
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let changed = match self.active_section {
+            0 => match &mut self.appearance {
+                Some(appearance) => appearance::dispatch_appearance(appearance, draft, area, msg, x, y),
+                None => false,
+            },
+            1 => match &mut self.font {
+                Some(font) => font::dispatch_font(font, draft, area, msg, x, y),
+                None => false,
+            },
+            2 => match &mut self.size {
+                Some(size) => size::dispatch_size(size, draft, area, msg, x, y),
+                None => false,
+            },
+            3 => match &mut self.animations {
+                Some(animations) => animations::dispatch_animations(animations, draft, area, msg, x, y),
+                None => false,
+            },
+            4 => match &mut self.update {
+                Some(update) => update::dispatch_update(update, draft, area, msg, x, y),
+                None => false,
+            },
+            _ => false,
+        };
         if changed {
             self.request_redraw();
         }
@@ -511,7 +571,18 @@ impl Panel {
         let Some(mut canvas) = Canvas::new(width.get(), height.get()) else {
             return;
         };
-        paint(&mut canvas, text, width.get(), height.get(), self.active_section, self.appearance.as_ref());
+        paint(
+            &mut canvas,
+            text,
+            width.get(),
+            height.get(),
+            self.active_section,
+            self.appearance.as_ref(),
+            self.font.as_ref(),
+            self.size.as_ref(),
+            self.animations.as_ref(),
+            self.update.as_ref(),
+        );
 
         let mut buffer = match surface.buffer_mut() {
             Ok(buffer) => buffer,
@@ -657,6 +728,10 @@ fn paint(
     height: u32,
     active_section: usize,
     appearance: Option<&AppearanceControls>,
+    font: Option<&FontControls>,
+    size: Option<&SizeControls>,
+    animation_controls: Option<&AnimationControls>,
+    update_controls: Option<&UpdateControls>,
 ) {
     let bg = Color::from_rgba8(0x1e, 0x1e, 0x1e, 0xff);
     let sidebar_bg = Color::from_rgba8(0x25, 0x25, 0x26, 0xff);
@@ -702,13 +777,37 @@ fn paint(
 
     let content_left = sidebar_w + 1.0;
     if content_left < w {
-        if active_section == 0 {
-            if let Some(appearance) = appearance {
-                appearance::draw_appearance_controls(canvas, text, content_area(), true, appearance);
+        match active_section {
+            0 => {
+                if let Some(appearance) = appearance {
+                    appearance::draw_appearance_controls(canvas, text, content_area(), true, appearance);
+                }
             }
-        } else {
-            let placeholder = format!("{} \u{2014} content coming soon", SECTIONS[active_section]);
-            text.draw_text(canvas, content_left + 20.0, 24.0, &placeholder, 13.0, muted_text);
+            1 => {
+                if let Some(font) = font {
+                    font::draw_font_controls(canvas, text, content_area(), true, font);
+                }
+            }
+            2 => {
+                if let Some(size) = size {
+                    size::draw_size_controls(canvas, text, content_area(), true, size);
+                }
+            }
+            3 => {
+                if let Some(animation_controls) = animation_controls {
+                    animations::draw_animation_controls(canvas, text, content_area(), true, animation_controls);
+                }
+            }
+            4 => {
+                if let Some(update_controls) = update_controls {
+                    update::draw_update_controls(canvas, text, content_area(), true, update_controls);
+                }
+            }
+            _ => {
+                // Presets (section index 5) stays a placeholder -- Task 12's job.
+                let placeholder = format!("{} \u{2014} content coming soon", SECTIONS[active_section]);
+                text.draw_text(canvas, content_left + 20.0, 24.0, &placeholder, 13.0, muted_text);
+            }
         }
     }
 }

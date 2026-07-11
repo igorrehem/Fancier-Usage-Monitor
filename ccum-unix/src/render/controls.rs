@@ -626,6 +626,400 @@ fn draw_checkerboard_swatch(canvas: &mut Canvas, swatch: LRect, color: Color) {
     }
 }
 
+// --- Dropdown layout constants -- exact values ported from `ccum-windows/src/controls.rs`'s
+// own constants of the same name. `DROPDOWN_ROW_HEIGHT` is `pub(crate)` (not private like the
+// others) so `render::font`'s own tests can compute an open list's row positions without
+// duplicating this value -- `Dropdown`'s other layout internals stay private since callers only
+// ever need to click through `Control::on_mouse`, but the row height is the one number a test
+// genuinely cannot derive any other way (list_rect/row_rect themselves stay private).
+pub(crate) const DROPDOWN_ROW_HEIGHT: f32 = 24.0;
+const DROPDOWN_MAX_VISIBLE: usize = 6;
+const DROPDOWN_TEXT_PAD: f32 = 8.0;
+const DROPDOWN_ARROW_ZONE: f32 = 18.0;
+
+/// A closed-by-default combobox: the closed row shows `items[selected]` plus an arrow glyph;
+/// clicking it opens a scrollable list of all `items` drawn directly below the closed row.
+/// Clicking an item selects it, closes the list, and emits `Changed`. Clicking the closed row
+/// again while open collapses it, and clicking anywhere else (outside both the closed row and
+/// the open list) also dismisses it without changing `selected` (the standard combobox/`<select>`
+/// "outside click cancels" convention). Direct port of `ccum-windows/src/controls.rs::Dropdown`.
+///
+/// # Outside-click handling (Task 11's own verification concern)
+///
+/// Like `RgbaPicker`, `Dropdown`'s valid interactive area extends *below* its own `rect` while
+/// open -- the dropped-down item list, via `list_rect`. `ccum-windows/src/config_window.rs`'s
+/// `dispatch_font` explicitly documents (in its own comment) that it skips the section-level
+/// `dispatch_hit` gate for `Dropdown` specifically, for exactly that reason: gating a click on
+/// `rect`'s own closed-row bounds would wrongly reject a click on an open list item below it.
+/// `render::font::dispatch_font` (Task 11) replicates that same skip, with the same reasoning
+/// preserved in its own comment -- see that function. This works because `Dropdown::on_mouse`
+/// below already fully self-validates every hit via `point_in`/`item_at`, exactly mirroring
+/// `RgbaPicker::on_mouse`'s identical self-validating contract (see this module's `RgbaPicker`
+/// doc comment) -- routing every message to it unconditionally is safe.
+pub struct Dropdown {
+    pub items: Vec<String>,
+    pub selected: usize,
+    open: bool,
+    /// Index of the first item currently visible in the open list.
+    scroll: usize,
+}
+
+impl Dropdown {
+    pub fn new(items: Vec<String>, selected: usize) -> Self {
+        let selected = if items.is_empty() { 0 } else { selected.min(items.len() - 1) };
+        Self { items, selected, open: false, scroll: 0 }
+    }
+
+    /// How many rows the open list shows at once (never more than the item count).
+    fn visible_count(&self) -> usize {
+        self.items.len().min(DROPDOWN_MAX_VISIBLE)
+    }
+
+    /// The largest valid `scroll` value: any further would leave blank rows at the bottom.
+    fn max_scroll(&self) -> usize {
+        self.items.len().saturating_sub(self.visible_count())
+    }
+
+    /// Adjusts `scroll` so `selected` falls within the visible window; called on open so the
+    /// current selection is always in view.
+    fn scroll_to_selected(&mut self) {
+        let visible = self.visible_count();
+        if visible == 0 {
+            self.scroll = 0;
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The open list's rect: directly below the closed `rect`, spanning its width, with height
+    /// sized to the number of currently visible rows (zero when there are no items).
+    fn list_rect(&self, rect: LRect) -> LRect {
+        let height = DROPDOWN_ROW_HEIGHT * self.visible_count() as f32;
+        LRect { left: rect.left, top: rect.bottom, right: rect.right, bottom: rect.bottom + height }
+    }
+
+    /// The rect of the visible row at `visible_idx` (0-based within the current scroll window),
+    /// relative to the open list computed from the closed `rect`.
+    fn row_rect(&self, rect: LRect, visible_idx: usize) -> LRect {
+        let list = self.list_rect(rect);
+        let top = list.top + DROPDOWN_ROW_HEIGHT * visible_idx as f32;
+        LRect { left: list.left, top, right: list.right, bottom: top + DROPDOWN_ROW_HEIGHT }
+    }
+
+    /// Whether client point `(x, y)` falls within `r` using half-open bounds, so adjacent rects
+    /// (e.g. the closed row and the open list starting exactly at its bottom edge) never both
+    /// claim the same point.
+    fn point_in(&self, x: f32, y: f32, r: LRect) -> bool {
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    }
+
+    /// Maps a client point to an item index in the open list, accounting for `scroll`. Returns
+    /// `None` when `(x, y)` falls outside the list's horizontal or vertical bounds (including
+    /// below the last visible row).
+    fn item_at(&self, x: f32, y: f32, rect: LRect) -> Option<usize> {
+        let list = self.list_rect(rect);
+        if !self.point_in(x, y, list) {
+            return None;
+        }
+        let visible_idx = ((y - list.top) / DROPDOWN_ROW_HEIGHT) as usize;
+        let idx = self.scroll + visible_idx;
+        if idx < self.items.len() { Some(idx) } else { None }
+    }
+
+    /// Force-closes the open list, if any, without changing `selected`. Used by embedders that
+    /// need to guarantee a dropdown isn't left visually "stuck open" when something other than
+    /// a click on/around the dropdown itself (e.g. navigating away from the section that owns
+    /// it) makes the open list stop making sense to show. A no-op if already closed.
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    /// Whether the open list is currently showing. Unlike `RgbaPicker::is_open` (which
+    /// `render::appearance::dispatch_appearance` reads to enforce "at most one popover open at
+    /// a time" across six sibling pickers), the Font section has only ever one `Dropdown`, so
+    /// nothing in `panel.rs`/`render::font` needs to query this outside a test -- `close_dropdown`
+    /// closes unconditionally on section-switch, the same way `close_all_popovers` does. Kept
+    /// as a public read-only accessor (mirroring `RgbaPicker`'s identical shape) since it's a
+    /// natural part of this control's API surface and is exercised directly by this module's
+    /// own tests.
+    #[allow(dead_code)]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+}
+
+impl Control for Dropdown {
+    fn draw(&self, canvas: &mut Canvas, text: &mut TextRenderer, rect: LRect, dark: bool) {
+        let bg = if dark { Color::from_rgba8(0x33, 0x33, 0x33, 0xff) } else { Color::from_rgba8(0xff, 0xff, 0xff, 0xff) };
+        let border = if dark { Color::from_rgba8(0x55, 0x55, 0x55, 0xff) } else { Color::from_rgba8(0xc0, 0xc0, 0xc0, 0xff) };
+        let text_color = if dark { Color::from_rgba8(0xf0, 0xf0, 0xf0, 0xff) } else { Color::from_rgba8(0x20, 0x20, 0x20, 0xff) };
+        let highlight = Color::from_rgba8(0xd9, 0x77, 0x57, 0xff);
+
+        if let Some(r) = rect.to_skia() {
+            canvas.fill_rounded_rect(r, 4.0, border);
+        }
+        let inset_rect = LRect { left: rect.left + 1.0, top: rect.top + 1.0, right: rect.right - 1.0, bottom: rect.bottom - 1.0 };
+        if let Some(r) = inset_rect.to_skia() {
+            canvas.fill_rounded_rect(r, 4.0, bg);
+        }
+
+        let label = self.items.get(self.selected).map(String::as_str).unwrap_or("");
+        let label_y = rect.top + (rect.height() - 12.0) / 2.0;
+        text.draw_text(canvas, rect.left + DROPDOWN_TEXT_PAD, label_y, label, 12.0, text_color);
+
+        let arrow = if self.open { "\u{25B2}" } else { "\u{25BC}" };
+        let arrow_w = text.text_width(arrow, 12.0);
+        let arrow_zone_left = rect.right - DROPDOWN_ARROW_ZONE;
+        let arrow_x = arrow_zone_left + ((DROPDOWN_ARROW_ZONE - arrow_w) / 2.0).max(0.0);
+        text.draw_text(canvas, arrow_x, label_y, arrow, 12.0, text_color);
+
+        if self.open && !self.items.is_empty() {
+            let list = self.list_rect(rect);
+            if let Some(r) = list.to_skia() {
+                canvas.fill_rounded_rect(r, 4.0, border);
+            }
+            let inset_list = LRect { left: list.left + 1.0, top: list.top, right: list.right - 1.0, bottom: list.bottom - 1.0 };
+            if let Some(r) = inset_list.to_skia() {
+                canvas.fill_rounded_rect(r, 4.0, bg);
+            }
+
+            for visible_idx in 0..self.visible_count() {
+                let idx = self.scroll + visible_idx;
+                let row = self.row_rect(rect, visible_idx);
+                if idx == self.selected {
+                    if let Some(r) = row.to_skia() {
+                        canvas.fill_rect(r, highlight);
+                    }
+                }
+                let row_y = row.top + (row.height() - 12.0) / 2.0;
+                text.draw_text(canvas, row.left + DROPDOWN_TEXT_PAD, row_y, &self.items[idx], 12.0, text_color);
+            }
+        }
+    }
+
+    fn on_mouse(&mut self, msg: MouseMsg, x: f32, y: f32, rect: LRect) -> Option<ControlEvent> {
+        if msg != MouseMsg::Down || self.items.is_empty() {
+            return None;
+        }
+        if self.open {
+            if self.point_in(x, y, rect) {
+                // Click on the closed row while open: collapse without changing selection.
+                self.open = false;
+                return None;
+            }
+            if let Some(idx) = self.item_at(x, y, rect) {
+                self.selected = idx;
+                self.open = false;
+                return Some(ControlEvent::Changed);
+            }
+            // Outside both the closed row and the open list: dismiss, no value change.
+            self.open = false;
+            None
+        } else if self.point_in(x, y, rect) {
+            self.open = true;
+            self.scroll_to_selected();
+            None
+        } else {
+            None
+        }
+    }
+}
+
+/// Horizontal gap, in pixels, between adjacent segment pills in a `Segmented` control.
+const SEGMENTED_GAP: f32 = 2.0;
+
+/// A row of equal-width "pill" buttons, one per `options` entry, with `selected` drawn
+/// highlighted. Clicking a pill (other than the one already selected) selects it and emits
+/// `Changed`; clicking the already-selected pill is a no-op. Direct port of
+/// `ccum-windows/src/controls.rs::Segmented`.
+pub struct Segmented {
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
+impl Segmented {
+    pub fn new(options: Vec<String>, selected: usize) -> Self {
+        let selected = if options.is_empty() { 0 } else { selected.min(options.len() - 1) };
+        Self { options, selected }
+    }
+
+    /// The rect of segment `index` within `rect`: `rect`'s width divided evenly into
+    /// `options.len()` columns (floored, matching the original's integer-division column
+    /// width, so `segment_rect`/`option_at` never disagree on which option owns a given pixel),
+    /// with a `SEGMENTED_GAP`-wide gap carved out of each segment's own width (not added on
+    /// top), so the row of segments still exactly spans `rect`. The last segment absorbs any
+    /// leftover width from the floor division.
+    fn segment_rect(&self, index: usize, rect: LRect) -> LRect {
+        let n = (self.options.len() as i32).max(1);
+        let width = rect.width().max(1.0);
+        let col_w = (width / n as f32).floor().max(1.0);
+        let left = rect.left + col_w * index as f32;
+        let right = if index as i32 == n - 1 { rect.right } else { left + col_w };
+        let gap = SEGMENTED_GAP.min((right - left) / 2.0).max(0.0);
+        LRect {
+            left: left + if index == 0 { 0.0 } else { gap },
+            top: rect.top,
+            right: right - if index as i32 == n - 1 { 0.0 } else { gap },
+            bottom: rect.bottom,
+        }
+    }
+
+    /// Which option index (if any) contains client point `(x, y)`, using half-open bounds
+    /// per-column so a click exactly on a shared boundary resolves to exactly one segment, and
+    /// a click above/below `rect` (or when there are no options) resolves to `None`.
+    fn option_at(&self, x: f32, y: f32, rect: LRect) -> Option<usize> {
+        if self.options.is_empty() || y < rect.top || y >= rect.bottom {
+            return None;
+        }
+        let n = (self.options.len() as i32).max(1);
+        let width = rect.width().max(1.0);
+        let col_w = (width / n as f32).floor().max(1.0);
+        if x < rect.left || x >= rect.right {
+            return None;
+        }
+        let idx = (((x - rect.left) / col_w) as i32).clamp(0, n - 1);
+        Some(idx as usize)
+    }
+}
+
+impl Control for Segmented {
+    fn draw(&self, canvas: &mut Canvas, text: &mut TextRenderer, rect: LRect, dark: bool) {
+        let bg = if dark { Color::from_rgba8(0x33, 0x33, 0x33, 0xff) } else { Color::from_rgba8(0xe8, 0xe8, 0xe8, 0xff) };
+        let selected_bg = Color::from_rgba8(0xd9, 0x77, 0x57, 0xff);
+        let text_color = if dark { Color::from_rgba8(0xf0, 0xf0, 0xf0, 0xff) } else { Color::from_rgba8(0x20, 0x20, 0x20, 0xff) };
+        let selected_text = Color::from_rgba8(0xff, 0xff, 0xff, 0xff);
+
+        let radius = (rect.height().max(1.0) / 2.0).min(8.0);
+        for (i, option) in self.options.iter().enumerate() {
+            let seg = self.segment_rect(i, rect);
+            let (fill, txt_color) = if i == self.selected { (selected_bg, selected_text) } else { (bg, text_color) };
+            if let Some(r) = seg.to_skia() {
+                canvas.fill_rounded_rect(r, radius, fill);
+            }
+
+            // `DT_CENTER` had no `cosmic-text` equivalent (see `TextRenderer::text_width`'s doc
+            // comment) -- measure the label first, then compute a left-aligned offset that
+            // centers it within the segment.
+            let label_w = text.text_width(option, 12.0);
+            let label_x = seg.left + ((seg.width() - label_w) / 2.0).max(0.0);
+            let label_y = seg.top + (seg.height() - 12.0) / 2.0;
+            text.draw_text(canvas, label_x, label_y, option, 12.0, txt_color);
+        }
+    }
+
+    fn on_mouse(&mut self, msg: MouseMsg, x: f32, y: f32, rect: LRect) -> Option<ControlEvent> {
+        if msg != MouseMsg::Down {
+            return None;
+        }
+        let idx = self.option_at(x, y, rect)?;
+        if idx == self.selected {
+            return None;
+        }
+        self.selected = idx;
+        Some(ControlEvent::Changed)
+    }
+}
+
+/// Layout constants for `Toggle`'s pill switch: overall track size and the padding between the
+/// track's edge and the knob circle.
+const TOGGLE_TRACK_W: f32 = 36.0;
+const TOGGLE_TRACK_H: f32 = 18.0;
+const TOGGLE_KNOB_PAD: f32 = 2.0;
+
+/// A simple on/off switch drawn as a pill-shaped track with a circular knob at the left (off)
+/// or right (on) end. Clicking within the drawn track (`track_rect(rect)`, which may be
+/// narrower than `rect` itself) flips `on` and emits `Changed`; clicks in the empty space of
+/// `rect` outside the track are ignored. Direct port of `ccum-windows/src/controls.rs::Toggle`,
+/// including the hit-test-against-drawn-track fix that file's own review cycle found (see
+/// `on_mouse` below).
+pub struct Toggle {
+    pub on: bool,
+}
+
+impl Toggle {
+    pub fn new(on: bool) -> Self {
+        Self { on }
+    }
+
+    /// The track rect: a `TOGGLE_TRACK_W` x `TOGGLE_TRACK_H` pill vertically centered within
+    /// `rect` and anchored to `rect`'s left edge (matching `RgbaPicker::swatch_rect`'s
+    /// left-anchored, height-clamped convention), shrunk to fit if `rect` is smaller than the
+    /// nominal track size.
+    fn track_rect(&self, rect: LRect) -> LRect {
+        let avail_h = rect.height().max(1.0);
+        let avail_w = rect.width().max(1.0);
+        let h = TOGGLE_TRACK_H.min(avail_h);
+        // Never narrower than it is tall, but the final `.min(avail_w)` re-clamps in case
+        // `.max(h)` (applied after the first `.min(avail_w)`) would otherwise re-widen `w` past
+        // the available width for narrow-but-tall rects (e.g. avail_w=1, h=18: without this the
+        // naive `min(36,1).max(18)` would overflow to 18).
+        let w = TOGGLE_TRACK_W.min(avail_w).max(h).min(avail_w);
+        let top = rect.top + (avail_h - h) / 2.0;
+        LRect { left: rect.left, top, right: rect.left + w, bottom: top + h }
+    }
+
+    /// The knob's bounding rect within `track`: a circle inset by `TOGGLE_KNOB_PAD`, flush with
+    /// the track's left edge when off and its right edge when on.
+    fn knob_rect(&self, track: LRect) -> LRect {
+        let h = track.height().max(1.0);
+        let d = (h - TOGGLE_KNOB_PAD * 2.0).max(1.0);
+        let left = if self.on { track.right - TOGGLE_KNOB_PAD - d } else { track.left + TOGGLE_KNOB_PAD };
+        LRect { left, top: track.top + TOGGLE_KNOB_PAD, right: left + d, bottom: track.top + TOGGLE_KNOB_PAD + d }
+    }
+}
+
+impl Control for Toggle {
+    fn draw(&self, canvas: &mut Canvas, _text: &mut TextRenderer, rect: LRect, dark: bool) {
+        let track = self.track_rect(rect);
+        let track_color = if self.on {
+            Color::from_rgba8(0xd9, 0x77, 0x57, 0xff)
+        } else if dark {
+            Color::from_rgba8(0x4a, 0x4a, 0x4a, 0xff)
+        } else {
+            Color::from_rgba8(0xd4, 0xd4, 0xd4, 0xff)
+        };
+        let knob_color = if dark { Color::from_rgba8(0xf0, 0xf0, 0xf0, 0xff) } else { Color::from_rgba8(0xff, 0xff, 0xff, 0xff) };
+        let knob_border = if dark { Color::from_rgba8(0x20, 0x20, 0x20, 0xff) } else { Color::from_rgba8(0xa0, 0xa0, 0xa0, 0xff) };
+
+        if let Some(r) = track.to_skia() {
+            canvas.fill_rounded_rect(r, track.height() / 2.0, track_color);
+        }
+
+        let knob = self.knob_rect(track);
+        // GDI drew the knob as a bordered ellipse; same "bordered circle" look here as
+        // `Slider::draw`'s knob -- a slightly larger border-colored circle behind a smaller
+        // knob-colored one.
+        let kr = (knob.width().max(0.0)) / 2.0;
+        let kcx = (knob.left + knob.right) / 2.0;
+        let kcy = (knob.top + knob.bottom) / 2.0;
+        canvas.fill_circle(kcx, kcy, kr, knob_border);
+        canvas.fill_circle(kcx, kcy, (kr - 1.0).max(0.0), knob_color);
+    }
+
+    fn on_mouse(&mut self, msg: MouseMsg, x: f32, y: f32, rect: LRect) -> Option<ControlEvent> {
+        if msg != MouseMsg::Down {
+            return None;
+        }
+        // Hit-test against the actual drawn track (`track_rect`), not the raw `rect`: when
+        // `rect` is wider than the fixed-size track, a click in the visually empty space to the
+        // right of the track must not flip `on`. This is the exact hit-test fix
+        // `ccum-windows/src/controls.rs::Toggle`'s own review cycle found and fixed, preserved
+        // here unchanged.
+        let track = self.track_rect(rect);
+        if x >= track.left && x < track.right && y >= track.top && y < track.bottom {
+            self.on = !self.on;
+            Some(ControlEvent::Changed)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +1185,238 @@ mod tests {
         let expanded_h = p.popover_height();
         assert!(expanded_h > closed_h);
         assert_eq!(expanded_h - closed_h, POPOVER_SLIDER_ROW_HEIGHT * 4.0);
+    }
+
+    // --- Dropdown ---
+
+    fn dropdown_items(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("Item {i}")).collect()
+    }
+
+    #[test]
+    fn dropdown_item_at_accounts_for_scroll_offset() {
+        let dropdown = Dropdown { items: dropdown_items(10), selected: 0, open: true, scroll: 3 };
+        let r = rect(0.0, 0.0, 200.0, 24.0);
+        let list = dropdown.list_rect(r);
+
+        let mid_row0_y = list.top + DROPDOWN_ROW_HEIGHT / 2.0;
+        assert_eq!(dropdown.item_at(100.0, mid_row0_y, r), Some(3));
+
+        let mid_last_row_y = list.top + DROPDOWN_ROW_HEIGHT * 5.0 + DROPDOWN_ROW_HEIGHT / 2.0;
+        assert_eq!(dropdown.item_at(100.0, mid_last_row_y, r), Some(8));
+
+        assert_eq!(dropdown.item_at(100.0, list.bottom, r), None);
+        assert_eq!(dropdown.item_at(-5.0, mid_row0_y, r), None);
+        assert_eq!(dropdown.item_at(500.0, mid_row0_y, r), None);
+        assert_eq!(dropdown.item_at(100.0, 0.0, r), None);
+    }
+
+    #[test]
+    fn dropdown_item_at_clamps_when_scroll_leaves_partial_last_page() {
+        let dropdown = Dropdown { items: dropdown_items(7), selected: 0, open: true, scroll: 1 };
+        assert_eq!(dropdown.max_scroll(), 1);
+        let r = rect(0.0, 0.0, 200.0, 24.0);
+        let list = dropdown.list_rect(r);
+        let last_row_mid_y = list.top + DROPDOWN_ROW_HEIGHT * 5.0 + DROPDOWN_ROW_HEIGHT / 2.0;
+        assert_eq!(dropdown.item_at(100.0, last_row_mid_y, r), Some(6));
+    }
+
+    #[test]
+    fn dropdown_scroll_to_selected_keeps_selection_in_view() {
+        let mut dropdown = Dropdown::new(dropdown_items(20), 15);
+        dropdown.scroll_to_selected();
+        let visible = dropdown.visible_count();
+        assert!(dropdown.selected >= dropdown.scroll);
+        assert!(dropdown.selected < dropdown.scroll + visible);
+        assert!(dropdown.scroll <= dropdown.max_scroll());
+    }
+
+    #[test]
+    fn dropdown_click_opens_then_click_item_selects_and_closes() {
+        let mut dropdown = Dropdown::new(dropdown_items(10), 0);
+        let r = rect(0.0, 0.0, 200.0, 24.0);
+
+        let event = dropdown.on_mouse(MouseMsg::Down, 50.0, 12.0, r);
+        assert!(event.is_none());
+        assert!(dropdown.is_open());
+
+        let list = dropdown.list_rect(r);
+        let row2_mid_y = list.top + DROPDOWN_ROW_HEIGHT * 2.0 + DROPDOWN_ROW_HEIGHT / 2.0;
+        let event = dropdown.on_mouse(MouseMsg::Down, 50.0, row2_mid_y, r);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert_eq!(dropdown.selected, 2);
+        assert!(!dropdown.is_open());
+    }
+
+    #[test]
+    fn dropdown_click_outside_open_list_closes_without_changing_selection() {
+        let mut dropdown = Dropdown::new(dropdown_items(10), 4);
+        let r = rect(0.0, 0.0, 200.0, 24.0);
+        dropdown.on_mouse(MouseMsg::Down, 50.0, 12.0, r);
+        assert!(dropdown.is_open());
+
+        let list = dropdown.list_rect(r);
+        let event = dropdown.on_mouse(MouseMsg::Down, 50.0, list.bottom + 100.0, r);
+        assert!(event.is_none());
+        assert!(!dropdown.is_open());
+        assert_eq!(dropdown.selected, 4);
+    }
+
+    #[test]
+    fn dropdown_click_closed_row_while_open_collapses_without_change() {
+        let mut dropdown = Dropdown::new(dropdown_items(10), 4);
+        let r = rect(0.0, 0.0, 200.0, 24.0);
+        dropdown.on_mouse(MouseMsg::Down, 50.0, 12.0, r);
+        assert!(dropdown.is_open());
+
+        let event = dropdown.on_mouse(MouseMsg::Down, 50.0, 12.0, r);
+        assert!(event.is_none());
+        assert!(!dropdown.is_open());
+        assert_eq!(dropdown.selected, 4);
+    }
+
+    #[test]
+    fn dropdown_ignores_clicks_when_no_items() {
+        let mut dropdown = Dropdown::new(Vec::new(), 0);
+        let r = rect(0.0, 0.0, 200.0, 24.0);
+        let event = dropdown.on_mouse(MouseMsg::Down, 50.0, 12.0, r);
+        assert!(event.is_none());
+        assert!(!dropdown.is_open());
+    }
+
+    // --- Segmented ---
+
+    fn segmented_options(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("Opt{i}")).collect()
+    }
+
+    #[test]
+    fn segmented_option_at_splits_evenly_and_resolves_boundaries() {
+        let seg = Segmented::new(segmented_options(3), 0);
+        let r = rect(0.0, 0.0, 300.0, 24.0);
+        let y = 12.0;
+
+        assert_eq!(seg.option_at(50.0, y, r), Some(0));
+        assert_eq!(seg.option_at(150.0, y, r), Some(1));
+        assert_eq!(seg.option_at(250.0, y, r), Some(2));
+
+        assert_eq!(seg.option_at(100.0, y, r), Some(1));
+        assert_eq!(seg.option_at(200.0, y, r), Some(2));
+
+        assert_eq!(seg.option_at(0.0, y, r), Some(0));
+        assert_eq!(seg.option_at(299.0, y, r), Some(2));
+        assert_eq!(seg.option_at(300.0, y, r), None);
+        assert_eq!(seg.option_at(-1.0, y, r), None);
+
+        assert_eq!(seg.option_at(50.0, r.top - 1.0, r), None);
+        assert_eq!(seg.option_at(50.0, r.bottom, r), None);
+    }
+
+    #[test]
+    fn segmented_option_at_last_segment_absorbs_uneven_remainder() {
+        let seg = Segmented::new(segmented_options(3), 0);
+        let r = rect(0.0, 0.0, 301.0, 24.0);
+        assert_eq!(seg.option_at(300.0, 12.0, r), Some(2));
+        assert_eq!(seg.option_at(199.0, 12.0, r), Some(1));
+        assert_eq!(seg.option_at(200.0, 12.0, r), Some(2));
+    }
+
+    #[test]
+    fn segmented_click_selects_and_emits_changed() {
+        let mut seg = Segmented::new(segmented_options(3), 0);
+        let r = rect(0.0, 0.0, 300.0, 24.0);
+        let event = seg.on_mouse(MouseMsg::Down, 250.0, 12.0, r);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert_eq!(seg.selected, 2);
+    }
+
+    #[test]
+    fn segmented_click_on_already_selected_option_is_a_no_op() {
+        let mut seg = Segmented::new(segmented_options(3), 1);
+        let r = rect(0.0, 0.0, 300.0, 24.0);
+        let event = seg.on_mouse(MouseMsg::Down, 150.0, 12.0, r);
+        assert!(event.is_none());
+        assert_eq!(seg.selected, 1);
+    }
+
+    #[test]
+    fn segmented_ignores_clicks_when_no_options() {
+        let mut seg = Segmented::new(Vec::new(), 0);
+        let r = rect(0.0, 0.0, 300.0, 24.0);
+        let event = seg.on_mouse(MouseMsg::Down, 150.0, 12.0, r);
+        assert!(event.is_none());
+        assert_eq!(seg.selected, 0);
+    }
+
+    #[test]
+    fn segmented_single_option_always_selected_and_click_is_a_no_op() {
+        let mut seg = Segmented::new(segmented_options(1), 0);
+        let r = rect(0.0, 0.0, 300.0, 24.0);
+        assert_eq!(seg.option_at(150.0, 12.0, r), Some(0));
+        let event = seg.on_mouse(MouseMsg::Down, 150.0, 12.0, r);
+        assert!(event.is_none());
+        assert_eq!(seg.selected, 0);
+    }
+
+    // --- Toggle ---
+
+    #[test]
+    fn toggle_click_flips_state_and_emits_changed() {
+        let mut toggle = Toggle::new(false);
+        let r = rect(0.0, 0.0, 36.0, 18.0);
+        let event = toggle.on_mouse(MouseMsg::Down, 10.0, 9.0, r);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(toggle.on);
+
+        let event = toggle.on_mouse(MouseMsg::Down, 10.0, 9.0, r);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(!toggle.on);
+    }
+
+    #[test]
+    fn toggle_ignores_clicks_outside_rect() {
+        let mut toggle = Toggle::new(false);
+        let r = rect(0.0, 0.0, 36.0, 18.0);
+        assert!(toggle.on_mouse(MouseMsg::Down, 36.0, 9.0, r).is_none());
+        assert!(toggle.on_mouse(MouseMsg::Down, -1.0, 9.0, r).is_none());
+        assert!(toggle.on_mouse(MouseMsg::Down, 10.0, 18.0, r).is_none());
+        assert!(!toggle.on);
+    }
+
+    #[test]
+    fn toggle_ignores_clicks_past_track_edge_in_wider_rect() {
+        let mut toggle = Toggle::new(false);
+        let r = rect(0.0, 0.0, 200.0, 18.0);
+        let track = toggle.track_rect(r);
+        assert_eq!(track.right, TOGGLE_TRACK_W);
+
+        let event = toggle.on_mouse(MouseMsg::Down, 150.0, 9.0, r);
+        assert!(event.is_none());
+        assert!(!toggle.on);
+
+        let event = toggle.on_mouse(MouseMsg::Down, track.right - 1.0, 9.0, r);
+        assert!(matches!(event, Some(ControlEvent::Changed)));
+        assert!(toggle.on);
+    }
+
+    #[test]
+    fn toggle_track_rect_never_exceeds_narrow_rects_width() {
+        let toggle = Toggle::new(false);
+        let r = rect(0.0, 0.0, 1.0, 100.0);
+        let track = toggle.track_rect(r);
+        assert!(track.width() <= r.width());
+        assert_eq!(track.right, r.right);
+    }
+
+    #[test]
+    fn toggle_knob_moves_from_left_to_right_edge_when_on() {
+        let track = rect(0.0, 0.0, 36.0, 18.0);
+        let off = Toggle::new(false);
+        let on = Toggle::new(true);
+        let off_knob = off.knob_rect(track);
+        let on_knob = on.knob_rect(track);
+        assert_eq!(off_knob.left, TOGGLE_KNOB_PAD);
+        assert_eq!(on_knob.right, track.right - TOGGLE_KNOB_PAD);
+        assert!(on_knob.left > off_knob.left);
     }
 }
