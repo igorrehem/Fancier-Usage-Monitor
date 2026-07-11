@@ -1,0 +1,31 @@
+[package]
+name = "ccum-unix"
+version = "1.5.0"
+edition = "2021"
+license = "MIT"
+description = "Claude Code Usage Monitor (macOS/Linux)"
+publish = false
+
+# Task 4 note: this is a "hello world" skeleton -- winit event loop, one blank window, a
+# sanity touch of ccum-core. It is NOT the real usage-monitor UI (that lands in later
+# Phase 2 tasks: render.rs's tiny-skia port of controls.rs, tray.rs's tray-icon
+# integration, settings_paths.rs's XDG/Library path resolution). See the design spec
+# (docs/superpowers/specs/2026-07-11-macos-linux-port-design.md) sections 2-3 and the
+# Task 4 report (.superpowers/sdd/mlp-task-4-report.md) for the reasoning behind every
+# dependency and version pinned below.
+#
+# GPU note: none of the four dependencies below pull in wgpu/Vulkan/OpenGL/Metal bindings
+# as a hard requirement -- verified via `cargo tree --target x86_64-unknown-linux-gnu` and
+# `cargo tree --target aarch64-apple-darwin` against this exact dependency set (see the
+# Task 4 report). winit is windowing/event-loop only (no renderer of its own); tiny-skia is
+# a pure-CPU rasterizer; tray-icon's Linux backend pulls GTK3/libappindicator (a *build-time*
+# system-library dependency, not a GPU one -- Cairo's GTK usage here is software rendering);
+# cosmic-text's rasterization path (swash) is pure CPU software rasterization, no `glyphon`/
+# wgpu feature enabled.
+
+[dependencies]
+ccum-core = { path = "../ccum-core" }
+winit = "0.30"
+tiny-skia = "0.12"
+tray-icon = "0.24"
+cosmic-text = "0.19"

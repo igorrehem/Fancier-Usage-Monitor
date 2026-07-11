@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ccum-core", "ccum-windows"]
+members = ["ccum-core", "ccum-windows", "ccum-unix"]
 default-members = ["ccum-windows"]
 
 # Shared release profile for every workspace member. `[profile.*]` sections are only honored in
