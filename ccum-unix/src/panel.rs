@@ -65,12 +65,35 @@
 //! `WindowEvent::Focused(false)` hides the panel, so clicking anywhere outside it closes it like
 //! a normal OS flyout. A short grace period (`FOCUS_GRACE`) after `show()` ignores the first
 //! unfocus, guarding against a spurious immediate `Focused(false)` some platforms can send right
-//! after a freshly-shown window hasn't actually received input focus yet. One known rough edge,
-//! left as-is for this shell task rather than over-engineered: clicking the tray icon again
-//! *while the panel is open* may race this same unfocus handling (the icon click can itself
-//! steal focus before the click's `Up` event -- the one `tray::handle_click` gates the toggle
-//! on -- is even delivered), so on some platforms a re-click might reopen the panel instead of
-//! leaving it closed. See the Task 9 report for what was actually observed on this machine.
+//! after a freshly-shown window hasn't actually received input focus yet.
+//!
+//! ## Tray-click/focus-loss race (post-Task-9 fix)
+//!
+//! Clicking the tray icon again *while the panel is open* can race this same unfocus handling:
+//! the click itself steals focus (the OS delivers `WindowEvent::Focused(false)` to the panel
+//! near-synchronously with the physical click) before `tray_icon`'s own `Click{Up}` event -- the
+//! one `tray::handle_click` gates the toggle on -- arrives, since that event is relayed through a
+//! slower path (`TrayIconEvent::set_event_handler` -> `EventLoopProxy::send_event`, see
+//! `main.rs`'s top-of-module comment). So the observed order is typically:
+//! 1. `Focused(false)` arrives -> `handle_focus_change` -> `hide()` (panel now invisible).
+//! 2. The tray's `Click{Up}` event arrives afterward -> `handle_tray_event` -> `Panel::toggle()`.
+//!
+//! Without a guard, step 2 would see `visible == false` and call `show()` again, reopening the
+//! panel a click meant to close. Two cooperating timestamps close this race from both possible
+//! orderings:
+//! - `focus_lost_at`, set by `handle_focus_change` right before a real (non-grace-swallowed)
+//!   `hide()`. `toggle()`'s reopen branch (`suppress_reopen`) checks this: if the panel was just
+//!   hidden by focus-loss within `TRAY_CLICK_GRACE`, the click that's about to reopen it almost
+//!   certainly CAUSED that focus-loss, so the toggle treats its "close" goal as already met and
+//!   does not call `show()` (this is the ordering above, and the one actually observed).
+//! - `last_tray_click_at`, set at the top of `toggle()` on every tray-click-triggered call.
+//!   `handle_focus_change` checks this too, symmetrically: a `Focused(false)` arriving shortly
+//!   AFTER a tray click is ignored rather than hiding an already-closed (or freshly-reopened)
+//!   panel, covering the less common reverse ordering.
+//!
+//! Neither check fires for a genuine click-outside-the-panel close (no tray click involved,
+//! `last_tray_click_at` stays `None`/stale) -- that path is untouched and still closes the panel
+//! exactly as before. See `Panel::toggle`/`Panel::suppress_reopen`/`Panel::handle_focus_change`.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -108,6 +131,14 @@ const POSITION_GAP: f64 = 6.0;
 /// comment ("Click-outside-to-close").
 const FOCUS_GRACE: Duration = Duration::from_millis(200);
 
+/// Grace window used to reconcile a tray-click-triggered toggle with a near-simultaneous
+/// `Focused(false)` plausibly caused by that same click's OS-level focus-steal -- see this
+/// module's doc comment ("Tray-click/focus-loss race"). Currently the same duration as
+/// `FOCUS_GRACE` (both are "OS event delivery/relay jitter" grace windows), but named
+/// separately since the two guard genuinely different races and may need independent tuning
+/// later.
+const TRAY_CLICK_GRACE: Duration = FOCUS_GRACE;
+
 /// The tray icon's on-screen rect at the moment the panel is being shown, in physical pixels --
 /// a local copy of the handful of fields this module actually needs out of
 /// `tray_icon::Rect`/`PhysicalPosition`/`PhysicalSize`, so `panel.rs` doesn't have to depend on
@@ -142,6 +173,13 @@ pub struct Panel {
     /// Set by `show()`, cleared once `FOCUS_GRACE` has elapsed -- see this module's doc comment
     /// ("Click-outside-to-close").
     shown_at: Option<Instant>,
+    /// Set by `handle_focus_change` immediately before it calls `hide()` in response to a real
+    /// (non-grace-swallowed) `Focused(false)`; cleared once consumed by `suppress_reopen`. See
+    /// this module's doc comment ("Tray-click/focus-loss race").
+    focus_lost_at: Option<Instant>,
+    /// Set at the top of `toggle()` on every tray-click-triggered call -- see this module's doc
+    /// comment ("Tray-click/focus-loss race").
+    last_tray_click_at: Option<Instant>,
 }
 
 impl Panel {
@@ -154,6 +192,8 @@ impl Panel {
             active_section: 0,
             cursor: (0.0, 0.0),
             shown_at: None,
+            focus_lost_at: None,
+            last_tray_click_at: None,
         }
     }
 
@@ -183,10 +223,35 @@ impl Panel {
     /// Opens the panel if it's currently closed, or closes it if it's open -- the single entry
     /// point `main.rs::App::handle_tray_event` calls for every tray-icon left-click.
     pub fn toggle(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>) {
+        // Record that a tray-click-triggered toggle is being processed right now -- read by
+        // `handle_focus_change` to ignore a `Focused(false)` that arrives shortly AFTER this
+        // click. See this module's doc comment ("Tray-click/focus-loss race").
+        self.last_tray_click_at = Some(Instant::now());
+
         if self.visible {
             self.hide();
-        } else {
+        } else if !self.suppress_reopen() {
             self.show(event_loop, anchor);
+        }
+    }
+
+    /// Returns `true` (and consumes `focus_lost_at`) if a reopen -- about to happen because
+    /// `self.visible == false` -- should be suppressed because the panel was hidden by a
+    /// `Focused(false)` only moments ago. That focus-loss almost certainly was CAUSED by this
+    /// very tray click (the OS's near-synchronous focus-steal notification arriving before
+    /// `tray_icon`'s own, more slowly relayed, `Click{Up}` event -- see this module's doc
+    /// comment, "Tray-click/focus-loss race"), so the click's "close the panel" goal already
+    /// happened and reopening now would undo it instead.
+    ///
+    /// Split out from `toggle` (rather than inlined) so this decision -- pure timestamp
+    /// comparison, no window/`ActiveEventLoop` access -- is directly unit-testable; `toggle`
+    /// itself needs a real `ActiveEventLoop` that a `#[test]` here can't construct.
+    fn suppress_reopen(&mut self) -> bool {
+        if within_grace(self.focus_lost_at, TRAY_CLICK_GRACE) {
+            self.focus_lost_at = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -307,11 +372,20 @@ impl Panel {
         }
         // Swallow the first unfocus within `FOCUS_GRACE` of showing -- see this module's doc
         // comment ("Click-outside-to-close").
-        if let Some(shown_at) = self.shown_at {
-            if shown_at.elapsed() < FOCUS_GRACE {
-                return;
-            }
+        if within_grace(self.shown_at, FOCUS_GRACE) {
+            return;
         }
+        // Also swallow an unfocus that arrives shortly after a tray-click-triggered toggle was
+        // just processed -- guards the less common ordering of the tray-click/focus-loss race
+        // (the more common ordering, focus-loss arriving FIRST, is instead guarded in
+        // `toggle`/`suppress_reopen` via `focus_lost_at`). See this module's doc comment
+        // ("Tray-click/focus-loss race"). A genuine click-outside-the-panel close (no tray click
+        // involved) leaves `last_tray_click_at` at `None`/stale, so this never suppresses that
+        // case.
+        if within_grace(self.last_tray_click_at, TRAY_CLICK_GRACE) {
+            return;
+        }
+        self.focus_lost_at = Some(Instant::now());
         self.hide();
     }
 
@@ -367,6 +441,14 @@ impl Default for Panel {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `ts` (a timestamp of some prior event) is still within `grace` of now -- the shared
+/// predicate behind both halves of the tray-click/focus-loss race guard (`Panel::suppress_reopen`
+/// and `Panel::handle_focus_change`'s `last_tray_click_at`/`shown_at` checks). `None` (no prior
+/// event recorded) is never "within grace".
+fn within_grace(ts: Option<Instant>, grace: Duration) -> bool {
+    ts.is_some_and(|t| t.elapsed() < grace)
 }
 
 /// Client rect of section-nav item `i`, top to bottom, spanning the sidebar's width -- a direct
@@ -543,6 +625,106 @@ mod tests {
         assert!(!panel.is_visible());
         assert_eq!(panel.active_section, 0);
         assert!(panel.window_id().is_none());
+    }
+
+    // --- Tray-click/focus-loss race regression coverage -- see this module's doc comment
+    // ("Tray-click/focus-loss race"). `Panel::toggle`/`Panel::show` need a real
+    // `ActiveEventLoop`, which no `#[test]` here can construct (winit only hands one out inside
+    // a running event loop's own callbacks) -- so these tests drive the panel's private state
+    // directly (as `new_panel_starts_hidden_with_appearance_active` above already does) and
+    // exercise `handle_focus_change`/`suppress_reopen`, the two functions that actually
+    // implement the guard, exactly as `toggle`/`WindowEvent::Focused` would call them.
+
+    #[test]
+    fn within_grace_is_false_for_none_and_for_a_stale_timestamp() {
+        assert!(!within_grace(None, TRAY_CLICK_GRACE));
+        let stale = Instant::now() - (TRAY_CLICK_GRACE + Duration::from_millis(50));
+        assert!(!within_grace(Some(stale), TRAY_CLICK_GRACE));
+        assert!(within_grace(Some(Instant::now()), TRAY_CLICK_GRACE));
+    }
+
+    #[test]
+    fn handle_focus_change_closes_normally_with_no_recent_tray_click() {
+        // A genuine click-outside-the-panel close (unrelated to any tray click) must behave
+        // exactly as before the fix: `last_tray_click_at` is `None`, so the new guard never
+        // fires, and the panel still closes.
+        let mut panel = Panel::new();
+        panel.visible = true;
+        panel.shown_at = None; // past the post-show grace window
+        panel.last_tray_click_at = None; // no tray click involved
+
+        panel.handle_focus_change(false);
+
+        assert!(!panel.is_visible(), "an unrelated click-outside must still close the panel");
+        assert!(panel.focus_lost_at.is_some(), "the close should be recorded as focus-loss-caused");
+    }
+
+    #[test]
+    fn handle_focus_change_ignores_unfocus_shortly_after_a_tray_click() {
+        // Covers the less common ordering: the tray's Click{Up} event (which set
+        // `last_tray_click_at` via `toggle`) is processed, then a `Focused(false)` plausibly
+        // caused by that same click arrives shortly after. It must be ignored, not treated as
+        // an unrelated click-outside.
+        let mut panel = Panel::new();
+        panel.visible = true;
+        panel.shown_at = None; // past the post-show grace window
+        panel.last_tray_click_at = Some(Instant::now());
+
+        panel.handle_focus_change(false);
+
+        assert!(
+            panel.is_visible(),
+            "a focus-loss arriving shortly after a tray click must be ignored, not close the panel"
+        );
+    }
+
+    #[test]
+    fn tray_click_reopen_is_suppressed_after_a_focus_loss_triggered_hide() {
+        // Reproduces the diagnosed race directly: the panel is open, and a `Focused(false)`
+        // caused by the OS's near-synchronous focus-steal on a tray click is processed BEFORE
+        // that same click's `Click{Up}` event (relayed through `tray_icon`'s slower path -- see
+        // this module's doc comment). Without the fix, `toggle()` would then see
+        // `visible == false` and call `show()` again, reopening the panel the click meant to
+        // close.
+        let mut panel = Panel::new();
+        panel.visible = true;
+        panel.shown_at = None; // past the post-show grace window
+        panel.last_tray_click_at = None; // the click hasn't arrived yet
+
+        // Step 1: the focus-loss event arrives first and closes the panel.
+        panel.handle_focus_change(false);
+        assert!(!panel.is_visible(), "focus loss should close the panel");
+        assert!(panel.focus_lost_at.is_some(), "the hide should be recorded as focus-loss-caused");
+
+        // Step 2: the tray's Click{Up} event arrives afterward. `toggle()` itself needs a real
+        // `ActiveEventLoop` this test can't construct, but its reopen decision is exactly
+        // `suppress_reopen` -- exercising it directly proves `toggle()` would skip `show()`
+        // here instead of reopening.
+        assert!(
+            panel.suppress_reopen(),
+            "a reopen within TRAY_CLICK_GRACE of a focus-loss-triggered hide must be suppressed"
+        );
+        assert!(
+            !panel.is_visible(),
+            "panel must remain closed -- exactly one transition, no spurious reopen"
+        );
+        assert!(panel.focus_lost_at.is_none(), "the guard should be consumed once used");
+    }
+
+    #[test]
+    fn tray_click_reopen_proceeds_once_the_focus_loss_grace_window_has_passed() {
+        // A focus-loss-triggered hide that happened well outside `TRAY_CLICK_GRACE` (e.g. the
+        // panel was closed by an unrelated click-outside minutes ago, then the user separately
+        // clicks the tray icon to reopen it) must NOT be suppressed -- otherwise every reopen
+        // after any click-outside close would silently break.
+        let mut panel = Panel::new();
+        panel.visible = false;
+        panel.focus_lost_at = Some(Instant::now() - (TRAY_CLICK_GRACE + Duration::from_millis(50)));
+
+        assert!(
+            !panel.suppress_reopen(),
+            "a stale focus-loss timestamp must not suppress an unrelated later reopen"
+        );
     }
 
     #[test]
