@@ -613,7 +613,7 @@ impl App {
             width: f64::from(r.size.width),
             height: f64::from(r.size.height),
         });
-        self.panel.toggle(event_loop, anchor);
+        self.panel.toggle(event_loop, anchor, &self.settings);
     }
 }
 

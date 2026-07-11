@@ -18,7 +18,9 @@
 //! entirely on this module's `Canvas` primitives -- see `ccum-unix/src/main.rs`'s
 //! double-buffering wiring for how the two fit together each frame.
 
+pub mod appearance;
 pub mod bars;
+pub mod controls;
 pub mod text;
 
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Transform};
@@ -147,6 +149,29 @@ impl Canvas {
         paint.anti_alias = true;
         self.pixmap
             .fill_rect(fill_rect, &paint, Transform::identity(), Some(&mask));
+    }
+
+    /// Fills a circle with a solid color. Mirrors the role GDI's `Ellipse` (brush-filled, no
+    /// pen) plays in `ccum-windows/src/controls.rs::Slider::draw`'s knob -- used by Task 10's
+    /// `controls::Slider::draw` port for the same purpose. `tiny-skia-path` 0.12.0's
+    /// `PathBuilder::push_circle` (confirmed against its own source -- see
+    /// `rounded_rect_path`'s doc comment for the same kind of direct-source verification this
+    /// module already does) builds the circular path directly, so no hand-rolled Bezier
+    /// approximation is needed here the way `rounded_rect_path` needed one for corners.
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, color: Color) {
+        if r <= 0.0 {
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        pb.push_circle(cx, cy, r);
+        let Some(path) = pb.finish() else {
+            return;
+        };
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        self.pixmap
+            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
     /// Blends a single glyph-coverage pixel into the canvas at `(x, y)`, using standard

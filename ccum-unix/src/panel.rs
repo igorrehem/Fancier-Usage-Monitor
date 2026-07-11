@@ -111,12 +111,15 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use ccum_core::settings::Settings;
 use softbuffer::{Context, Surface};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
+use crate::render::appearance::{self, AppearanceControls};
+use crate::render::controls::{LRect, MouseMsg};
 use crate::render::text::TextRenderer;
 use crate::render::{Canvas, Color, Rect};
 
@@ -127,13 +130,30 @@ use crate::render::{Canvas, Color, Rect};
 pub const SECTIONS: [&str; 6] = ["Appearance", "Font", "Size", "Animations", "Update", "Presets"];
 
 // Layout constants, in unscaled (no-DPI-awareness-yet) pixels -- see this module's doc comment.
-const PANEL_W: i32 = 420;
-const PANEL_H: i32 = 360;
+//
+// `PANEL_W`/`PANEL_H` were widened by Task 10 (from Task 9's original 420x360) to actually fit
+// the Appearance section's real content: the 2-column `RgbaPicker` grid's quick-swatch popover
+// needs at least ~144px of width within a single grid cell (5 columns x `POPOVER_SWATCH_CELL`
+// (24) + gaps + padding -- see `render::controls`), and the tallest reflow case (the top-left
+// picker's popover open, pushing every row below it down by up to `popover_height()`) needs
+// enough headroom that the opacity row doesn't run off the bottom of a non-scrolling,
+// non-resizable window. `ccum-windows/src/config_window.rs`'s own settings window is 700x700 for
+// the same reason (`WINDOW_W`/`WINDOW_H`) -- this is a smaller popup, not the full window, but
+// needed the same kind of widening once real content (not a placeholder) had to fit inside it.
+const PANEL_W: i32 = 520;
+const PANEL_H: i32 = 460;
 const SIDEBAR_W: i32 = 150;
 const SECTION_ITEM_H: i32 = 36;
 const SECTION_TOP_PAD: i32 = 12;
 const SECTION_TEXT_INSET: i32 = 16;
 const ACCENT_BAR_W: i32 = 3;
+
+/// Padding, in unscaled pixels, applied on all sides of the content area (right of the
+/// sidebar) before handing it to a section's layout function -- mirrors
+/// `ccum-windows/src/config_window.rs`'s `CTRL_PAD` (used by `split_content` there), minus that
+/// function's live-preview-strip subtraction (Task 9's shell has no preview strip -- see
+/// `render::appearance`'s module doc comment, "No preview strip / button bar").
+const CTRL_PAD: f32 = 16.0;
 
 /// Gap, in physical pixels, kept between the panel's edge and the tray icon rect (or monitor
 /// edge, for the no-anchor fallback) it's positioned against.
@@ -189,6 +209,19 @@ pub struct Panel {
     /// (non-grace-swallowed) `Focused(false)`; cleared once consumed by `suppress_reopen`. See
     /// this module's doc comment ("Tray-click/focus-loss race").
     focus_lost_at: Option<Instant>,
+
+    // --- Task 10: Appearance section content ---
+    /// Working copy of settings, cloned once (in `create`) from whatever `Settings` `show()`
+    /// was first called with -- mirrors `ccum-windows/src/config_window.rs::ConfigState::draft`.
+    /// Kept alive across hide/show toggles (see this module's doc comment, "Lazy creation,
+    /// hide/show toggling") rather than rebuilt every open, matching how `window`/`surface`
+    /// already persist. Only `appearance` (below) reads/writes into it so far; Tasks 11-13
+    /// extend both to the remaining sections and Save/Cancel/Reset.
+    draft: Option<Settings>,
+    /// Live `RgbaPicker`/`Slider` widgets for the Appearance section, seeded from `draft` the
+    /// same moment `draft` itself is seeded. `None` until the panel's window has been created
+    /// once (see `create`).
+    appearance: Option<AppearanceControls>,
 }
 
 impl Panel {
@@ -202,6 +235,8 @@ impl Panel {
             cursor: (0.0, 0.0),
             shown_at: None,
             focus_lost_at: None,
+            draft: None,
+            appearance: None,
         }
     }
 
@@ -229,12 +264,15 @@ impl Panel {
     }
 
     /// Opens the panel if it's currently closed, or closes it if it's open -- the single entry
-    /// point `main.rs::App::handle_tray_event` calls for every tray-icon left-click.
-    pub fn toggle(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>) {
+    /// point `main.rs::App::handle_tray_event` calls for every tray-icon left-click. `settings`
+    /// is only actually consumed the FIRST time the panel is ever shown (see `create`'s doc
+    /// comment on `draft`) -- passed on every call anyway so the caller doesn't need to track
+    /// which call is "the first one".
+    pub fn toggle(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>, settings: &Settings) {
         if self.visible {
             self.hide();
         } else if !self.suppress_reopen() {
-            self.show(event_loop, anchor);
+            self.show(event_loop, anchor, settings);
         }
     }
 
@@ -258,8 +296,8 @@ impl Panel {
         }
     }
 
-    fn show(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>) {
-        if self.window.is_none() && !self.create(event_loop) {
+    fn show(&mut self, event_loop: &ActiveEventLoop, anchor: Option<TrayAnchor>, settings: &Settings) {
+        if self.window.is_none() && !self.create(event_loop, settings) {
             return;
         }
         let Some(window) = &self.window else { return };
@@ -283,11 +321,14 @@ impl Panel {
         self.shown_at = None;
     }
 
-    /// Builds the window/softbuffer context+surface the first time the panel is shown. Returns
-    /// `false` (leaving `self.window`/etc. untouched at `None`) if any step fails, mirroring
-    /// `main.rs::App::resumed`'s own error handling for the demo window -- except a failure here
-    /// only disables the popup panel, not the whole process (`event_loop.exit()` is NOT called).
-    fn create(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    /// Builds the window/softbuffer context+surface the first time the panel is shown, and
+    /// seeds `draft`/`appearance` from `settings` at the same time (once -- see `draft`'s doc
+    /// comment on `Panel` for why this only happens on the very first `show()`, not every
+    /// toggle). Returns `false` (leaving `self.window`/etc. untouched at `None`) if any step
+    /// fails, mirroring `main.rs::App::resumed`'s own error handling for the demo window --
+    /// except a failure here only disables the popup panel, not the whole process
+    /// (`event_loop.exit()` is NOT called).
+    fn create(&mut self, event_loop: &ActiveEventLoop, settings: &Settings) -> bool {
         let attributes = Window::default_attributes()
             .with_title("Claude Code Usage Monitor \u{2014} Settings")
             .with_inner_size(PhysicalSize::new(PANEL_W as u32, PANEL_H as u32))
@@ -324,6 +365,15 @@ impl Panel {
         self.window = Some(window);
         self.context = Some(context);
         self.surface = Some(surface);
+
+        if self.draft.is_none() {
+            let draft = settings.clone();
+            // `is_dark: true` -- no OS dark/light-mode detection wired up yet, matching
+            // `render::bars`/this module's own `paint` (see that function's doc comment).
+            self.appearance = Some(AppearanceControls::from_settings(&draft.appearance, true));
+            self.draft = Some(draft);
+        }
+
         true
     }
 
@@ -347,10 +397,18 @@ impl Panel {
             WindowEvent::RedrawRequested => self.redraw(text),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                // Broadcast unconditionally -- see `config_window.rs`'s own `WM_MOUSEMOVE`
+                // handler's identical reasoning (`render::controls`'s module doc comment,
+                // "Mouse message model"): only a control mid-drag reacts to this at all, so
+                // it's cheap even at full mouse-move rates.
+                self.dispatch_content_mouse(MouseMsg::Move);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if *state == ElementState::Pressed && *button == MouseButton::Left {
-                    self.handle_click();
+                if *button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => self.handle_click(),
+                        ElementState::Released => self.dispatch_content_mouse(MouseMsg::Up),
+                    }
                 }
             }
             WindowEvent::Focused(focused) => self.handle_focus_change(*focused),
@@ -358,14 +416,57 @@ impl Panel {
         }
     }
 
+    /// Handles `MouseInput{Pressed, Left}`: sidebar clicks switch the active section (closing
+    /// any open Appearance popover -- see `AppearanceControls::close_all_popovers`'s doc
+    /// comment); every other click is routed to the active section's content dispatch. Direct
+    /// port of `ccum-windows/src/config_window.rs`'s `WM_LBUTTONDOWN` handler's own
+    /// sidebar-vs-content split (a sidebar hit always returns early, never falling through to
+    /// `dispatch_controls`/`dispatch_content_mouse`).
     fn handle_click(&mut self) {
-        let Some(window) = &self.window else { return };
-        let size = window.inner_size();
+        let size = match &self.window {
+            Some(window) => window.inner_size(),
+            None => return,
+        };
         if let Some(idx) = section_at(self.cursor.0, self.cursor.1, size.width, size.height) {
             if idx != self.active_section {
                 self.active_section = idx;
-                window.request_redraw();
+                if let Some(appearance) = &mut self.appearance {
+                    appearance.close_all_popovers();
+                }
+                self.request_redraw();
             }
+            return;
+        }
+        self.dispatch_content_mouse(MouseMsg::Down);
+    }
+
+    /// Routes a mouse message to the active section's content controls (currently only
+    /// Appearance -- the other 5 sections stay placeholders until Tasks 11-12) and requests a
+    /// repaint if anything changed. A no-op while Appearance isn't the active section, or
+    /// before the panel's window (and thus `draft`/`appearance`) has ever been created.
+    fn dispatch_content_mouse(&mut self, msg: MouseMsg) {
+        if self.active_section != 0 {
+            return;
+        }
+        let (Some(draft), Some(appearance)) = (&mut self.draft, &mut self.appearance) else {
+            return;
+        };
+        let changed = appearance::dispatch_appearance(
+            appearance,
+            draft,
+            content_area(),
+            msg,
+            self.cursor.0 as f32,
+            self.cursor.1 as f32,
+        );
+        if changed {
+            self.request_redraw();
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -410,7 +511,7 @@ impl Panel {
         let Some(mut canvas) = Canvas::new(width.get(), height.get()) else {
             return;
         };
-        paint(&mut canvas, text, width.get(), height.get(), self.active_section);
+        paint(&mut canvas, text, width.get(), height.get(), self.active_section, self.appearance.as_ref());
 
         let mut buffer = match surface.buffer_mut() {
             Ok(buffer) => buffer,
@@ -453,6 +554,21 @@ fn section_rect(i: usize) -> Rect {
     let top = (SECTION_TOP_PAD + i as i32 * SECTION_ITEM_H) as f32;
     Rect::from_xywh(0.0, top, SIDEBAR_W as f32, SECTION_ITEM_H as f32)
         .expect("section_rect: SIDEBAR_W/SECTION_ITEM_H are fixed positive constants")
+}
+
+/// The content panel's controls area: everything right of the sidebar divider, inset by
+/// `CTRL_PAD` on all sides -- see the `CTRL_PAD` doc comment for how this differs from
+/// `ccum-windows/src/config_window.rs::split_content`'s equivalent (no preview-strip
+/// subtraction). Fixed (not size-dependent) since the panel is `with_resizable(false)`, the
+/// same reasoning `section_rect` below already relies on for its own fixed layout.
+fn content_area() -> LRect {
+    let content_left = SIDEBAR_W as f32 + 1.0;
+    LRect {
+        left: content_left + CTRL_PAD,
+        top: CTRL_PAD,
+        right: (PANEL_W as f32 - CTRL_PAD).max(content_left + CTRL_PAD),
+        bottom: (PANEL_H as f32 - CTRL_PAD).max(CTRL_PAD),
+    }
 }
 
 /// Index of the section-nav item containing client point `(x, y)`, if any -- mirrors
@@ -534,7 +650,14 @@ fn compute_position(
 /// branch -- `ccum-unix` has no OS dark/light-mode detection wired up yet, matching
 /// `render::bars::draw_bars`'s own documented `is_dark` placeholder (see that module's doc
 /// comment).
-fn paint(canvas: &mut Canvas, text: &mut TextRenderer, width: u32, height: u32, active_section: usize) {
+fn paint(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    width: u32,
+    height: u32,
+    active_section: usize,
+    appearance: Option<&AppearanceControls>,
+) {
     let bg = Color::from_rgba8(0x1e, 0x1e, 0x1e, 0xff);
     let sidebar_bg = Color::from_rgba8(0x25, 0x25, 0x26, 0xff);
     let divider = Color::from_rgba8(0x3a, 0x3a, 0x3a, 0xff);
@@ -579,8 +702,14 @@ fn paint(canvas: &mut Canvas, text: &mut TextRenderer, width: u32, height: u32, 
 
     let content_left = sidebar_w + 1.0;
     if content_left < w {
-        let placeholder = format!("{} \u{2014} content coming soon", SECTIONS[active_section]);
-        text.draw_text(canvas, content_left + 20.0, 24.0, &placeholder, 13.0, muted_text);
+        if active_section == 0 {
+            if let Some(appearance) = appearance {
+                appearance::draw_appearance_controls(canvas, text, content_area(), true, appearance);
+            }
+        } else {
+            let placeholder = format!("{} \u{2014} content coming soon", SECTIONS[active_section]);
+            text.draw_text(canvas, content_left + 20.0, 24.0, &placeholder, 13.0, muted_text);
+        }
     }
 }
 
