@@ -87,7 +87,139 @@
 
 This is not a normal task — it's a mandatory pause. After Task 4, the orchestrator (not a subagent) must report back to the user with: what was achieved in Phase 1 (fully verified) and Task 4 (partially verified, environment-limited), and explicitly ask whether to continue deeper into Phase 2/3 (the full `tiny-skia` rendering port — thousands of lines of genuinely unverifiable-from-this-environment code) or pause here so the user can set up actual macOS/Linux hardware (or a CI runner) to provide a real feedback loop before more code gets written blind. Do not proceed past this point without that check-in.
 
+**Resolution (2026-07-11): user chose to continue.** Phase 3+ below decomposes the remaining design-spec scope (§2-4) into tasks. Every task in Phase 3+ inherits the same verification ceiling disclosed above — Windows-side additions (none expected) get full verification, `ccum-unix` additions get best-effort `cargo check`/native-Windows-build-as-circumstantial-evidence only, per Task 4's established pattern.
+
 ---
+
+## Phase 3 — Rendering foundation (`ccum-unix`)
+
+### Task 6: `tiny-skia` + `cosmic-text` rendering primitives + double-buffered paint pipeline
+
+**Files:**
+- Create: `ccum-unix/src/render/mod.rs` (or `render.rs` if a single file stays manageable — implementer's call, split if it grows large), `ccum-unix/src/render/text.rs` (cosmic-text integration)
+- Modify: `ccum-unix/src/main.rs` (wire the new paint pipeline into the winit redraw cycle)
+
+**Interfaces:**
+- Consumes: `tiny_skia::{Pixmap, Paint, Path, PathBuilder, Color as SkColor}`, `cosmic_text::{FontSystem, SwashCache, Buffer, Metrics, Attrs}` (or whatever `cosmic-text`'s actual current API surface is — Task 4's chosen version is 0.19.0, verify the real API against that version's docs/source rather than assuming an API shape).
+- Produces: a small `Canvas` abstraction (or similarly-named type) wrapping a `tiny_skia::Pixmap` with helper methods mirroring `ccum-windows`'s GDI helpers' role — `fill_rect(rect, color)`, `fill_rounded_rect(rect, radius, color)`, `draw_text(pos, text, font_size, color)` — that later rendering tasks (bars, controls, sections) will build on, exactly like `window.rs`'s `fill_rect`/`draw_field_label` helpers did for the Windows GDI implementation. A `paint(canvas: &mut Canvas, ...)` entry point wired into `winit`'s `WindowEvent::RedrawRequested`, presenting the finished `Pixmap` to the actual window surface (research how `tiny-skia`-rendered pixels reach an on-screen `winit` window — likely via `softbuffer` crate, a common pairing for `tiny-skia`+`winit` software rendering; add it as a new dependency if so, and document why in this task's report, since it wasn't anticipated in Task 4's dependency list).
+
+- [ ] **Step 1:** Research the `tiny-skia` → on-screen-pixels path for a `winit` window (very likely needs `softbuffer` or an equivalent software-presentation crate, since neither `tiny-skia` nor `winit` alone gets CPU-rendered pixels onto a window surface — `winit` only manages the window/event loop). Confirm this new dependency is still CPU-only (no GPU requirement) before adding it — this is a continuation of Task 4's "no GPU" constraint, don't relax it here.
+- [ ] **Step 2:** Implement the `Canvas` abstraction with `fill_rect`/`fill_rounded_rect`/`draw_text` (and any other primitive later tasks will clearly need — keep this minimal, don't speculatively build primitives no later task asks for, per this whole plan's YAGNI discipline).
+- [ ] **Step 3:** Wire double-buffering: build the frame into an off-screen `Pixmap` each `RedrawRequested`, then present it in one shot — mirroring the exact lesson learned from `ccum-windows`'s own flicker fix (commit `2b6d4f3` on `main`) — do not skip this, single-buffered CPU rendering into a live window is a well-known flicker source, and this codebase already paid to learn that lesson once on Windows; don't relearn it here.
+- [ ] **Step 4: Verify.** Windows-side: N/A (no `ccum-windows` changes expected — confirm `.\dev.ps1 build`/`test` still pass unaffected regardless, as a matter of course). `ccum-unix` (best-effort): `cargo check -p ccum-unix --target x86_64-unknown-linux-gnu` (report the exact outcome, distinguishing "my code has an error" from "never reached my code" per the established pattern), AND — since Task 4 discovered this works and is genuinely informative — also try `cargo build -p ccum-unix` targeting the NATIVE `x86_64-pc-windows-msvc` (this crate has zero OS-gating so far; if it still builds/runs natively on Windows after this task's changes, that's real evidence, not just a formality) and, if it builds, actually RUN it and visually confirm SOMETHING renders (even a solid-color rectangle) in the window on this machine — this is the first task where you can get genuine visual confirmation of the rendering pipeline, even though the final target platforms are different, since `tiny-skia`+`softbuffer`(if used)+`winit` should behave identically in terms of the CPU-rasterization logic regardless of OS. Take this opportunity seriously — it's your best available signal before Phase 4.
+- [ ] **Step 5: Commit** — `feat: tiny-skia/cosmic-text rendering primitives + double-buffered paint pipeline`.
+
+### Task 7: Usage bar widget rendering
+
+**Files:**
+- Create: `ccum-unix/src/render/bars.rs`
+- Modify: `ccum-unix/src/main.rs` (drive `ccum_core::animation::AnimationClock` on a timer, feed `AnimationFrame` into the bar renderer each tick)
+
+**Interfaces:**
+- Consumes: `ccum_core::animation::{AnimationClock, AnimationFrame}`, `ccum_core::settings::{Settings, AnimationSettings, Appearance}`, `ccum_core::models::{UsageData, UsageSection}`, Task 6's `Canvas`.
+- Produces: `fn draw_bars(canvas: &mut Canvas, settings: &Settings, frame: &AnimationFrame, usage: &UsageData)` — the actual "does this look like a usage bar" rendering: label + filled bar (fill percentage from `frame.fill_pcts`, color from `settings.appearance`, shimmer/glow effects if enabled) + text, for however many sections are active (Claude Code/Codex/Antigravity) — this is a genuine PORT of `ccum-windows/src/window.rs`'s `paint_widget`/`draw_usage_bar`-equivalent logic (read that Windows code in full before starting — the animation MATH is identical since `ccum-core::animation` is shared, only the DRAWING calls change from GDI to `tiny-skia`).
+
+- [ ] **Step 1:** Read `ccum-windows/src/window.rs`'s current bar-drawing logic in full (whatever it's now named post-Task-1's extraction) to understand exactly what visual elements exist and in what order they're drawn, so the port is faithful, not reimagined from scratch.
+- [ ] **Step 2:** Implement `draw_bars` using Task 6's `Canvas` primitives, driven by a real `AnimationClock` ticking on a `winit` timer (research the right `winit` 0.30 mechanism for a periodic redraw — likely `event_loop.set_control_flow(ControlFlow::WaitUntil(...))` recomputed each frame, or a separate thread posting `UserEvent`s — pick one, document why).
+- [ ] **Step 3: Verify** — same pattern as Task 6: best-effort Linux `cargo check`, and (valuable) a native Windows run to visually confirm the bars actually render and animate on this machine, comparing by eye against the real `ccum-windows` app's own bars for rough visual fidelity (not pixel-perfect, but "does this look like the same idea").
+- [ ] **Step 4: Commit** — `feat: port usage bar rendering (fill/shimmer/glow/fade) to tiny-skia`.
+
+### Task 8: Tray icon integration
+
+**Files:**
+- Create: `ccum-unix/src/tray.rs`
+- Modify: `ccum-unix/src/main.rs` (wire tray-icon creation, click-to-toggle popup visibility, periodic icon-bitmap regeneration from real `ccum_core::poller::poll()` results)
+
+**Interfaces:**
+- Consumes: `tray_icon` crate's API (`TrayIconBuilder`, `Icon::from_rgba`), Task 7's `draw_bars` (or a compact variant of it sized for an icon — icons are much smaller than the popup panel, so this is likely a SEPARATE, simpler compact rendering path, not a literal reuse of `draw_bars` at a smaller canvas size — use your judgment, document the choice), `ccum_core::poller::poll()`.
+- Produces: a real system tray/menu-bar icon that regenerates its bitmap each poll tick (matching the "continuous visual feedback" design decision from brainstorming) and toggles the popup panel (from Task 9, once it exists — if Task 9 isn't done yet when this task runs, stub the click handler to just log an event, don't block this task on a not-yet-existing later task).
+
+- [ ] **Step 1:** Implement compact icon-bitmap rendering (a small mini-bar, sized per typical tray/menu-bar icon dimensions — research typical sizes, e.g. ~22x22 on Linux, ~18-22pt on macOS at the relevant scale factors).
+- [ ] **Step 2:** Wire `tray_icon` crate creation + a real `ccum_core::poller::poll()` call on a timer, regenerating the icon bitmap from real (or, if polling genuinely fails in this dev environment — likely, since this is a Windows machine without the exact `claude`/`codex` POSIX setup Task 2's new code paths expect — clearly-fallback demo/placeholder) usage data each tick.
+- [ ] **Step 3: Verify** — best-effort Linux check (note: `tray-icon`'s Linux backend needs GTK3 system libs per Task 4's finding, so this will likely hit the same wall — that's expected and fine, document it, don't try to work around it by disabling the tray feature just to get a green checkmark). Native Windows run: `tray-icon` DOES support Windows too (it's cross-platform) — if it builds/runs, confirm an actual tray icon appears in the Windows system tray on this machine and updates over time, which would be strong real evidence.
+- [ ] **Step 4: Commit** — `feat: tray icon with live-rendered mini-bar, real poll-driven updates`.
+
+---
+
+## Phase 4 — Popup panel + settings port
+
+### Task 9: Popup window shell + section-nav sidebar
+
+**Files:** Create `ccum-unix/src/panel.rs` (window management: show/hide/position-near-tray-icon), `ccum-unix/src/render/sections.rs` (sidebar nav rendering, mirroring `ccum-windows`'s `config_window.rs` section-list)
+
+**Interfaces:** Consumes Task 6-8's rendering pipeline + tray click events. Produces a togglable popup panel with the 6-section sidebar (Appearance/Font/Size/Animations/Update/Presets) rendered and clickable, content area still empty (sections' actual content is Tasks 10-12) — this task proves the panel shell + navigation works before any section's content is ported.
+
+- [ ] **Step 1:** Read `ccum-windows/src/config_window.rs`'s section-nav layout/draw/dispatch logic (from the original settings-window plan) as the porting reference.
+- [ ] **Step 2:** Implement the popup window (borderless or minimal chrome — research what's idiomatic per-platform via `winit`'s window-attribute options), positioned near the tray icon on open, with the sidebar rendered via Task 6's primitives and section-switch click handling.
+- [ ] **Step 3: Verify** — native Windows run: open the popup via the tray icon, confirm the sidebar renders and section clicks switch the highlighted section (even with empty content areas).
+- [ ] **Step 4: Commit** — `feat: popup panel shell with section-nav sidebar`.
+
+### Task 10: Appearance section port (6 RgbaPickers + popover)
+
+**Files:** `ccum-unix/src/render/sections.rs` (or split into `sections/appearance.rs` if it grows — mirror `ccum-windows`'s per-section file organization instinct even though that codebase kept everything in one `config_window.rs`; use your judgment on when a split earns its keep, this port is a good moment to start clean rather than recreate that file's eventual 3000+-line size problem from day one).
+
+**Interfaces:** Consumes `ccum-core::settings::{Appearance, Rgba, PaletteStops}`, Task 6-9's rendering/panel infra. Produces the Appearance section's real content: 6 compact RgbaPicker-equivalent rows, each opening a popover (quick-swatch grid + Custom sliders) on click — a genuine PORT of `ccum-windows/src/controls.rs`'s `RgbaPicker` (from CT-Task 1/2 of the prior color-picker/themes plan) to `tiny-skia`, including its hit-testing logic (which is pure math, not GDI-specific, so the CORE hit-test logic — `popover_rect`, `swatch_cell_rect`, `custom_row_rect` — can likely port with only the coordinate-type/rect-type changed, not reimagined; read that code and reuse its logic/structure closely).
+
+- [ ] **Step 1:** Read `ccum-windows/src/controls.rs`'s full `RgbaPicker` implementation (Task 1/2 of the color-picker/themes plan) as the porting reference — this is a substantial, already-battle-tested design (including the outside-click-bounds fix from that plan's own review cycle), don't redesign it, port it.
+- [ ] **Step 2:** Implement the port, including click/hit-testing wired to `winit`'s pointer events (`WindowEvent::CursorMoved`/`MouseInput` — different event model than Win32's `WM_LBUTTONDOWN`, but the same underlying hit-test math applies once you have current cursor position + click state).
+- [ ] **Step 3: Verify** — native Windows run: open Appearance, click through all 6 pickers, open a popover, pick a quick swatch, open Custom and drag a slider, confirm values visually update.
+- [ ] **Step 4: Commit** — `feat: port Appearance section (RgbaPicker popover) to tiny-skia`.
+
+### Task 11: Font/Size/Animations/Update sections port
+
+**Files:** `ccum-unix/src/render/sections.rs` (or split files per Task 10's judgment call).
+
+**Interfaces:** Consumes `ccum-core::settings::{Typography, Geometry, AnimationSettings}`, the remaining `ccum-windows/src/controls.rs` control types (`Dropdown`, `Segmented`, `Toggle`, bare `Slider`) as porting references. Produces the 4 simpler sections' real content.
+
+- [ ] **Step 1:** Port `Slider`/`Dropdown`/`Segmented`/`Toggle` from `controls.rs` to `tiny-skia`-drawn equivalents (same porting philosophy as Task 10 — reuse the proven hit-test/layout math, change only the drawing calls).
+- [ ] **Step 2:** Wire the 4 sections' actual field bindings (Font's family/size/weight, Size's 6 geometry sliders, Animations' 4 groups + reduce-motion, Update's frequency segmented + custom slider).
+- [ ] **Step 3: Verify** — native Windows run: exercise every control in all 4 sections, confirm values change and (once Task 6/7's live bar rendering is wired into the popup preview, if this plan reaches that — otherwise defer preview-wiring to a later polish task and just confirm the controls themselves respond correctly) the settings actually update.
+- [ ] **Step 4: Commit** — `feat: port Font/Size/Animations/Update sections to tiny-skia`.
+
+### Task 12: Presets section port (24-card scrollable grid)
+
+**Files:** `ccum-unix/src/render/sections.rs` (or split).
+
+**Interfaces:** Consumes `ccum_core::presets::{apply_preset, theme_display_name, theme_category, ALL_PRESET_IDS, PresetCategory}`. Produces the full 24-preset, 3-category-grouped, scrollable card grid — a genuine PORT of `ccum-windows/src/config_window.rs`'s Presets section (from CT-Task 5 of the color-picker/themes plan), including its scroll-offset/hit-test consistency discipline (that plan's own review found and fixed a real bug there — read that history, in `.superpowers/sdd/progress.md`'s CT-Task 5 entry, before porting, so the same class of mistake isn't reintroduced fresh in the new rendering backend).
+
+- [ ] **Step 1:** Read `ccum-windows/src/config_window.rs`'s Presets section (layout/draw/dispatch/scroll) in full as the porting reference, plus the CT-Task 5 review history for the scroll-offset bug class to avoid repeating.
+- [ ] **Step 2:** Implement the port, including mouse-wheel scroll handling (`winit`'s `WindowEvent::MouseWheel`) and the same draw/hit-test-offset-consistency discipline.
+- [ ] **Step 3: Verify** — native Windows run: scroll through all 24 cards, click cards at top/mid-scroll/bottom, confirm each applies its own correct preset (the exact same high-risk check CT-Task 5's own verification used).
+- [ ] **Step 4: Commit** — `feat: port Presets section (scrollable 24-card grid) to tiny-skia`.
+
+### Task 13: Save/Cancel/Reset + settings persistence paths
+
+**Files:** Create `ccum-unix/src/settings_paths.rs`. Modify `ccum-unix/src/panel.rs` (button bar).
+
+**Interfaces:** Consumes `ccum_core::settings::{Settings, load, save}` (check `load`/`save`'s actual current signature — Task 1's report should document whether they take an explicit path or resolve one internally; if internal, they likely need a `ccum-windows`-specific path baked in that must be generalized to accept a path parameter so `ccum-unix` can supply its own OS-appropriate path — this may require a small, additive `ccum-core` change, which is in-scope for this task if needed, just keep it minimal and don't regress `ccum-windows`'s own call sites). Produces: `fn settings_path() -> PathBuf` with `#[cfg(target_os = "macos")]` → `~/Library/Application Support/ClaudeCodeUsageMonitor/settings.json` and `#[cfg(target_os = "linux")]` → XDG (`$XDG_CONFIG_HOME` or `~/.config/`) `/claude-code-usage-monitor/settings.json`, per the design spec §4. Save/Cancel/Reset buttons in the popup panel's button bar, mirroring `ccum-windows`'s Task 14 (original settings-window plan) semantics.
+
+- [ ] **Step 1:** Check `ccum_core::settings::{load, save}`'s actual signature (added in Task 1) and generalize it to accept a path if it doesn't already, updating `ccum-windows`'s call site to pass its existing Windows path explicitly (zero behavior change there — verify with `.\dev.ps1 test` after this change, this is the one place in Phase 3+ that touches `ccum-windows`/`ccum-core` and needs that full regression check).
+- [ ] **Step 2:** Implement `settings_path()` for macOS/Linux, wire Save/Cancel/Reset.
+- [ ] **Step 3: Verify** — Windows regression: `.\dev.ps1 build`/`test` must still be clean (this task touches shared `ccum-core` code, unlike Tasks 6-12 which were `ccum-unix`-only). `ccum-unix`: native Windows run to confirm Save/Cancel/Reset behave correctly against SOME settings path (even if it's not the "real" macOS/Linux path on this machine, the mechanism itself is verifiable).
+- [ ] **Step 4: Commit** — `feat: Save/Cancel/Reset + macOS/Linux settings persistence paths`.
+
+---
+
+## Phase 5 — Polish
+
+### Task 14: Full pass + i18n verification + handoff documentation
+
+**Files:** Possibly none (verification/docs task) unless a genuine bug surfaces.
+
+- [ ] **Step 1:** Full native-Windows run-through of the entire `ccum-unix` app (tray icon, popup, all 6 sections, Save/Cancel/Reset) as the best available proxy for real macOS/Linux behavior.
+- [ ] **Step 2:** Confirm `cosmic-text` correctly renders at least one non-Latin locale's strings (e.g. temporarily point the app at Japanese or Russian `Strings` from `ccum_core::localization` and visually confirm glyphs render, not tofu/boxes) — this was the whole reason `cosmic-text` was chosen over `fontdue` in Task 4, so it needs a real check, not just an assumption.
+- [ ] **Step 3:** Write a clear, concise "how to actually test this on real macOS/Linux hardware" doc (e.g. `ccum-unix/TESTING.md` or a section in the design spec) covering: how to build (`cargo build -p ccum-unix --release` from a real Mac/Linux checkout), what to check first (does the tray icon appear, does the popup open, do all sections work), and a list of every place in this plan's tasks where the implementer explicitly flagged low confidence (the Antigravity credential-read POSIX guesses from Task 2 chief among them) so the user knows exactly what to scrutinize first.
+- [ ] **Step 4: Commit** — `docs: macOS/Linux port Phase 3-5 complete, handoff testing guide` (or a `fix: ...` if Step 1/2 found something).
+
+---
+
+## Self-Review (Phase 3-5 addendum)
+
+**Spec coverage:** design spec §2 (rendering) ✓ Tasks 6-7,10-12; §3 (tray) ✓ Task 8; §4 (persistence paths) ✓ Task 13; §5 (out of scope) correctly not tasked; §6 (testing) ✓ Task 14 + each task's own verification step.
+
+**Placeholders:** none — every task names its exact files/interfaces; research-dependent decisions (the `tiny-skia`-to-window presentation mechanism in Task 6, exact popup positioning in Task 9) are flagged as decisions FOR the implementer to make and document, not vague hand-waves.
+
+**Type consistency:** every later task's "Consumes" line names the exact `ccum_core`/earlier-task type it depends on, traceable back to Task 1's documented public API or an earlier Phase-3+ task's own "Produces" line.
 
 ## Self-Review
 
