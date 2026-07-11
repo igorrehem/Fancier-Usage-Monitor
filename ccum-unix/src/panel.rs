@@ -111,10 +111,10 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ccum_core::settings::Settings;
+use ccum_core::settings::{PresetId, Settings};
 use softbuffer::{Context, Surface};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
@@ -122,10 +122,19 @@ use crate::render::animations::{self, AnimationControls};
 use crate::render::appearance::{self, AppearanceControls};
 use crate::render::controls::{LRect, MouseMsg};
 use crate::render::font::{self, FontControls};
+use crate::render::presets;
 use crate::render::size::{self, SizeControls};
 use crate::render::text::TextRenderer;
 use crate::render::update::{self, UpdateControls};
 use crate::render::{Canvas, Color, Rect};
+
+/// `SECTIONS`' index for Presets -- the last of the 6 sections. Named rather than a bare `5`
+/// literal at every call site (`handle_mouse_wheel`'s active-section gate, `paint`/
+/// `dispatch_content_mouse`'s match arms) so the "which index is Presets" fact lives in one
+/// place, mirroring `ccum-windows/src/config_window.rs::draw_section_controls`'s own `_ =>` arm
+/// convention (Presets is Windows' fall-through/last arm too, for the same reason: it's the
+/// final section in `SECTIONS`' declared order).
+const PRESETS_SECTION: usize = 5;
 
 /// Section-nav labels -- see this module's doc comment ("Porting notes") for why these are
 /// hardcoded English rather than routed through `ccum_core::localization::Strings` yet. Order
@@ -247,6 +256,26 @@ pub struct Panel {
     size: Option<SizeControls>,
     animations: Option<AnimationControls>,
     update: Option<UpdateControls>,
+
+    // --- Task 12: Presets section content ---
+    /// Vertical scroll position of the Presets section's card grid, in pixels of content
+    /// scrolled past the top of the section's content area -- `0.0` means scrolled all the way
+    /// to the top (the initial/default state). Mirrors
+    /// `ccum-windows/src/config_window.rs::ConfigState::presets_scroll_offset` -- see that
+    /// field's doc comment for why this lives directly on `Panel` rather than inside some
+    /// `PresetsControls` struct (there is no per-field widget state to bundle; this is the only
+    /// piece of transient UI state the section has). Clamped to
+    /// `[0, presets::presets_max_scroll_offset(..)]` on every mutation (`handle_mouse_wheel`),
+    /// never negative. Reset only implicitly (never explicitly), same as the Windows original --
+    /// re-opening the panel does NOT currently rebuild `Panel` from scratch (unlike
+    /// `ccum-windows`'s per-open `ConfigState`; see `create`'s doc comment, "Lazy creation,
+    /// hide/show toggling"), so a scroll position set in one session persists into the next
+    /// until the process exits. This is a deliberate, minor behavioral difference from Windows,
+    /// not a bug: `ccum-unix`'s hide/show model already keeps every other section's control
+    /// state (slider drag positions, open dropdowns notwithstanding `close_dropdown`) across
+    /// toggles too, so a persisted scroll position is consistent with that same lifecycle
+    /// choice, not an outlier.
+    presets_scroll_offset: f32,
 }
 
 impl Panel {
@@ -266,6 +295,7 @@ impl Panel {
             size: None,
             animations: None,
             update: None,
+            presets_scroll_offset: 0.0,
         }
     }
 
@@ -450,7 +480,50 @@ impl Panel {
                 }
             }
             WindowEvent::Focused(focused) => self.handle_focus_change(*focused),
+            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(*delta),
             _ => {}
+        }
+    }
+
+    /// Handles `WindowEvent::MouseWheel`: adjusts the Presets section's scroll offset, gated to
+    /// the Presets section being active (mirroring
+    /// `ccum-windows/src/config_window.rs`'s own `WM_MOUSEWHEEL` handler, which is a no-op
+    /// unless `active_section == 5` -- no other section has scrollable content of its own yet).
+    /// `winit` delivers no cursor position with this event on every platform (unlike Win32's
+    /// `WM_MOUSEWHEEL`, whose `lParam` at least carries *screen* coordinates), so -- like the
+    /// Windows original, which explicitly documents skipping a cursor-position gate here for the
+    /// same reason -- this reacts to every wheel event delivered to the panel window while
+    /// Presets is active, without checking where the cursor actually is; safe because the whole
+    /// visible content area *is* the scrollable region whenever Presets is active, so "the panel
+    /// has focus/received this event" and "the cursor is over the scrollable content" coincide
+    /// in practice for this one section.
+    ///
+    /// `MouseScrollDelta::LineDelta`'s `y` is a notch count (`ccum-windows`' `WHEEL_DELTA`-based
+    /// `notches`); `PixelDelta`'s `y` is already real pixels (high-precision trackpad/touch
+    /// scroll) and is used directly rather than re-quantized into notch-sized steps. Both cases
+    /// follow `winit::event::MouseScrollDelta`'s own documented sign convention -- "positive
+    /// values indicate that the content that is being scrolled should move right and down" --
+    /// which is the same direction `ccum-windows/src/config_window.rs`'s own `WM_MOUSEWHEEL`
+    /// handler assumes for its `notches` (there, a positive `notches` -- wheel rotated away from
+    /// the user, the traditional "scroll toward the top" gesture -- *decreases* the offset, i.e.
+    /// moves content down/reveals what's above): `new_offset = old_offset - delta_px`.
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.active_section != PRESETS_SECTION {
+            return;
+        }
+        let delta_px = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y * presets::PRESET_SCROLL_STEP,
+            MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+        };
+        if delta_px == 0.0 {
+            return;
+        }
+        let area = content_area();
+        let max_offset = presets::presets_max_scroll_offset(area);
+        let new_offset = presets::clamp_scroll_offset(self.presets_scroll_offset - delta_px, max_offset);
+        if new_offset != self.presets_scroll_offset {
+            self.presets_scroll_offset = new_offset;
+            self.request_redraw();
         }
     }
 
@@ -486,10 +559,9 @@ impl Panel {
         self.dispatch_content_mouse(MouseMsg::Down);
     }
 
-    /// Routes a mouse message to the active section's content controls (Presets, section index
-    /// 5, is still a placeholder -- Task 12's job) and requests a repaint if anything changed.
-    /// A no-op before the panel's window (and thus `draft`/the section controls) has ever been
-    /// created.
+    /// Routes a mouse message to the active section's content controls and requests a repaint if
+    /// anything changed. A no-op before the panel's window (and thus `draft`/the section
+    /// controls) has ever been created.
     fn dispatch_content_mouse(&mut self, msg: MouseMsg) {
         let Some(draft) = &mut self.draft else {
             return;
@@ -517,6 +589,26 @@ impl Panel {
                 Some(update) => update::dispatch_update(update, draft, area, msg, x, y),
                 None => false,
             },
+            PRESETS_SECTION => {
+                let applied = presets::dispatch_presets(draft, area, self.presets_scroll_offset, msg, x, y);
+                if applied {
+                    // `ccum_core::presets::apply_preset` only ever touches `draft.appearance`/
+                    // `draft.animation` (never `typography`/`geometry`/`poll_interval_ms` -- see
+                    // that function's own doc comment), so only those two sections' cached
+                    // control state needs rebuilding from the mutated draft -- the same
+                    // "rebuild controls from settings after an external draft mutation"
+                    // discipline `ccum-windows/src/config_window.rs::dispatch_presets` uses via
+                    // `SectionControls::from_settings`, scoped down to just the two sections
+                    // actually touched instead of every section wholesale (this crate has no
+                    // single `SectionControls` struct to rebuild in one shot -- see `Panel`'s
+                    // own per-section `Option<...Controls>` fields). `is_dark: true` matches
+                    // `create`'s own hardcoded seed (see that method's doc comment -- no OS
+                    // dark/light-mode detection wired up yet).
+                    self.appearance = Some(AppearanceControls::from_settings(&draft.appearance, true));
+                    self.animations = Some(AnimationControls::from_settings(&draft.animation));
+                }
+                applied
+            }
             _ => false,
         };
         if changed {
@@ -571,6 +663,7 @@ impl Panel {
         let Some(mut canvas) = Canvas::new(width.get(), height.get()) else {
             return;
         };
+        let active_preset = self.draft.as_ref().and_then(|d| d.animation.preset);
         paint(
             &mut canvas,
             text,
@@ -582,6 +675,8 @@ impl Panel {
             self.size.as_ref(),
             self.animations.as_ref(),
             self.update.as_ref(),
+            active_preset,
+            self.presets_scroll_offset,
         );
 
         let mut buffer = match surface.buffer_mut() {
@@ -713,14 +808,15 @@ fn compute_position(
 
 /// Paints one full frame into `canvas`: whole-window background, sidebar background, the
 /// sidebar/content divider, each section's label (with the active one tinted + accent-barred),
-/// and a placeholder line in the content area -- a direct port of `config_window.rs::paint`'s
-/// overall shape (see this module's doc comment), minus that file's preview strip/per-section
-/// controls/button bar, which don't exist yet on this platform (Tasks 10-14).
+/// and each section's own controls -- a direct port of `config_window.rs::paint`'s overall shape
+/// (see this module's doc comment), minus that file's preview strip/button bar, which don't
+/// exist yet on this platform.
 ///
 /// Colors are the same fixed dark-mode palette `config_window.rs::paint` uses for its own dark
 /// branch -- `ccum-unix` has no OS dark/light-mode detection wired up yet, matching
 /// `render::bars::draw_bars`'s own documented `is_dark` placeholder (see that module's doc
 /// comment).
+#[allow(clippy::too_many_arguments)]
 fn paint(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
@@ -732,6 +828,8 @@ fn paint(
     size: Option<&SizeControls>,
     animation_controls: Option<&AnimationControls>,
     update_controls: Option<&UpdateControls>,
+    active_preset: Option<PresetId>,
+    presets_scroll_offset: f32,
 ) {
     let bg = Color::from_rgba8(0x1e, 0x1e, 0x1e, 0xff);
     let sidebar_bg = Color::from_rgba8(0x25, 0x25, 0x26, 0xff);
@@ -803,11 +901,10 @@ fn paint(
                     update::draw_update_controls(canvas, text, content_area(), true, update_controls);
                 }
             }
-            _ => {
-                // Presets (section index 5) stays a placeholder -- Task 12's job.
-                let placeholder = format!("{} \u{2014} content coming soon", SECTIONS[active_section]);
-                text.draw_text(canvas, content_left + 20.0, 24.0, &placeholder, 13.0, muted_text);
+            PRESETS_SECTION => {
+                presets::draw_presets_controls(canvas, text, content_area(), true, active_preset, presets_scroll_offset);
             }
+            _ => {}
         }
     }
 }

@@ -24,6 +24,7 @@ pub mod bars;
 pub mod controls;
 pub mod font;
 mod layout;
+pub mod presets;
 pub mod size;
 pub mod text;
 pub mod update;
@@ -43,13 +44,59 @@ pub use tiny_skia::{Color, Rect};
 /// immediate-mode CPU rasterizer painting straight onto a live window surface.
 pub struct Canvas {
     pixmap: Pixmap,
+    /// Active rectangular clip (Task 12: the Presets section's scrollable card grid), or `None`
+    /// for no clipping. See `set_clip_rect`'s doc comment.
+    clip_rect: Option<Rect>,
+    /// `clip_rect` pre-rasterized into a full-canvas alpha `Mask`, consumed by every fill
+    /// primitive's own `Option<&Mask>` parameter -- see `set_clip_rect`'s doc comment for why
+    /// this is built once per `set_clip_rect` call rather than per draw call.
+    clip_mask: Option<Mask>,
 }
 
 impl Canvas {
     /// Allocates a new, fully-transparent `width` x `height` canvas. Returns `None` if
     /// `width`/`height` is zero (matches `tiny_skia::Pixmap::new`'s own contract).
     pub fn new(width: u32, height: u32) -> Option<Self> {
-        Pixmap::new(width, height).map(|pixmap| Self { pixmap })
+        Pixmap::new(width, height).map(|pixmap| Self { pixmap, clip_rect: None, clip_mask: None })
+    }
+
+    /// Confines every subsequent `fill_rect`/`fill_rounded_rect`/`fill_circle`/glyph-blend call
+    /// (`blend_pixel`) to `rect`'s bounds, replacing any previously active clip; `None` clears it
+    /// (equivalent to `clear_clip`). This is `tiny-skia`'s nearest equivalent to GDI's
+    /// persistent per-DC clip region (`SelectClipRgn`), which
+    /// `ccum-windows/src/config_window.rs::draw_presets_controls` uses to keep the Presets
+    /// section's scrolled-out cards from bleeding into the preview strip/button bar around it --
+    /// see that function's doc comment. Unlike `fill_rect_clipped_to_rounded_rect` (a per-call,
+    /// single-shape clip already established by Task 7 for usage-bar segments), this is a
+    /// *persistent*, plain axis-aligned rect clip meant to span many heterogeneous draw calls
+    /// (rect fills AND text) in one scope -- Task 12's Presets section is this crate's first
+    /// caller that needs that shape, so the `Mask` is built once here (not re-rasterized on every
+    /// one of the ~30 draw calls -- intro + 3 headers + 24 cards + scrollbar thumb -- a single
+    /// frame of that section makes) and cached in `clip_mask` until the next `set_clip_rect`/
+    /// `clear_clip` call. `blend_pixel` (glyph compositing) has no `Mask`-consuming API to hook
+    /// into the way `Pixmap::fill_rect`/`fill_path` do, so it instead checks the plain `clip_rect`
+    /// bounds directly -- cheaper than sampling the mask's alpha per glyph pixel, and exact since
+    /// the clip is always a hard-edged rectangle (no anti-aliased mask edge text would need to
+    /// blend against).
+    pub fn set_clip_rect(&mut self, rect: Option<Rect>) {
+        self.clip_mask = rect.and_then(|r| {
+            let mut mask = Mask::new(self.pixmap.width(), self.pixmap.height())?;
+            let path = PathBuilder::from_rect(r);
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            Some(mask)
+        });
+        self.clip_rect = rect;
+    }
+
+    /// Clears any active clip set by `set_clip_rect`. Mirrors GDI's
+    /// `SelectClipRgn(hdc, HRGN::default())` reset call `draw_presets_controls` makes once it's
+    /// done drawing the Presets section -- see that function's doc comment for why a reset
+    /// (rather than a save/restore of some prior clip) is safe there, and why the same reasoning
+    /// carries over here (this crate's `Canvas` is rebuilt fresh every `RedrawRequested`, so
+    /// there is never a "prior clip" to restore in the first place).
+    pub fn clear_clip(&mut self) {
+        self.clip_mask = None;
+        self.clip_rect = None;
     }
 
     // Not called by `bars.rs` (which reads `Rect`/model geometry, not the canvas's own
@@ -93,7 +140,7 @@ impl Canvas {
         paint.set_color(color);
         paint.anti_alias = true;
         self.pixmap
-            .fill_rect(rect, &paint, Transform::identity(), None);
+            .fill_rect(rect, &paint, Transform::identity(), self.clip_mask.as_ref());
     }
 
     /// Fills a rectangle with rounded corners. Mirrors the role
@@ -112,8 +159,13 @@ impl Canvas {
         let mut paint = Paint::default();
         paint.set_color(color);
         paint.anti_alias = true;
-        self.pixmap
-            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            self.clip_mask.as_ref(),
+        );
     }
 
     /// Fills `fill_rect` with `color`, but only within the rounded-rect region described by
@@ -175,8 +227,13 @@ impl Canvas {
         let mut paint = Paint::default();
         paint.set_color(color);
         paint.anti_alias = true;
-        self.pixmap
-            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            self.clip_mask.as_ref(),
+        );
     }
 
     /// Blends a single glyph-coverage pixel into the canvas at `(x, y)`, using standard
@@ -187,6 +244,15 @@ impl Canvas {
     pub(crate) fn blend_pixel(&mut self, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
         if a == 0 || x < 0 || y < 0 {
             return;
+        }
+        // `set_clip_rect`'s doc comment: glyph compositing has no `Mask`-consuming API to hook
+        // into, so this checks the plain clip bounds directly instead -- exact, since the clip
+        // is always a hard-edged rectangle. `clip_rect` uses the same (float, half-open-via-cast)
+        // coordinate space `LRect`/`render::Rect` already use elsewhere in this crate.
+        if let Some(clip) = self.clip_rect {
+            if (x as f32) < clip.left() || (x as f32) >= clip.right() || (y as f32) < clip.top() || (y as f32) >= clip.bottom() {
+                return;
+            }
         }
         let (x, y) = (x as u32, y as u32);
         let width = self.pixmap.width();
