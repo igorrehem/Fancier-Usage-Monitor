@@ -12,31 +12,18 @@
 //! Text rendering (`cosmic-text` integration) lives in the sibling `text` module, not here,
 //! because it needs a persistent `FontSystem`/`SwashCache` (expensive to rebuild -- font
 //! enumeration happens once in `FontSystem::new()`) that must outlive any single frame's
-//! `Canvas`, whereas `Canvas` itself is cheap and rebuilt fresh every `RedrawRequested` (see
-//! this module's `paint` and `ccum-unix/src/main.rs`'s double-buffering wiring).
+//! `Canvas`, whereas `Canvas` itself is cheap and rebuilt fresh every `RedrawRequested`. The
+//! real usage-bar widget (`bars::draw_bars`, Task 7's frame-content entry point wired into
+//! `WindowEvent::RedrawRequested` in `main.rs`) lives in the sibling `bars` module, built
+//! entirely on this module's `Canvas` primitives -- see `ccum-unix/src/main.rs`'s
+//! double-buffering wiring for how the two fit together each frame.
 
+pub mod bars;
 pub mod text;
 
-use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Transform};
+use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Transform};
 
 pub use tiny_skia::{Color, Rect};
-
-use text::TextRenderer;
-
-/// The app's brand accent color (`#D97757`), matching `ccum-windows`'s `theme.rs` accent.
-/// Used here only as this task's placeholder proof-of-life content -- Task 7 replaces it
-/// with the real usage-bar accent wiring.
-///
-/// A function, not a `const`, because `tiny_skia::Color::from_rgba8` isn't a `const fn`.
-pub fn brand_accent() -> Color {
-    Color::from_rgba8(0xD9, 0x77, 0x57, 0xFF)
-}
-
-/// A dark background color for the placeholder frame, close to `ccum-windows`'s dark-theme
-/// default background (`#1C1C1C`).
-fn placeholder_bg() -> Color {
-    Color::from_rgba8(0x1C, 0x1C, 0x1C, 0xFF)
-}
 
 /// An off-screen CPU pixel buffer, wrapping a `tiny_skia::Pixmap`.
 ///
@@ -58,14 +45,15 @@ impl Canvas {
         Pixmap::new(width, height).map(|pixmap| Self { pixmap })
     }
 
+    // Not called by `bars.rs` (which reads `Rect`/model geometry, not the canvas's own
+    // extent, for horizontal layout -- everything is anchored from the left divider), but a
+    // natural, minimal companion to `height()` (which IS called, for vertical row layout)
+    // that later widget-layout code (e.g. Task 9's popup panel) will need.
+    #[allow(dead_code)]
     pub fn width(&self) -> u32 {
         self.pixmap.width()
     }
 
-    // Not yet called by this task's own placeholder `paint()` (which only exercises
-    // `fill_rounded_rect`), but a natural, minimal companion to `width()` that later
-    // widget-layout code (Task 7+) will need -- kept, not speculative beyond that.
-    #[allow(dead_code)]
     pub fn height(&self) -> u32 {
         self.pixmap.height()
     }
@@ -91,13 +79,8 @@ impl Canvas {
     }
 
     /// Fills an axis-aligned rectangle with a solid color. Mirrors the role
-    /// `ccum-windows/src/controls.rs::fill_rect` (a `FillRect` GDI call) plays there. Not yet
-    /// called by this task's placeholder `paint()` (which only needs the rounded variant
-    /// below), but required by this task's brief as one of the two minimum `Canvas`
-    /// primitives -- `#[allow(dead_code)]` for the same reason
-    /// `ccum-windows/src/controls.rs::draw_rounded_rect` carries one: a primitive built
-    /// ahead of the widget code (Task 7+) that will call it.
-    #[allow(dead_code)]
+    /// `ccum-windows/src/controls.rs::fill_rect` (a `FillRect` GDI call) plays there -- used by
+    /// `bars.rs` for the widget's left divider strokes.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
         let mut paint = Paint::default();
         paint.set_color(color);
@@ -124,6 +107,46 @@ impl Canvas {
         paint.anti_alias = true;
         self.pixmap
             .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    /// Fills `fill_rect` with `color`, but only within the rounded-rect region described by
+    /// `clip_rect`/`radius` -- i.e. a clipped fill that keeps rounded corners intact even when
+    /// `fill_rect` only covers part of `clip_rect`. Task 7's one new primitive, added for two
+    /// call sites in `bars.rs`: a partially-filled usage-bar segment (fill width < segment
+    /// width, but the segment's own corners must stay rounded) and the shimmer highlight band
+    /// (swept across a bar's full rounded outline, must not poke past its corners).
+    ///
+    /// `ccum-windows/src/window.rs::draw_usage_bar`'s GDI equivalent built a
+    /// `CreateRoundRectRgn` and called `SelectClipRgn` on the DC before `FillRect`, then
+    /// restored the DC's clip afterwards -- GDI clip state lives on the device context itself.
+    /// `tiny-skia` has no persistent DC-style clip; its nearest equivalent is `Mask`, a
+    /// per-call alpha buffer (confirmed against the actual `tiny-skia-0.12.0` source:
+    /// `Mask::new`/`Mask::fill_path` build a full-canvas 8-bit alpha mask from a path, and
+    /// `Pixmap::fill_rect`'s last argument is `Option<&Mask>`). A fresh `Mask` is allocated
+    /// per call here rather than cached -- this widget's canvas is small (well under
+    /// 1000x100px) and at most a handful of these calls happen per frame (one partial segment
+    /// plus one shimmer band per visible bar), so the extra allocation is negligible next to
+    /// the rest of the frame's rasterization work.
+    pub fn fill_rect_clipped_to_rounded_rect(
+        &mut self,
+        fill_rect: Rect,
+        clip_rect: Rect,
+        radius: f32,
+        color: Color,
+    ) {
+        let Some(clip_path) = rounded_rect_path(clip_rect, radius) else {
+            return;
+        };
+        let Some(mut mask) = Mask::new(self.pixmap.width(), self.pixmap.height()) else {
+            return;
+        };
+        mask.fill_path(&clip_path, FillRule::Winding, true, Transform::identity());
+
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        self.pixmap
+            .fill_rect(fill_rect, &paint, Transform::identity(), Some(&mask));
     }
 
     /// Blends a single glyph-coverage pixel into the canvas at `(x, y)`, using standard
@@ -196,34 +219,4 @@ fn rounded_rect_path(rect: Rect, radius: f32) -> Option<Path> {
     pb.cubic_to(x0, y0 + radius - k, x0 + radius - k, y0, x0 + radius, y0);
     pb.close();
     pb.finish()
-}
-
-/// The frame-content entry point wired into `WindowEvent::RedrawRequested` in `main.rs`.
-///
-/// Task 6 scope only: this draws simple, non-trivial placeholder content (a filled
-/// brand-accent rounded rect plus a line of text) purely as end-to-end proof that
-/// `tiny-skia` fills/paths, `cosmic-text` shaping/rasterization, and the double-buffered
-/// present pipeline all genuinely work together -- it is NOT the real usage-bar widget
-/// (that's Task 7's job, which will replace this function's body with real bar/percentage
-/// rendering driven by `ccum_core`'s usage data).
-pub fn paint(canvas: &mut Canvas, text: &mut TextRenderer) {
-    canvas.clear(placeholder_bg());
-
-    let width = canvas.width() as f32;
-
-    // A filled, rounded, brand-accent rectangle roughly centered in the top half of the
-    // window -- stands in for where a usage bar will eventually render (Task 7).
-    if let Some(rect) = Rect::from_xywh(24.0, 24.0, (width - 48.0).max(0.0), 28.0) {
-        canvas.fill_rounded_rect(rect, 8.0, brand_accent());
-    }
-
-    // A line of placeholder text below the rect, rendered via cosmic-text -> tiny-skia.
-    text.draw_text(
-        canvas,
-        24.0,
-        72.0,
-        "Claude Code Usage Monitor",
-        16.0,
-        Color::from_rgba8(0xF0, 0xF0, 0xF0, 0xFF),
-    );
 }
