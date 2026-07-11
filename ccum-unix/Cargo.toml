@@ -14,14 +14,30 @@ publish = false
 # Task 4 report (.superpowers/sdd/mlp-task-4-report.md) for the reasoning behind every
 # dependency and version pinned below.
 #
-# GPU note: none of the four dependencies below pull in wgpu/Vulkan/OpenGL/Metal bindings
+# GPU note: none of the five dependencies below pull in wgpu/Vulkan/OpenGL/Metal bindings
 # as a hard requirement -- verified via `cargo tree --target x86_64-unknown-linux-gnu` and
 # `cargo tree --target aarch64-apple-darwin` against this exact dependency set (see the
-# Task 4 report). winit is windowing/event-loop only (no renderer of its own); tiny-skia is
-# a pure-CPU rasterizer; tray-icon's Linux backend pulls GTK3/libappindicator (a *build-time*
-# system-library dependency, not a GPU one -- Cairo's GTK usage here is software rendering);
-# cosmic-text's rasterization path (swash) is pure CPU software rasterization, no `glyphon`/
-# wgpu feature enabled.
+# Task 4 report, and the softbuffer check added in Task 6). winit is windowing/event-loop only
+# (no renderer of its own); tiny-skia is a pure-CPU rasterizer; tray-icon's Linux backend pulls
+# GTK3/libappindicator (a *build-time* system-library dependency, not a GPU one -- Cairo's GTK
+# usage here is software rendering); cosmic-text's rasterization path (swash) is pure CPU
+# software rasterization, no `glyphon`/wgpu feature enabled.
+#
+# Task 6 note (softbuffer): tiny-skia rasterizes into an in-memory `Pixmap` -- it has no idea
+# a window exists. winit itself is windowing/event-loop only and has no renderer. Something has
+# to copy the finished `Pixmap`'s pixels onto the window's actual surface via each platform's
+# native windowing API (Win32 GDI/DXGI, X11/Wayland shm, Cocoa) -- that "something" is
+# `softbuffer`. Confirmed it's the right/expected choice, not just assumed: it's maintained
+# under the same `rust-windowing` GitHub org as `winit` itself (a strong first-party-pairing
+# signal), and its own `Cargo.toml.orig` (read from the resolved 0.4.8 source in the local
+# registry cache) depends on nothing but `raw-window-handle`/`tracing` plus per-platform
+# *windowing*-protocol crates (`x11rb`, `wayland-*`, `drm`/`kms` on Linux; native Win32/Cocoa
+# calls elsewhere) -- `cargo tree --target x86_64-unknown-linux-gnu` and
+# `--target x86_64-pc-windows-msvc` for `-p softbuffer` both show zero wgpu/Vulkan/OpenGL/
+# Metal/D3D/GLES matches, so it stays within this project's "no GPU" constraint. Its buffer
+# format is opaque `0x00RRGGBB` per pixel (see its own doc comment on `Buffer`), which is a
+# deliberate simplification our present step accounts for (see `render/mod.rs`'s
+# `Canvas::present_to` doc comment) since this app's window is always fully opaque.
 
 [dependencies]
 ccum-core = { path = "../ccum-core" }
@@ -29,3 +45,4 @@ winit = "0.30"
 tiny-skia = "0.12"
 tray-icon = "0.24"
 cosmic-text = "0.19"
+softbuffer = "0.4"
