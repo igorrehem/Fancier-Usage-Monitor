@@ -20,6 +20,7 @@ It sits in your taskbar and shows how much of your Claude Code, Codex, and/or An
 - System tray icon badges showing your enabled model usage percentage
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Right-click options for refresh, displayed models, update frequency, language, startup, widget visibility, and updates
+- A settings window to customize colors, font, size, and animations, with built-in presets and a live preview
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
 
 ## Who This Is For
@@ -63,7 +64,7 @@ Once running, it will appear in your taskbar and as one or more tray icons in th
 
 - Drag the left divider to move the taskbar widget
 - On multi-monitor setups, drag the widget onto another Windows taskbar to move it to that screen
-- Right-click the taskbar widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, and exit
+- Right-click the taskbar widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, Settings, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
 
@@ -86,6 +87,27 @@ If multiple providers are enabled, the app shows one tray icon per provider. If 
 The Claude Code tray icon uses the same warm usage colors as the Claude bar. The Codex tray icon uses a black and white badge style. The Antigravity tray icon uses a blue badge style.
 
 Hovering over a tray icon shows the usage values for that model.
+
+## Settings
+
+Right-click the taskbar widget or tray icon and choose **Settings…**, or double-click the tray icon, to open the settings window.
+
+*(screenshot coming soon)*
+
+From there you can customize:
+
+- **Appearance** — the calm/attention/critical usage bar colors, background, text, and divider colors, and overall opacity
+- **Font** — any installed font family, size, and weight
+- **Size** — widget height, corner radius, bar thickness, label/text width, and spacing
+- **Animations** — fill, shimmer, alert glow, and fade/slide effects, each with its own on/off switch and speed/intensity controls, plus a Reduce Motion switch that turns off decorative motion
+- **Update** — how often the widget refreshes, using the same frequency options as the right-click menu
+- **Presets** — four built-in looks (Default, Glass, Neon, Minimal) that apply a full appearance and animation combination in one click
+
+Every change appears immediately in the window's live preview. Nothing is written to disk until you choose one of the three buttons at the bottom:
+
+- **Save** applies your changes to the real widget and writes them to `settings.json`
+- **Cancel** closes the window and discards any changes you made
+- **Reset** puts appearance, font, size, and animation settings back to their defaults, leaving your widget position, update frequency, and enabled models untouched
 
 ## Diagnostics
 

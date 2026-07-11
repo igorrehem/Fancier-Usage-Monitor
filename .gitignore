@@ -26,3 +26,6 @@ AGENTS.md
 
 # Local WinGet manifest generation output
 /manifests/
+
+# Local superpowers SDD ledger + brainstorming companion scratch state
+/.superpowers/

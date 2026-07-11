@@ -18,10 +18,12 @@ const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
 
 /// Actions the tray message handler can request from the main window.
+#[derive(Debug, PartialEq, Eq)]
 pub enum TrayAction {
     None,
     ToggleWidget,
     ShowContextMenu,
+    OpenSettings,
 }
 
 #[derive(Clone, Copy)]
@@ -447,11 +449,24 @@ pub fn remove_all(hwnd: HWND) {
 }
 
 /// Interpret a tray callback message and return the action to take.
+///
+/// Note: a real double-click on this (legacy, non-`NOTIFYICON_VERSION_4`) tray icon delivers
+/// FOUR messages in order: `WM_LBUTTONDOWN`, `WM_LBUTTONUP`, `WM_LBUTTONDBLCLK`,
+/// `WM_LBUTTONUP` — i.e. `WM_LBUTTONUP` fires both before AND after `WM_LBUTTONDBLCLK` (the
+/// first is the release of click 1, the trailing one is the release of click 2). Both map to
+/// `ToggleWidget` here since `handle_message` only looks at the raw message, not sequence
+/// state. To keep a double-click from also toggling widget visibility, the caller
+/// (`window.rs`) does not act on `ToggleWidget` immediately — it starts a short one-shot
+/// debounce timer (`IDT_TRAY_CLICK_DEBOUNCE`) and only performs the toggle when that timer
+/// fires. If `WM_LBUTTONDBLCLK` arrives first, the caller kills the pending timer before
+/// opening settings and also sets a one-shot guard so the trailing `WM_LBUTTONUP` (which
+/// arrives right after) is recognized as already consumed and doesn't re-arm the timer.
 pub fn handle_message(lparam: LPARAM) -> TrayAction {
     let mouse_msg = lparam.0 as u32;
     match mouse_msg {
         WM_LBUTTONUP => TrayAction::ToggleWidget,
         WM_RBUTTONUP => TrayAction::ShowContextMenu,
+        WM_LBUTTONDBLCLK => TrayAction::OpenSettings,
         _ => TrayAction::None,
     }
 }
@@ -466,4 +481,46 @@ fn copy_to_tip(s: &str, tip: &mut [u16; 128]) {
     }
     tip[..len].copy_from_slice(&wide[..len]);
     tip[len] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These pin down the click -> action mapping that window.rs's tray debounce depends on:
+    // WM_LBUTTONUP must keep mapping to ToggleWidget (window.rs turns this into "start the
+    // debounce timer" rather than acting immediately) and WM_LBUTTONDBLCLK must keep mapping
+    // to OpenSettings (window.rs turns this into "kill the pending timer, then open
+    // settings"). If either mapping changes, the debounce in window.rs silently breaks.
+    #[test]
+    fn single_click_up_maps_to_toggle_widget() {
+        assert_eq!(
+            handle_message(LPARAM(WM_LBUTTONUP as isize)),
+            TrayAction::ToggleWidget
+        );
+    }
+
+    #[test]
+    fn double_click_maps_to_open_settings() {
+        assert_eq!(
+            handle_message(LPARAM(WM_LBUTTONDBLCLK as isize)),
+            TrayAction::OpenSettings
+        );
+    }
+
+    #[test]
+    fn right_click_up_maps_to_show_context_menu() {
+        assert_eq!(
+            handle_message(LPARAM(WM_RBUTTONUP as isize)),
+            TrayAction::ShowContextMenu
+        );
+    }
+
+    #[test]
+    fn unrecognized_message_maps_to_none() {
+        assert_eq!(
+            handle_message(LPARAM(WM_MOUSEMOVE as isize)),
+            TrayAction::None
+        );
+    }
 }

@@ -1,9 +1,7 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -12,18 +10,21 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::animation::{AnimationClock, AnimationFrame};
+use crate::config_window;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, IDT_ANIM, IDT_TRAY_CLICK_DEBOUNCE, TIMER_COUNTDOWN, TIMER_POLL,
+    TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::settings;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -91,6 +92,14 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+
+    /// One-shot guard: set when `WM_LBUTTONDBLCLK` opens Settings, so the trailing
+    /// `WM_LBUTTONUP` that Windows sends for the double-click's second (release) event
+    /// is recognized as "already consumed by the double-click" instead of being treated
+    /// as a fresh single click that re-arms the debounce timer. Cleared as soon as that
+    /// trailing `WM_LBUTTONUP` is seen (or ignored/consumed), so it never suppresses a
+    /// later, unrelated single click.
+    suppress_next_tray_click: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +140,9 @@ const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+/// Opens the settings window (`config_window::open_config_window`). Placed after
+/// `tray_icon::IDM_TOGGLE_WIDGET` (70) to avoid colliding with any existing menu id.
+const IDM_OPEN_SETTINGS: u16 = 71;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -146,7 +158,11 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
-fn sc(px: i32) -> i32 {
+///
+/// `pub(crate)`: also used by `config_window.rs` to size its live preview so the preview's
+/// internal layout (which goes through `paint_content`, itself built entirely on this same
+/// `sc()`) stays dimensionally consistent with the width/height passed to `paint_widget`.
+pub(crate) fn sc(px: i32) -> i32 {
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
     (px as f64 * dpi as f64 / 96.0).round() as i32
 }
@@ -289,109 +305,165 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn settings_path() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata)
-        .join("ClaudeCodeUsageMonitor")
-        .join("settings.json")
+/// In-memory copy of the render/appearance settings, refreshed from disk at startup
+/// (`run()`) and whenever the settings window saves new values (`set_settings`).
+/// Render paths read this instead of hitting disk on every frame.
+static SETTINGS: Mutex<Option<settings::Settings>> = Mutex::new(None);
+
+fn lock_settings() -> MutexGuard<'static, Option<settings::Settings>> {
+    SETTINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SettingsFile {
-    #[serde(default)]
-    tray_offset: i32,
-    #[serde(default)]
-    taskbar_index: usize,
-    #[serde(default = "default_poll_interval")]
-    poll_interval_ms: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_update_check_unix: Option<u64>,
-    #[serde(default = "default_widget_visible")]
-    widget_visible: bool,
-    #[serde(default = "default_show_claude_code")]
-    show_claude_code: bool,
-    #[serde(default = "default_show_codex")]
-    show_codex: bool,
-    #[serde(default = "default_show_antigravity")]
-    show_antigravity: bool,
+/// Global animation clock driving bar-fill, shimmer, alert-glow, and fade transitions for
+/// the embedded widget's layered render. Lazily constructed (from the live settings) on
+/// first use by `with_anim` so no explicit init call is needed at startup.
+static ANIM: Mutex<Option<AnimationClock>> = Mutex::new(None);
+
+/// Wall-clock timestamp of the previous `render_layered` animation tick. `None` both before
+/// the first tick and whenever the animation timer has been stopped (idle), so the next
+/// tick after a gap falls back to an assumed 16ms frame instead of a huge `dt`.
+static LAST_ANIM_TICK: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// One bar slot in the fixed draw-order contract shared by `set_targets` (feeding the
+/// clock) and `render_layered` (reading `frame.fill_pcts` back out). Index N in
+/// `ordered_bar_fracts`/`ordered_bar_slots` always refers to the same slot here, so the two
+/// call sites can never disagree about what a given index means.
+#[derive(Clone, Copy)]
+enum BarSlot {
+    ClaudeSession,
+    ClaudeWeekly,
+    CodexSession,
+    CodexWeekly,
+    AntigravitySession,
+    AntigravityWeekly,
 }
 
-impl Default for SettingsFile {
-    fn default() -> Self {
-        Self {
-            tray_offset: 0,
-            taskbar_index: 0,
-            poll_interval_ms: default_poll_interval(),
-            language: None,
-            last_update_check_unix: None,
-            widget_visible: true,
-            show_claude_code: true,
-            show_codex: false,
-            show_antigravity: false,
+/// The ordered list of bar slots for the currently shown model sections, in draw order:
+/// `[claude.session, claude.weekly, codex.session, codex.weekly, antigravity.session,
+/// antigravity.weekly]`, omitting any section whose `show_*` flag is off. This is the
+/// single source of truth for bar ordering -- both `ordered_bar_fracts` (used for
+/// `set_targets`) and `render_layered` (used to read `frame.fill_pcts` back for drawing)
+/// build their index off this same sequence.
+fn ordered_bar_slots(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> Vec<BarSlot> {
+    let mut slots = Vec::with_capacity(6);
+    if show_claude_code {
+        slots.push(BarSlot::ClaudeSession);
+        slots.push(BarSlot::ClaudeWeekly);
+    }
+    if show_codex {
+        slots.push(BarSlot::CodexSession);
+        slots.push(BarSlot::CodexWeekly);
+    }
+    if show_antigravity {
+        slots.push(BarSlot::AntigravitySession);
+        slots.push(BarSlot::AntigravityWeekly);
+    }
+    slots
+}
+
+/// The ordered list of bar fill fractions (0.0..=1.0) for the currently shown model
+/// sections, in the exact `ordered_bar_slots` order. Fed to `AnimationClock::set_targets`.
+fn ordered_bar_fracts(state: &AppState) -> Vec<f32> {
+    ordered_bar_slots(state.show_claude_code, state.show_codex, state.show_antigravity)
+        .into_iter()
+        .map(|slot| match slot {
+            BarSlot::ClaudeSession => (state.session_percent / 100.0) as f32,
+            BarSlot::ClaudeWeekly => (state.weekly_percent / 100.0) as f32,
+            BarSlot::CodexSession => (state.codex_session_percent / 100.0) as f32,
+            BarSlot::CodexWeekly => (state.codex_weekly_percent / 100.0) as f32,
+            BarSlot::AntigravitySession => (state.antigravity_session_percent / 100.0) as f32,
+            BarSlot::AntigravityWeekly => (state.antigravity_weekly_percent / 100.0) as f32,
+        })
+        .collect()
+}
+
+/// Run `f` against the global animation clock, lazily constructing it from the live
+/// settings on first use.
+fn with_anim<R>(f: impl FnOnce(&mut AnimationClock) -> R) -> R {
+    let mut guard = ANIM.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(AnimationClock::new(&current_settings().animation));
+    }
+    f(guard.as_mut().unwrap())
+}
+
+/// Re-apply the live animation settings (speeds/easing/thresholds/reduce-motion) to the
+/// running clock. Called whenever the settings window saves new animation preferences.
+fn anim_apply_settings() {
+    with_anim(|clock| clock.apply_settings(&current_settings().animation));
+}
+
+/// Store settings into the global without triggering a repaint. Used at startup and by
+/// `save_state_settings` (which must not recursively repaint mid-save).
+fn store_settings(s: settings::Settings) {
+    *lock_settings() = Some(s);
+}
+
+/// Clone of the current in-memory settings. Falls back to `Settings::default()` if `run()`
+/// hasn't populated the global yet (reproduces today's look/behavior either way, since
+/// defaults are chosen to match the existing hardcoded values).
+pub fn current_settings() -> settings::Settings {
+    lock_settings().clone().unwrap_or_default()
+}
+
+/// Store new settings (e.g. from the settings window) and immediately repaint so the
+/// change is visible.
+///
+/// Also the single point where an externally-supplied `poll_interval_ms` (e.g. the settings
+/// window's Update section) is reconciled into the *running* `AppState` and its live poll
+/// timer -- mirroring what the `IDM_FREQ_*` menu handler does inline. Without this, saving a
+/// new frequency from the settings window would persist to disk/`SETTINGS` correctly but the
+/// real `SetTimer(TIMER_POLL, ...)` interval (and the menu's checkmark, which reads
+/// `AppState.poll_interval_ms`) would silently keep the old value until restart. The menu
+/// handler is left as-is (it already keeps `AppState` and `SETTINGS`/disk in sync via
+/// `save_state_settings`) rather than rerouted through here, since `store_settings` is
+/// documented as must-not-repaint-mid-save and folding this repainting path into
+/// `save_state_settings` would violate that.
+pub fn set_settings(s: settings::Settings) {
+    let new_interval = s.poll_interval_ms;
+    store_settings(s);
+    anim_apply_settings();
+    let retimer_hwnd = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|st| {
+            if st.poll_interval_ms == new_interval {
+                None
+            } else {
+                st.poll_interval_ms = new_interval;
+                Some(st.hwnd.to_hwnd())
+            }
+        })
+    };
+    if let Some(hwnd) = retimer_hwnd {
+        unsafe {
+            SetTimer(hwnd, TIMER_POLL, new_interval, None);
         }
     }
-}
-
-fn default_poll_interval() -> u32 {
-    POLL_15_MIN
-}
-
-fn default_widget_visible() -> bool {
-    true
-}
-
-fn default_show_claude_code() -> bool {
-    true
-}
-
-fn default_show_codex() -> bool {
-    false
-}
-
-fn default_show_antigravity() -> bool {
-    false
-}
-
-fn load_settings() -> SettingsFile {
-    let content = match std::fs::read_to_string(settings_path()) {
-        Ok(c) => c,
-        Err(_) => return SettingsFile::default(),
-    };
-    let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
-        settings.show_claude_code = true;
-    }
-    settings
-}
-
-fn save_settings(settings: &SettingsFile) {
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(path, json);
-    }
+    render_layered();
 }
 
 fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
-        save_settings(&SettingsFile {
-            tray_offset: s.tray_offset,
-            taskbar_index: s.taskbar_index,
-            poll_interval_ms: s.poll_interval_ms,
-            language: s
-                .language_override
-                .map(|language| language.code().to_string()),
-            last_update_check_unix: s.last_update_check_unix,
-            widget_visible: s.widget_visible,
-            show_claude_code: s.show_claude_code,
-            show_codex: s.show_codex,
-            show_antigravity: s.show_antigravity,
-        });
+        // Preserve appearance/typography/geometry/animation currently in memory: start
+        // from current_settings() (NOT settings::load()) so a save here can't clobber
+        // appearance/typography/geometry changes that came from the settings window but
+        // haven't hit disk in this exact shape yet, overwrite only the state-derived
+        // fields, save to disk, and store the merged result back into the global.
+        let mut settings = current_settings();
+        settings.tray_offset = s.tray_offset;
+        settings.taskbar_index = s.taskbar_index;
+        settings.poll_interval_ms = s.poll_interval_ms;
+        settings.language = s
+            .language_override
+            .map(|language| language.code().to_string());
+        settings.last_update_check_unix = s.last_update_check_unix;
+        settings.widget_visible = s.widget_visible;
+        settings.show_claude_code = s.show_claude_code;
+        settings.show_codex = s.show_codex;
+        settings.show_antigravity = s.show_antigravity;
+        crate::settings::save(&settings);
+        store_settings(settings);
     }
 }
 
@@ -487,8 +559,12 @@ fn toggle_widget_visibility(hwnd: HWND) {
         if new_visible {
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            with_anim(|clock| clock.trigger_fade_in());
+            let _ = SetTimer(hwnd, IDT_ANIM, 16, None);
             render_layered();
         } else {
+            with_anim(|clock| clock.trigger_fade_out());
+            let _ = SetTimer(hwnd, IDT_ANIM, 16, None);
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
@@ -1043,26 +1119,26 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
-// Dimensions matching the C# version
+// Dimensions matching the C# version.
+//
+// SEGMENT_H, SEGMENT_GAP, CORNER_RADIUS, LABEL_WIDTH, TEXT_WIDTH, and WIDGET_HEIGHT moved
+// to `settings::Geometry` (bar_thickness, spacing, corner_radius, label_width, text_width,
+// height respectively) so the renderer can be driven by user overrides; the rest have no
+// corresponding settings field and stay as fixed layout constants.
 const SEGMENT_W: i32 = 10;
-const SEGMENT_H: i32 = 13;
-const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
-const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
-const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let widget_height = current_settings().geometry.height;
+    let divider_top = (sc(widget_height) - divider_h) / 2;
     client_x >= 0
         && client_x < sc(LEFT_DIVIDER_W)
         && client_y >= divider_top
@@ -1079,7 +1155,9 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
+/// `pub(crate)`: also used by `config_window.rs` to compute the preview widget's natural
+/// size (see `sc`'s doc comment).
+pub(crate) fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
     (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
 }
 
@@ -1091,27 +1169,267 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
+/// `pub(crate)`: also used by `config_window.rs` (see `sc`'s doc comment).
+pub(crate) fn total_widget_width_for(active_models: i32, geometry: &settings::Geometry) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
+    let model_width = (sc(SEGMENT_W) + sc(geometry.spacing)) * bar_segments - sc(geometry.spacing)
         + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+        + sc(geometry.text_width);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
+        + sc(geometry.label_width)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
         + sc(RIGHT_MARGIN)
 }
 
+/// Same layout formula as `total_widget_width_for`, but without the DPI scaling (`sc()`)
+/// applied to every term -- i.e. the total width a `Geometry` would produce if it were
+/// painted at 96 DPI. Used only by `clamp_geometry`, which works entirely in that baseline
+/// pixel space (see its doc comment for why).
+fn baseline_total_width_for(active_models: i32, geometry: &settings::Geometry) -> i32 {
+    let bar_segments = row_bar_segment_count(active_models);
+    let model_width = (SEGMENT_W + geometry.spacing) * bar_segments - geometry.spacing
+        + BAR_RIGHT_MARGIN
+        + geometry.text_width;
+
+    LEFT_DIVIDER_W
+        + DIVIDER_RIGHT_MARGIN
+        + geometry.label_width
+        + LABEL_RIGHT_MARGIN
+        + model_width * active_models
+        + MODEL_RIGHT_MARGIN * (active_models - 1)
+        + RIGHT_MARGIN
+}
+
+/// Sane, non-degenerate bounds for individual `Geometry` fields, applied by `clamp_geometry`
+/// regardless of the taskbar's own size. Guards against a corrupted/hand-edited
+/// `settings.json` (zero, negative, or absurdly large values) breaking layout math or
+/// rendering (e.g. `text_width <= 0` clipping every label to nothing, `bar_thickness <= 0`
+/// making the usage bar invisible). Chosen generously around the shipped defaults
+/// (height=46, corner_radius=2, bar_thickness=13, label_width=18, text_width=62, spacing=1)
+/// so any value a user would plausibly want in the Size section stays untouched.
+const MIN_HEIGHT_BASELINE: i32 = 20;
+const MAX_HEIGHT_BASELINE: i32 = 400;
+const MAX_CORNER_RADIUS_BASELINE: i32 = 40;
+const MIN_BAR_THICKNESS_BASELINE: i32 = 4;
+const MAX_BAR_THICKNESS_BASELINE: i32 = 60;
+const MIN_LABEL_WIDTH_BASELINE: i32 = 4;
+const MAX_LABEL_WIDTH_BASELINE: i32 = 200;
+const MIN_TEXT_WIDTH_BASELINE: i32 = 8;
+const MAX_TEXT_WIDTH_BASELINE: i32 = 300;
+const MAX_SPACING_BASELINE: i32 = 20;
+
+/// Breathing-room margin subtracted from the taskbar's own baseline height before capping
+/// `Geometry::height` -- a widget exactly as tall as the whole taskbar reads as flush/clipped
+/// against its top and bottom edges. 2px baseline is small enough that the shipped default
+/// (`height` = 46) stays untouched against a stock Windows 11 taskbar (48px baseline @100%
+/// scaling) while still trimming anything actually oversized.
+const HEIGHT_MARGIN_BASELINE: i32 = 2;
+
+/// Width cap per this task's brief: `min(taskbar_width / 2, 800px @96dpi)`.
+const MAX_TOTAL_WIDTH_BASELINE: i32 = 800;
+
+/// Worst-case active-model count used to evaluate the derived total width against the cap
+/// (see `clamp_geometry`'s doc comment for why 3, not the currently-active count).
+const CLAMP_WORST_CASE_ACTIVE_MODELS: i32 = 3;
+
+/// Clamps `g` so it can never produce a widget taller than, or too wide relative to, the
+/// taskbar described by `taskbar_rect`, and bounds every individual field to a sane range
+/// regardless of the taskbar's size. Deterministic and idempotent: clamping an
+/// already-in-range `Geometry` is a no-op, and clamping twice produces the same result as
+/// clamping once.
+///
+/// Called from two places (see `clamp_geometry_to_current_taskbar` and
+/// `clamp_geometry_for_render`): defensively in `render_layered` (so a corrupted/hand-edited
+/// `settings.json`, or a future bug, can't paint an off-taskbar or oversized widget at
+/// runtime) and from the settings window's Save handler (so a user can't persist an oversized
+/// geometry from the editor in the first place).
+///
+/// DPI handling: `Geometry`'s fields are always baseline (96-DPI) pixel values, scaled to
+/// physical pixels only at paint/hit-test time via `sc()` (see its doc comment). This
+/// function stays in that same baseline space rather than doing DPI conversion itself: it's
+/// pure, touches no `CURRENT_DPI` global, and is trivially unit-testable with plain `RECT`
+/// literals. Callers that only have a *physical* taskbar `RECT` (as returned by
+/// `native_interop::get_taskbar_rect`) must convert it to baseline pixels first --
+/// see `physical_rect_to_baseline`.
+///
+/// Derived-width handling: `Geometry` has no literal "width" field -- `total_widget_width_for`
+/// derives it per-active-model-count, and the same `Geometry` renders a different total width
+/// depending on how many of Claude/Codex/Antigravity are enabled. This clamps against the
+/// width `CLAMP_WORST_CASE_ACTIVE_MODELS` (3, i.e. all three enabled) would produce, since
+/// that's the only model-count-independent guarantee: the cap must hold no matter which
+/// models are later toggled on, without needing to re-run the clamp every time
+/// `show_claude_code`/`show_codex`/`show_antigravity` change.
+///
+/// If the derived width is still over the cap after clamping `text_width`, `label_width`, and
+/// `spacing` down to their individual minimums (an extremely narrow taskbar), the result is
+/// accepted as the narrowest representable `Geometry` rather than looping forever or
+/// producing degenerate (zero/negative) fields.
+pub(crate) fn clamp_geometry(mut g: settings::Geometry, taskbar_rect: RECT) -> settings::Geometry {
+    // --- Per-field sane bounds, independent of the taskbar's own size ---
+    g.corner_radius = g.corner_radius.clamp(0, MAX_CORNER_RADIUS_BASELINE);
+    g.bar_thickness = g
+        .bar_thickness
+        .clamp(MIN_BAR_THICKNESS_BASELINE, MAX_BAR_THICKNESS_BASELINE);
+    g.label_width = g
+        .label_width
+        .clamp(MIN_LABEL_WIDTH_BASELINE, MAX_LABEL_WIDTH_BASELINE);
+    g.text_width = g
+        .text_width
+        .clamp(MIN_TEXT_WIDTH_BASELINE, MAX_TEXT_WIDTH_BASELINE);
+    g.spacing = g.spacing.clamp(0, MAX_SPACING_BASELINE);
+    g.height = g.height.clamp(MIN_HEIGHT_BASELINE, MAX_HEIGHT_BASELINE);
+
+    // --- Height vs. the real taskbar ---
+    let taskbar_height = (taskbar_rect.bottom - taskbar_rect.top).max(0);
+    if taskbar_height > 0 {
+        let height_cap = (taskbar_height - HEIGHT_MARGIN_BASELINE).max(MIN_HEIGHT_BASELINE);
+        g.height = g.height.min(height_cap);
+    }
+    // A corner radius bigger than half the (possibly just-clamped) height draws artifacts.
+    g.corner_radius = g.corner_radius.min(g.height / 2);
+
+    // --- Derived total width vs. the real taskbar ---
+    let taskbar_width = (taskbar_rect.right - taskbar_rect.left).max(0);
+    let mut width_cap = MAX_TOTAL_WIDTH_BASELINE;
+    if taskbar_width > 0 {
+        width_cap = width_cap.min(taskbar_width / 2);
+    }
+    // Never shrink below what every field at its own individual minimum would already need --
+    // guards the loop below against spinning forever against a degenerate (near-zero)
+    // taskbar_rect.
+    let floor_width = baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &{
+        let mut floor = g;
+        floor.text_width = MIN_TEXT_WIDTH_BASELINE;
+        floor.label_width = MIN_LABEL_WIDTH_BASELINE;
+        floor.spacing = 0;
+        floor
+    });
+    let width_cap = width_cap.max(floor_width);
+
+    while baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &g) > width_cap {
+        if g.text_width > MIN_TEXT_WIDTH_BASELINE {
+            g.text_width -= 1;
+        } else if g.label_width > MIN_LABEL_WIDTH_BASELINE {
+            g.label_width -= 1;
+        } else if g.spacing > 0 {
+            g.spacing -= 1;
+        } else {
+            break;
+        }
+    }
+
+    g
+}
+
+/// Converts a taskbar `RECT` in physical (DPI-scaled) screen pixels -- as returned by
+/// `native_interop::get_taskbar_rect` -- into an equivalent `RECT` expressing width/height in
+/// baseline (96-DPI) pixels, the unit `clamp_geometry` works in (see its doc comment). Only
+/// the width/height *deltas* matter to `clamp_geometry`, so `left`/`top` are left at 0 rather
+/// than also converting the taskbar's (possibly negative, multi-monitor) screen position.
+fn physical_rect_to_baseline(r: RECT, dpi: u32) -> RECT {
+    let dpi = (dpi.max(1)) as f64;
+    let width = ((r.right - r.left) as f64 * 96.0 / dpi).round() as i32;
+    let height = ((r.bottom - r.top) as f64 * 96.0 / dpi).round() as i32;
+    RECT { left: 0, top: 0, right: width, bottom: height }
+}
+
+/// Sentinel, zero-area `RECT` passed to `clamp_geometry` when the real taskbar rect can't be
+/// resolved (no tracked `taskbar_hwnd` yet, or `get_taskbar_rect` failed). `clamp_geometry`'s
+/// taskbar-size-dependent sections (`taskbar_height > 0` / `taskbar_width > 0`) are written to
+/// treat a zero-area rect as "no taskbar constraint" and skip themselves, so this still runs
+/// the per-field sane-bounds section unconditionally -- exactly the behavior needed here: no
+/// real taskbar to compare against, but the corrupted/hand-edited-settings guard must still
+/// apply. Safe by construction: every arithmetic step downstream of `taskbar_height`/
+/// `taskbar_width` is gated behind a `> 0` check before it's used, so a zero rect can't drive a
+/// divide-by-zero or clamp any field to a degenerate (zero/negative) value.
+const NO_TASKBAR_RECT: RECT = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+
+/// Resolves the real, currently-tracked taskbar's rect and DPI, converts it to baseline
+/// pixels, and runs `clamp_geometry` against it. For callers (the settings window's Save
+/// handler, `config_window::handle_button_action`) that only have a `Geometry` in hand and no
+/// taskbar info of their own. Always queries fresh (no caching) since Save is a rare,
+/// user-initiated action where correctness matters more than avoiding one extra query --
+/// contrast with `clamp_geometry_for_render`, which is on the ~60fps animation path and
+/// deliberately caches. If the taskbar handle or its rect can't be resolved right now, still
+/// runs `clamp_geometry` against `NO_TASKBAR_RECT` so the per-field sanity bounds (guarding
+/// against a corrupted/hand-edited `settings.json`) are never skipped -- only the
+/// taskbar-size-dependent height/width caps are skipped, matching this module's existing
+/// best-effort posture around taskbar queries (e.g. `position_at_taskbar`'s own early-return
+/// arms): Save must never fail just because Explorer.exe is momentarily unavailable, but it
+/// must also never persist a raw, unclamped `Geometry`.
+pub(crate) fn clamp_geometry_to_current_taskbar(g: settings::Geometry) -> settings::Geometry {
+    let taskbar_hwnd = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.taskbar_hwnd)
+    };
+    let Some(taskbar_hwnd) = taskbar_hwnd else {
+        return clamp_geometry(g, NO_TASKBAR_RECT);
+    };
+    let Some(rect) = native_interop::get_taskbar_rect(taskbar_hwnd) else {
+        return clamp_geometry(g, NO_TASKBAR_RECT);
+    };
+    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
+    clamp_geometry(g, physical_rect_to_baseline(rect, dpi))
+}
+
+/// Short-lived cache for the taskbar rect used by the defensive clamp in `render_layered`.
+/// `render_layered` runs on every ~16ms animation tick while an animation is active
+/// (`IDT_ANIM`); querying the taskbar rect (`SHAppBarMessage`, a synchronous round-trip to
+/// Explorer) on every single frame would add needless syscall/IPC overhead to the hot render
+/// path for a check whose whole purpose is catching *rare* situations (corrupted settings, a
+/// future bug) rather than tracking the taskbar's live size every frame. A short TTL keeps
+/// the defensive check meaningfully fresh (e.g. after a taskbar resize or DPI change) without
+/// paying the query cost on every frame.
+static RENDER_CLAMP_TASKBAR_CACHE: Mutex<Option<(Instant, RECT)>> = Mutex::new(None);
+const RENDER_CLAMP_TASKBAR_CACHE_TTL: Duration = Duration::from_millis(500);
+
+fn taskbar_rect_for_render_clamp(taskbar_hwnd: HWND) -> Option<RECT> {
+    let mut cache = RENDER_CLAMP_TASKBAR_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((fetched_at, rect)) = *cache {
+        if fetched_at.elapsed() < RENDER_CLAMP_TASKBAR_CACHE_TTL {
+            return Some(rect);
+        }
+    }
+    let rect = native_interop::get_taskbar_rect(taskbar_hwnd)?;
+    *cache = Some((Instant::now(), rect));
+    Some(rect)
+}
+
+/// Defensive variant of `clamp_geometry_to_current_taskbar` for the `render_layered` hot path
+/// -- see `taskbar_rect_for_render_clamp`'s doc comment for why it caches. Same best-effort
+/// fallback as `clamp_geometry_to_current_taskbar`: when the taskbar can't be resolved, still
+/// runs `clamp_geometry` against `NO_TASKBAR_RECT` so the per-field sanity bounds keep applying
+/// (see `NO_TASKBAR_RECT`'s doc comment) -- only the taskbar-size-dependent caps are skipped.
+fn clamp_geometry_for_render(
+    g: settings::Geometry,
+    taskbar_hwnd: Option<HWND>,
+) -> settings::Geometry {
+    let Some(taskbar_hwnd) = taskbar_hwnd else {
+        return clamp_geometry(g, NO_TASKBAR_RECT);
+    };
+    let Some(rect) = taskbar_rect_for_render_clamp(taskbar_hwnd) else {
+        return clamp_geometry(g, NO_TASKBAR_RECT);
+    };
+    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
+    clamp_geometry(g, physical_rect_to_baseline(rect, dpi))
+}
+
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    let geometry = current_settings().geometry;
+    total_widget_width_for(
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        &geometry,
+    )
 }
 
 fn total_widget_width() -> i32 {
@@ -1122,7 +1440,8 @@ fn total_widget_width() -> i32 {
             .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
             .unwrap_or(1)
     };
-    total_widget_width_for(active_models)
+    let geometry = current_settings().geometry;
+    total_widget_width_for(active_models, &geometry)
 }
 
 fn claude_accent_color() -> Color {
@@ -1233,7 +1552,8 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let settings = load_settings();
+        let settings = crate::settings::load();
+        store_settings(settings.clone());
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1252,8 +1572,8 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
+            total_widget_width_for(initial_model_count, &settings.geometry),
+            sc(settings.geometry.height),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1327,6 +1647,7 @@ pub fn run() {
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                suppress_next_tray_click: false,
             });
         }
 
@@ -1356,6 +1677,8 @@ pub fn run() {
         position_at_taskbar();
         if settings.widget_visible {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            with_anim(|clock| clock.trigger_fade_in());
+            SetTimer(hwnd, IDT_ANIM, 16, None);
         }
         diagnose::log("window shown");
 
@@ -1410,6 +1733,153 @@ pub fn run() {
     }
 }
 
+/// Bundled per-model usage data (percentages + display text + section visibility) that
+/// `paint_widget` needs. Groups the ~16 loose parameters `paint_content` used to take for
+/// this concern into one value so both the real widget (`render_layered`, built from
+/// `AppState`) and the settings-window preview (`config_window.rs`, built from a hardcoded
+/// demo dataset) can construct one of these instead of threading individual percent/text
+/// pairs through call sites.
+pub(crate) struct UsageData {
+    pub session_pct: f64,
+    pub session_text: String,
+    pub weekly_pct: f64,
+    pub weekly_text: String,
+    pub codex_session_pct: f64,
+    pub codex_session_text: String,
+    pub codex_weekly_pct: f64,
+    pub codex_weekly_text: String,
+    pub antigravity_session_pct: f64,
+    pub antigravity_session_text: String,
+    pub antigravity_weekly_pct: f64,
+    pub antigravity_weekly_text: String,
+    pub show_claude_code: bool,
+    pub show_codex: bool,
+    pub show_antigravity: bool,
+}
+
+/// Adaptive dark/light default colors with `appearance`'s optional overrides applied.
+/// Returns `(background, text, track/divider)`. Single source of truth shared by
+/// `paint_widget` (which uses all three to draw) and `render_layered` (which needs just the
+/// background color to know which DIB pixels are "background" for the alpha-channel
+/// post-process -- see the `bg_bgr` comparison below).
+fn derive_colors(appearance: &settings::Appearance, is_dark: bool) -> (Color, Color, Color) {
+    let track_default = if is_dark {
+        Color::from_hex("#444444")
+    } else {
+        Color::from_hex("#AAAAAA")
+    };
+    let text_default = if is_dark {
+        Color::from_hex("#888888")
+    } else {
+        Color::from_hex("#404040")
+    };
+    let bg_default = if is_dark {
+        Color::from_hex("#1C1C1C")
+    } else {
+        Color::from_hex("#F3F3F3")
+    };
+    // Option-override model: `None` (the default) reproduces today's adaptive colors
+    // exactly; `Some(rgba)` overrides them.
+    let track = appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
+    let text_color = appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
+    let bg_color = appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
+    (bg_color, text_color, track)
+}
+
+/// Paint the widget's bars/labels/text onto `hdc` at `width`x`height`, given explicit
+/// `settings`/`frame`/`usage` rather than reading global state. Shared by the real widget's
+/// `render_layered` (which builds these from `AppState`/`current_settings()`/the global
+/// animation clock and then does layered-window-specific DIB/alpha/`UpdateLayeredWindow`
+/// work around this call) and the settings window's live preview (which builds these from
+/// `draft`/a demo `UsageData`/a local animation clock and blits straight into its own
+/// window's DC -- no DIB or layering involved there).
+pub(crate) fn paint_widget(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    settings: &settings::Settings,
+    frame: &AnimationFrame,
+    usage: &UsageData,
+    is_dark: bool,
+    strings: Strings,
+) {
+    let accent = claude_accent_color();
+    let codex_accent = codex_accent_color(is_dark);
+    let antigravity_accent = antigravity_accent_color();
+    let (bg_color, text_color, track) = derive_colors(&settings.appearance, is_dark);
+
+    // Shimmer/glow render params: `None` disables the effect entirely (either turned off in
+    // settings, or -- for glow -- not currently pulsing because no bar is over threshold).
+    let shimmer_fx = settings
+        .animation
+        .shimmer
+        .on
+        .then_some((frame.shimmer_phase, settings.animation.shimmer.intensity));
+    let glow_fx = (frame.glow_intensity > 0.0)
+        .then_some((settings.animation.alert_glow.threshold, frame.glow_intensity));
+
+    // Map the animated fill fractions back onto each bar using the SAME ordered-slot
+    // sequence used to feed the clock's `set_targets`, so index N always refers to the same
+    // bar here as it did when the target was set. Falls back to the raw (unanimated)
+    // percentage for any slot the frame doesn't have yet (e.g. before the first poll
+    // population, or a demo dataset whose clock hasn't been ticked with matching targets).
+    let slots = ordered_bar_slots(usage.show_claude_code, usage.show_codex, usage.show_antigravity);
+    let mut anim_session_pct = usage.session_pct;
+    let mut anim_weekly_pct = usage.weekly_pct;
+    let mut anim_codex_session_pct = usage.codex_session_pct;
+    let mut anim_codex_weekly_pct = usage.codex_weekly_pct;
+    let mut anim_antigravity_session_pct = usage.antigravity_session_pct;
+    let mut anim_antigravity_weekly_pct = usage.antigravity_weekly_pct;
+    for (i, slot) in slots.iter().enumerate() {
+        let Some(&frac) = frame.fill_pcts.get(i) else {
+            continue;
+        };
+        let pct = (frac as f64) * 100.0;
+        match slot {
+            BarSlot::ClaudeSession => anim_session_pct = pct,
+            BarSlot::ClaudeWeekly => anim_weekly_pct = pct,
+            BarSlot::CodexSession => anim_codex_session_pct = pct,
+            BarSlot::CodexWeekly => anim_codex_weekly_pct = pct,
+            BarSlot::AntigravitySession => anim_antigravity_session_pct = pct,
+            BarSlot::AntigravityWeekly => anim_antigravity_weekly_pct = pct,
+        }
+    }
+
+    paint_content(
+        hdc,
+        width,
+        height,
+        is_dark,
+        &bg_color,
+        &text_color,
+        &accent,
+        &track,
+        strings,
+        anim_session_pct,
+        &usage.session_text,
+        anim_weekly_pct,
+        &usage.weekly_text,
+        anim_codex_session_pct,
+        &usage.codex_session_text,
+        anim_codex_weekly_pct,
+        &usage.codex_weekly_text,
+        anim_antigravity_session_pct,
+        &usage.antigravity_session_text,
+        anim_antigravity_weekly_pct,
+        &usage.antigravity_weekly_text,
+        usage.show_claude_code,
+        usage.show_codex,
+        usage.show_antigravity,
+        &codex_accent,
+        &antigravity_accent,
+        &settings.geometry,
+        &settings.typography,
+        settings.appearance.palette,
+        shimmer_fx,
+        glow_fx,
+    );
+}
+
 /// Render widget content and push to the layered window via UpdateLayeredWindow.
 /// Renders fully opaque with the actual taskbar background colour so that
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
@@ -1435,6 +1905,8 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        bar_fracts,
+        taskbar_hwnd,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1458,6 +1930,8 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                ordered_bar_fracts(s),
+                s.taskbar_hwnd,
             ),
             None => return,
         }
@@ -1473,26 +1947,57 @@ fn render_layered() {
         return;
     }
 
-    let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
+    // Read settings once per render; everything below uses `cfg` instead of re-locking
+    // the global.
+    let mut cfg = current_settings();
+    // Defensive clamp: a corrupted/hand-edited settings.json (or a future bug) must not be
+    // able to paint an off-taskbar or oversized embedded widget. See
+    // `clamp_geometry_for_render`'s doc comment for why this uses a short-lived cache
+    // instead of querying the taskbar on every ~16ms animation frame.
+    cfg.geometry = clamp_geometry_for_render(cfg.geometry, taskbar_hwnd);
 
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
+    // --- Animation tick ---
+    // `dt` is measured against the previous tick; the first tick after a timer restart (or
+    // ever) has no previous sample, so it assumes one frame's worth (16ms) rather than a
+    // huge or zero delta.
+    let dt = {
+        let mut last = LAST_ANIM_TICK.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let dt = match *last {
+            Some(prev) => now.duration_since(prev),
+            None => Duration::from_millis(16),
+        };
+        *last = Some(now);
+        dt
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
+    let usage_max = bar_fracts.iter().cloned().fold(0.0f32, f32::max);
+    let (frame, anim_active) = with_anim(|clock| clock.tick(dt, usage_max));
+
+    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let width = total_widget_width_for(active_models, &cfg.geometry);
+    let height = sc(cfg.geometry.height);
+
+    // Only the background color is needed directly here (for the alpha-channel
+    // "background -> nearly transparent" post-process below); `paint_widget` derives the
+    // same triple internally for drawing.
+    let (bg_color, _, _) = derive_colors(&cfg.appearance, is_dark);
+
+    let usage = UsageData {
+        session_pct,
+        session_text,
+        weekly_pct,
+        weekly_text,
+        codex_session_pct,
+        codex_session_text,
+        codex_weekly_pct,
+        codex_weekly_text,
+        antigravity_session_pct,
+        antigravity_session_text,
+        antigravity_weekly_pct,
+        antigravity_weekly_text,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
     };
 
     unsafe {
@@ -1528,34 +2033,9 @@ fn render_layered() {
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
-        );
+        // Fill widths animate (via `frame`); the text and segment count still reflect the
+        // real polled percentage (`usage`'s *_text fields are untouched above).
+        paint_widget(mem_dc, width, height, &cfg, &frame, &usage, is_dark, strings);
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
@@ -1567,6 +2047,20 @@ fn render_layered() {
                 *px = 0x01000000;
             } else {
                 *px = rgb | 0xFF000000;
+            }
+        }
+
+        // Apply the global opacity override together with the current fade (show/hide/
+        // update fade-in-out) alpha on top of the alpha channel just assigned above.
+        // Default opacity 1.0 * settled fade_alpha 1.0 leaves every pixel byte-for-byte
+        // unchanged (a * 1.0 rounds back to `a` exactly for every u8 value).
+        let opacity = cfg.appearance.opacity.clamp(0.0, 1.0) * frame.fade_alpha.clamp(0.0, 1.0);
+        if opacity != 1.0 {
+            for px in pixel_data.iter_mut() {
+                let a = (*px >> 24) as u8;
+                let rgb = *px & 0x00FFFFFF;
+                let new_a = ((a as f32) * opacity).round().clamp(0.0, 255.0) as u32;
+                *px = (new_a << 24) | rgb;
             }
         }
 
@@ -1601,6 +2095,16 @@ fn render_layered() {
         let _ = DeleteDC(mem_dc);
         ReleaseDC(hwnd, screen_dc);
     }
+
+    // The clock has nothing left to animate (fill settled, no shimmer/glow pulsing, fade
+    // complete): stop the timer so idle CPU returns to ~0% instead of repainting every
+    // 16ms forever, and clear the last-tick timestamp so the next kick starts clean.
+    if !anim_active {
+        unsafe {
+            let _ = KillTimer(hwnd, IDT_ANIM);
+        }
+        *LAST_ANIM_TICK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// Paint all widget content onto a DC with a given background color.
@@ -1631,6 +2135,14 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    geometry: &settings::Geometry,
+    typography: &settings::Typography,
+    palette: Option<settings::PaletteStops>,
+    // Animation overlays for the embedded/animated render path. `None` disables the effect
+    // entirely; the non-embedded fallback `paint()` passes `None` for both since it never
+    // animates.
+    shimmer: Option<(f32, f32)>, // (shimmer_phase 0..1, intensity 0..1)
+    glow: Option<(f32, f32)>,    // (alert_glow.threshold 0..1, glow_intensity 0..1)
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1682,19 +2194,37 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let bar_thickness = sc(geometry.bar_thickness);
+        let row2_y = height - sc(5) - bar_thickness;
+        let row1_y = row2_y - sc(10) - bar_thickness;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
+        // Weight mapping (documented, must stay in sync with Typography::default()):
+        // today's hardcoded CreateFontW call used FW_MEDIUM (not FW_REGULAR), so
+        // Weight::Regular -> FW_MEDIUM to keep the default output pixel-identical.
+        // SemiBold and Bold map to their obvious GDI equivalents.
+        let font_weight = match typography.weight {
+            settings::Weight::Regular => FW_MEDIUM.0 as i32,
+            settings::Weight::SemiBold => FW_SEMIBOLD.0 as i32,
+            settings::Weight::Bold => FW_BOLD.0 as i32,
+        };
+
+        // nHeight mapping (documented, must stay in sync with default_font_size() in
+        // settings.rs): Windows converts point size to logical units via
+        // nHeight = -(point_size * dpi / 72). At the 96-DPI baseline `sc()` scales
+        // relative to, the default size_pt = 9.0 reproduces today's hardcoded `sc(-12)`
+        // call: -(9.0 * 96 / 72) = -12.
+        let base_height = -((typography.size_pt * 96.0 / 72.0).round() as i32);
+
+        let font_name = native_interop::wide_str(&typography.family);
         let font = CreateFontW(
-            sc(-12),
+            sc(base_height),
             0,
             0,
             0,
-            FW_MEDIUM.0 as i32,
+            font_weight,
             0,
             0,
             0,
@@ -1727,6 +2257,11 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            bg,
+            geometry,
+            palette,
+            shimmer,
+            glow,
         );
         draw_row(
             hdc,
@@ -1748,6 +2283,11 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            bg,
+            geometry,
+            palette,
+            shimmer,
+            glow,
         );
 
         SelectObject(hdc, old_font);
@@ -2126,7 +2666,7 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT);
+    let widget_height = sc(current_settings().geometry.height);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
@@ -2304,6 +2844,15 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                IDT_ANIM => {
+                    render_layered();
+                }
+                IDT_TRAY_CLICK_DEBOUNCE => {
+                    // One-shot: stop it before acting so it doesn't keep firing every
+                    // GetDoubleClickTime() interval.
+                    let _ = KillTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE);
+                    toggle_widget_visibility(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -2311,6 +2860,17 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            // Kick the fill animation toward the freshly-polled percentages and make sure
+            // the animation timer is running so the tween (and any shimmer/glow/fade still
+            // in flight) actually gets rendered.
+            let fresh_targets = {
+                let state = lock_state();
+                state.as_ref().map(ordered_bar_fracts)
+            };
+            if let Some(targets) = fresh_targets {
+                with_anim(|clock| clock.set_targets(&targets));
+                let _ = SetTimer(hwnd, IDT_ANIM, 16, None);
+            }
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -2411,7 +2971,7 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT);
+                            let widget_height = sc(current_settings().geometry.height);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
                             let x = if embedded {
                                 tray_left - taskbar_rect.left - widget_width - new_offset
@@ -2670,6 +3230,9 @@ unsafe extern "system" fn wnd_proc(
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
+                IDM_OPEN_SETTINGS => {
+                    config_window::open_config_window();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -2677,10 +3240,57 @@ unsafe extern "system" fn wnd_proc(
         _ if msg == WM_APP_TRAY => {
             match tray_icon::handle_message(lparam) {
                 tray_icon::TrayAction::ToggleWidget => {
-                    toggle_widget_visibility(hwnd);
+                    // A real Win32 double-click on a legacy (non-NOTIFYICON_VERSION_4) tray
+                    // icon delivers FOUR messages in order: WM_LBUTTONDOWN, WM_LBUTTONUP,
+                    // WM_LBUTTONDBLCLK, WM_LBUTTONUP. Both WM_LBUTTONUPs map to
+                    // ToggleWidget here, so this arm runs twice per double-click:
+                    //   1. The first WM_LBUTTONUP (before WM_LBUTTONDBLCLK) - handled by the
+                    //      debounce timer below, same as a genuine single click.
+                    //   2. The trailing WM_LBUTTONUP (right after WM_LBUTTONDBLCLK, the
+                    //      release of the second click) - if we armed another debounce timer
+                    //      here, it would fire ~GetDoubleClickTime() ms after Settings opened
+                    //      and silently toggle+persist widget_visible anyway. The
+                    //      OpenSettings arm below sets suppress_next_tray_click for exactly
+                    //      this case; consume it here (one-shot) and skip arming the timer
+                    //      entirely instead of re-arming ToggleWidget's debounce.
+                    let already_consumed = {
+                        let mut guard = lock_state();
+                        if let Some(s) = guard.as_mut() {
+                            let was_set = s.suppress_next_tray_click;
+                            s.suppress_next_tray_click = false;
+                            was_set
+                        } else {
+                            false
+                        }
+                    };
+                    if !already_consumed {
+                        // Don't toggle immediately: a real double-click delivers
+                        // WM_LBUTTONUP (this arm) for its first click before
+                        // WM_LBUTTONDBLCLK fires for the second. Debounce with a short
+                        // one-shot timer instead; if the double-click arrives before it
+                        // fires, the OpenSettings arm below kills it and the toggle never
+                        // happens. A single click still toggles once the timer expires,
+                        // just delayed by GetDoubleClickTime() (imperceptible).
+                        let _ =
+                            SetTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE, GetDoubleClickTime(), None);
+                    }
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
                     show_context_menu(hwnd);
+                }
+                tray_icon::TrayAction::OpenSettings => {
+                    let _ = KillTimer(hwnd, IDT_TRAY_CLICK_DEBOUNCE);
+                    // The second click of this double-click still has a WM_LBUTTONUP
+                    // (release) to come; mark it so the ToggleWidget arm above skips
+                    // arming a fresh debounce timer for it instead of treating it as a
+                    // new single click.
+                    {
+                        let mut guard = lock_state();
+                        if let Some(s) = guard.as_mut() {
+                            s.suppress_next_tray_click = true;
+                        }
+                    }
+                    config_window::open_config_window();
                 }
                 tray_icon::TrayAction::None => {}
             }
@@ -2753,6 +3363,16 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             1,
             PCWSTR::from_raw(refresh_str.as_ptr()),
+        );
+
+        // Opens the settings window (Task 15). Placed near the top since it's the primary
+        // entry point to the settings window feature.
+        let open_settings_str = native_interop::wide_str(strings.open_settings);
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_SETTINGS as usize,
+            PCWSTR::from_raw(open_settings_str.as_ptr()),
         );
 
         // Update Frequency submenu
@@ -3013,24 +3633,33 @@ fn paint(hdc: HDC, hwnd: HWND) {
         }
     };
 
+    // Read settings once per render; everything below uses `cfg` instead of re-locking
+    // the global.
+    let cfg = current_settings();
+
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
     let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
+    let track_default = if is_dark {
         Color::from_hex("#444444")
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
+    let text_default = if is_dark {
         Color::from_hex("#888888")
     } else {
         Color::from_hex("#404040")
     };
-    let bg_color = if is_dark {
+    let bg_default = if is_dark {
         Color::from_hex("#1C1C1C")
     } else {
         Color::from_hex("#F3F3F3")
     };
+    // Option-override model: `None` (the default) reproduces today's adaptive colors
+    // exactly; `Some(rgba)` overrides them.
+    let track = cfg.appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
+    let text_color = cfg.appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
+    let bg_color = cfg.appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -3073,6 +3702,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            &cfg.geometry,
+            &cfg.typography,
+            cfg.appearance.palette,
+            None,
+            None,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3103,8 +3737,13 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    bg: &Color,
+    geometry: &settings::Geometry,
+    palette: Option<settings::PaletteStops>,
+    shimmer: Option<(f32, f32)>,
+    glow: Option<(f32, f32)>,
 ) {
-    let seg_h = sc(SEGMENT_H);
+    let seg_h = sc(geometry.bar_thickness);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1;
@@ -3130,7 +3769,7 @@ fn draw_row(
         let mut label_rect = RECT {
             left: x,
             top: y,
-            right: x + sc(LABEL_WIDTH),
+            right: x + sc(geometry.label_width),
             bottom: y + seg_h,
         };
         let _ = DrawTextW(
@@ -3140,7 +3779,7 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x + sc(geometry.label_width) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -3151,9 +3790,14 @@ fn draw_row(
                 claude_text,
                 claude_accent,
                 track,
+                bg,
                 &claude_value_color,
+                geometry,
+                palette,
+                shimmer,
+                glow,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, geometry) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
@@ -3165,9 +3809,14 @@ fn draw_row(
                 codex_text,
                 codex_accent,
                 track,
+                bg,
                 &codex_value_color,
+                geometry,
+                palette,
+                shimmer,
+                glow,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, geometry) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
@@ -3179,16 +3828,35 @@ fn draw_row(
                 antigravity_text,
                 antigravity_accent,
                 track,
+                bg,
                 &antigravity_value_color,
+                geometry,
+                palette,
+                shimmer,
+                glow,
             );
         }
     }
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+fn model_usage_width(segment_count: i32, geometry: &settings::Geometry) -> i32 {
+    (sc(SEGMENT_W) + sc(geometry.spacing)) * segment_count - sc(geometry.spacing)
         + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
+        + sc(geometry.text_width)
+}
+
+/// Interpolates a bar-fill color from `stops` based on usage fraction `p` (0.0..=1.0):
+/// the lower half blends calm→attention, the upper half blends attention→critical.
+fn palette_color(stops: &settings::PaletteStops, p: f32) -> Color {
+    let p = p.clamp(0.0, 1.0);
+    let calm = stops.calm.to_color();
+    let attention = stops.attention.to_color();
+    let critical = stops.critical.to_color();
+    if p < 0.5 {
+        calm.lerp(&attention, p * 2.0)
+    } else {
+        attention.lerp(&critical, (p - 0.5) * 2.0)
+    }
 }
 
 fn draw_usage_bar(
@@ -3200,16 +3868,56 @@ fn draw_usage_bar(
     text: &str,
     accent: &Color,
     track: &Color,
+    bg: &Color,
     text_color: &Color,
+    geometry: &settings::Geometry,
+    palette: Option<settings::PaletteStops>,
+    // (shimmer_phase 0..1, intensity 0..1); `None` disables shimmer for this bar entirely.
+    shimmer: Option<(f32, f32)>,
+    // (alert_glow.threshold 0..1, glow_intensity 0..1); `None` disables glow for this bar.
+    // Even when `Some`, the halo only actually draws once this bar's own fraction reaches
+    // `threshold` -- `glow` being `Some` just means *some* bar in the widget is pulsing.
+    glow: Option<(f32, f32)>,
 ) {
     let seg_w = sc(SEGMENT_W);
-    let seg_h = sc(SEGMENT_H);
-    let seg_gap = sc(SEGMENT_GAP);
-    let corner_r = sc(CORNER_RADIUS);
+    let seg_h = sc(geometry.bar_thickness);
+    let seg_gap = sc(geometry.spacing);
+    let corner_r = sc(geometry.corner_radius);
+    let total_w = segment_count * (seg_w + seg_gap) - seg_gap;
 
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
         let segment_percent = 100.0 / segment_count as f64;
+
+        // Per-model bar fill: if a palette override is set, interpolate the fill color by
+        // this bar's overall usage fraction; otherwise keep the per-model accent passed in
+        // (today's exact behavior, since palette defaults to None).
+        let effective_accent: Color = match &palette {
+            Some(stops) => palette_color(stops, (percent_clamped / 100.0) as f32),
+            None => *accent,
+        };
+        let accent = &effective_accent;
+
+        // --- Alert glow: a soft halo drawn BEHIND the bar so the (opaque) track/fill
+        // segments painted below cover its interior, leaving just a subtle tinted ring
+        // peeking out around the bar's edges. Only shown once this specific bar's own
+        // fraction reaches the threshold, even though `glow` is shared across the whole
+        // widget (it just signals "the clock is currently pulsing").
+        if let Some((threshold, glow_intensity)) = glow {
+            if glow_intensity > 0.0 && (percent_clamped / 100.0) as f32 >= threshold {
+                let pad = sc(3).max(1);
+                let halo_rect = RECT {
+                    left: bar_x - pad,
+                    top: y - pad,
+                    right: bar_x + total_w + pad,
+                    bottom: y + seg_h + pad,
+                };
+                // Blend mostly toward the background; only a sliver of accent shows through
+                // as the "glow" -- keeps it a soft wash rather than a hard colored box.
+                let halo_color = bg.lerp(accent, glow_intensity.clamp(0.0, 1.0) * 0.45);
+                draw_rounded_rect(hdc, &halo_rect, &halo_color, corner_r + pad);
+            }
+        }
 
         for i in 0..segment_count {
             let seg_x = bar_x + i * (seg_w + seg_gap);
@@ -3256,12 +3964,55 @@ fn draw_usage_bar(
             }
         }
 
+        // --- Shimmer: a thin, soft highlight band sweeping left-to-right across the
+        // FILLED portion only, clipped to the bar's rounded outline so it never pokes past
+        // the corners. Drawn as a lightened solid (not true alpha blending -- GDI has no
+        // cheap per-pixel alpha on this DC) so `intensity` controls how much it lightens
+        // toward white rather than true transparency; kept low by design for subtlety.
+        if let Some((phase, shimmer_intensity)) = shimmer {
+            if shimmer_intensity > 0.0 {
+                let fill_w = ((percent_clamped / 100.0) * total_w as f64).round() as i32;
+                if fill_w > 2 {
+                    let band_w = (total_w / 10).max(sc(4));
+                    let center = bar_x + (total_w as f32 * phase).round() as i32;
+                    let band_left = (center - band_w / 2).max(bar_x);
+                    let band_right = (center + band_w / 2).min(bar_x + fill_w);
+                    if band_right > band_left {
+                        let highlight = accent.lerp(
+                            &Color::from_hex("#FFFFFF"),
+                            shimmer_intensity.clamp(0.0, 1.0) * 0.35,
+                        );
+                        let clip_rgn = CreateRoundRectRgn(
+                            bar_x,
+                            y,
+                            bar_x + total_w + 1,
+                            y + seg_h + 1,
+                            corner_r * 2,
+                            corner_r * 2,
+                        );
+                        let _ = SelectClipRgn(hdc, clip_rgn);
+                        let band_rect = RECT {
+                            left: band_left,
+                            top: y,
+                            right: band_right,
+                            bottom: y + seg_h,
+                        };
+                        let brush = CreateSolidBrush(COLORREF(highlight.to_colorref()));
+                        FillRect(hdc, &band_rect, brush);
+                        let _ = DeleteObject(brush);
+                        let _ = SelectClipRgn(hdc, HRGN::default());
+                        let _ = DeleteObject(clip_rgn);
+                    }
+                }
+            }
+        }
+
         let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + sc(TEXT_WIDTH),
+            right: text_x + sc(geometry.text_width),
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -3288,5 +4039,190 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod clamp_geometry_tests {
+    use super::*;
+
+    /// A generously large taskbar (1920x48 baseline-equivalent) that comfortably fits the
+    /// shipped default `Geometry` unchanged -- used by tests asserting no-op / pass-through
+    /// behavior for already-sane values.
+    fn roomy_taskbar_rect() -> RECT {
+        RECT { left: 0, top: 0, right: 1920, bottom: 48 }
+    }
+
+    fn short_taskbar_rect(height: i32) -> RECT {
+        RECT { left: 0, top: 0, right: 1920, bottom: height }
+    }
+
+    // --- Step 1 (brief-literal): oversized height clamps to taskbar height ---
+    #[test]
+    fn oversized_height_clamps_to_taskbar_height() {
+        let g = settings::Geometry { height: 5000, ..settings::Geometry::default() };
+        let taskbar = short_taskbar_rect(48);
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert!(
+            clamped.height <= 48,
+            "clamped height {} exceeds taskbar height 48",
+            clamped.height
+        );
+        assert!(clamped.height > 0, "clamped height must stay positive");
+    }
+
+    #[test]
+    fn oversized_width_contributor_clamps_derived_width_under_cap() {
+        // text_width alone, at the worst-case 3-active-model count, would blow the derived
+        // width far past both the 800px baseline cap and half of this taskbar's width.
+        let g = settings::Geometry { text_width: 999_999, ..settings::Geometry::default() };
+        let taskbar = roomy_taskbar_rect();
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        let cap = (taskbar.right / 2).min(MAX_TOTAL_WIDTH_BASELINE);
+        let derived = baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &clamped);
+        assert!(
+            derived <= cap,
+            "derived width {derived} exceeds cap {cap} after clamping text_width={}",
+            clamped.text_width
+        );
+    }
+
+    #[test]
+    fn already_in_range_geometry_is_a_no_op() {
+        let g = settings::Geometry::default();
+        let taskbar = roomy_taskbar_rect();
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert_eq!(clamped, g, "clamp_geometry mutated an already-sane default Geometry");
+    }
+
+    #[test]
+    fn negative_and_zero_component_values_bound_to_sane_minimums() {
+        let g = settings::Geometry {
+            height: -10,
+            corner_radius: -5,
+            bar_thickness: 0,
+            label_width: -1,
+            text_width: 0,
+            spacing: -3,
+        };
+        let taskbar = roomy_taskbar_rect();
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert!(clamped.height >= MIN_HEIGHT_BASELINE);
+        assert!(clamped.corner_radius >= 0);
+        assert!(clamped.bar_thickness >= MIN_BAR_THICKNESS_BASELINE);
+        assert!(clamped.label_width >= MIN_LABEL_WIDTH_BASELINE);
+        assert!(clamped.text_width >= MIN_TEXT_WIDTH_BASELINE);
+        assert!(clamped.spacing >= 0);
+    }
+
+    #[test]
+    fn width_cap_never_below_taskbar_half_width_for_a_narrow_taskbar() {
+        // A narrow taskbar (e.g. a small secondary monitor) should still cap the derived
+        // width at (roughly) half its own width, not just fall back to the 800px baseline.
+        let g = settings::Geometry { text_width: 500, label_width: 150, ..settings::Geometry::default() };
+        let taskbar = RECT { left: 0, top: 0, right: 300, bottom: 48 };
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        let derived = baseline_total_width_for(CLAMP_WORST_CASE_ACTIVE_MODELS, &clamped);
+        // Some slack is allowed only if every shrinkable field already hit its own minimum
+        // (this taskbar is narrow enough that the width floor may exceed width/2).
+        let floor = baseline_total_width_for(
+            CLAMP_WORST_CASE_ACTIVE_MODELS,
+            &settings::Geometry {
+                text_width: MIN_TEXT_WIDTH_BASELINE,
+                label_width: MIN_LABEL_WIDTH_BASELINE,
+                spacing: 0,
+                ..clamped
+            },
+        );
+        assert!(
+            derived <= (taskbar.right / 2).max(floor),
+            "derived width {derived} not bounded relative to taskbar half-width for a narrow taskbar"
+        );
+    }
+
+    #[test]
+    fn corner_radius_bounded_by_clamped_height() {
+        let g = settings::Geometry { corner_radius: 1000, height: 5000, ..settings::Geometry::default() };
+        let taskbar = short_taskbar_rect(30);
+
+        let clamped = clamp_geometry(g, taskbar);
+
+        assert!(clamped.corner_radius <= clamped.height / 2);
+    }
+
+    #[test]
+    fn clamp_is_idempotent() {
+        let g = settings::Geometry { height: 9000, text_width: 5000, ..settings::Geometry::default() };
+        let taskbar = short_taskbar_rect(48);
+
+        let once = clamp_geometry(g, taskbar);
+        let twice = clamp_geometry(once, taskbar);
+
+        assert_eq!(once, twice, "clamping an already-clamped Geometry must be a no-op");
+    }
+
+    // --- Regression: per-field sanity bounds must still apply when the taskbar rect can't be
+    // resolved (`clamp_geometry_to_current_taskbar` / `clamp_geometry_for_render` fall back to
+    // `NO_TASKBAR_RECT`, a zero-area RECT, rather than skipping `clamp_geometry` entirely). ---
+    #[test]
+    fn zero_area_taskbar_rect_still_applies_per_field_sanity_bounds() {
+        // A corrupted/hand-edited settings.json with an out-of-range negative text_width and
+        // an absurdly large spacing -- exactly the class of value the per-field bounds exist
+        // to catch, reaching clamp_geometry with no real taskbar rect to compare against
+        // (taskbar_hwnd not yet resolved, or get_taskbar_rect transiently failing).
+        let g = settings::Geometry {
+            text_width: -50,
+            spacing: 999_999,
+            height: -1,
+            corner_radius: -1,
+            bar_thickness: 0,
+            label_width: -1,
+        };
+
+        let clamped = clamp_geometry(g, NO_TASKBAR_RECT);
+
+        assert!(
+            clamped.text_width >= MIN_TEXT_WIDTH_BASELINE,
+            "text_width {} not bounded to sane minimum despite unresolvable taskbar",
+            clamped.text_width
+        );
+        assert!(
+            clamped.spacing <= MAX_SPACING_BASELINE,
+            "spacing {} not bounded to sane maximum despite unresolvable taskbar",
+            clamped.spacing
+        );
+        assert!(clamped.height >= MIN_HEIGHT_BASELINE);
+        assert!(clamped.height <= MAX_HEIGHT_BASELINE);
+        assert!(clamped.corner_radius >= 0);
+        assert!(clamped.bar_thickness >= MIN_BAR_THICKNESS_BASELINE);
+        assert!(clamped.label_width >= MIN_LABEL_WIDTH_BASELINE);
+    }
+
+    #[test]
+    fn zero_area_taskbar_rect_does_not_apply_size_dependent_caps() {
+        // With no real taskbar to compare against, the taskbar-size-dependent height/width
+        // caps must be skipped entirely -- a Geometry that's merely large (but still within
+        // the generous per-field bounds) should pass through those specific caps unchanged.
+        let g = settings::Geometry {
+            height: MAX_HEIGHT_BASELINE,
+            ..settings::Geometry::default()
+        };
+
+        let clamped = clamp_geometry(g, NO_TASKBAR_RECT);
+
+        assert_eq!(
+            clamped.height, MAX_HEIGHT_BASELINE,
+            "height was capped against a zero-area taskbar rect instead of only the per-field maximum"
+        );
     }
 }

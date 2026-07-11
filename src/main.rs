@@ -1,10 +1,15 @@
 #![windows_subsystem = "windows"]
 
+mod animation;
+mod config_window;
+mod controls;
 mod diagnose;
 mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod presets;
+mod settings;
 mod theme;
 mod tray_icon;
 mod updater;
