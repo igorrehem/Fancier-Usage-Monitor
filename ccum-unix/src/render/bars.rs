@@ -564,6 +564,95 @@ fn draw_row(
     }
 }
 
+/// The "most urgent" percentage across every currently active model + window (session/weekly),
+/// used by `draw_tray_icon` to collapse the widget's up-to-six independent bars into the tray
+/// icon's single fill level. Picking the MAX (not an average) mirrors the alert-glow feature's
+/// own philosophy elsewhere in this module: a glanceable tray icon should always reflect
+/// whichever limit is closest to being hit, not smooth that signal away by averaging it against
+/// other windows/models that still have plenty of headroom.
+fn primary_pct(usage: &UsageData) -> f64 {
+    let mut candidates: Vec<f64> = Vec::with_capacity(6);
+    if usage.show_claude_code {
+        candidates.push(usage.session_pct);
+        candidates.push(usage.weekly_pct);
+    }
+    if usage.show_codex {
+        candidates.push(usage.codex_session_pct);
+        candidates.push(usage.codex_weekly_pct);
+    }
+    if usage.show_antigravity {
+        candidates.push(usage.antigravity_session_pct);
+        candidates.push(usage.antigravity_weekly_pct);
+    }
+    candidates.into_iter().fold(0.0f64, f64::max)
+}
+
+/// The accent color of the first active model in priority order (Claude Code, then Codex, then
+/// Antigravity -- the same priority `ordered_bar_slots` draws in), used by `draw_tray_icon` when
+/// no palette override is set. Mirrors `draw_usage_bar`'s own `None => accent` fallback, just
+/// picking ONE model's accent for the whole icon instead of each bar getting its own.
+fn primary_accent_color(usage: &UsageData, is_dark: bool) -> Color {
+    if usage.show_claude_code {
+        claude_accent_color()
+    } else if usage.show_codex {
+        codex_accent_color(is_dark)
+    } else if usage.show_antigravity {
+        antigravity_accent_color()
+    } else {
+        claude_accent_color()
+    }
+}
+
+/// Draws a compact, icon-scale usage indicator onto `canvas` (expected to be small and square --
+/// `tray.rs` always allocates it at `tray::ICON_SIZE`): a single vertical "fill" bar (like a
+/// battery/thermometer level) inside a rounded track, rather than the widget's full
+/// multi-segment bars.
+///
+/// Design choice (Task 8): a literal `draw_bars` reuse at a tiny canvas size was considered and
+/// rejected -- `SEGMENT_W` alone is 10px, `LEFT_DIVIDER_W` + `DIVIDER_RIGHT_MARGIN` +
+/// `LABEL_RIGHT_MARGIN` add another 23px of fixed chrome before a single bar segment is even
+/// drawn, and `TextRenderer::draw_text`'s glyphs are illegible well before a full row (label +
+/// bar + percentage text) could fit inside a ~16-22px tray icon. A single proportional fill bar
+/// (the "battery level" idiom) reads clearly at icon scale and reuses this module's EXISTING
+/// primitives (`Canvas::fill_rounded_rect`/`fill_rect_clipped_to_rounded_rect`) and color logic
+/// (`derive_colors`/`palette_color`/per-model accent colors) verbatim -- no new drawing code, no
+/// new color rules, just a different (single-number, `primary_pct`) input feeding the same
+/// machinery `draw_usage_bar` already uses for its own filled-segment/track colors.
+///
+/// The background is left fully transparent (`Canvas::clear(Color::TRANSPARENT)`, not the
+/// widget's opaque `bg` fill) because a tray/menu-bar icon is composited over the OS's own
+/// taskbar/menu-bar chrome -- an opaque square icon would look like a UI bug, not a status
+/// indicator.
+pub fn draw_tray_icon(canvas: &mut Canvas, settings: &Settings, usage: &UsageData, is_dark: bool) {
+    canvas.clear(Color::TRANSPARENT);
+
+    let size = canvas.height() as f32;
+    let margin = (size * 0.12).max(1.0);
+    let radius = (size * 0.22).max(1.0);
+    let Some(track_rect) = Rect::from_ltrb(margin, margin, size - margin, size - margin) else {
+        return;
+    };
+
+    let (_, _, track_color) = derive_colors(&settings.appearance, is_dark);
+    let pct = primary_pct(usage);
+    let fill_color = match settings.appearance.palette {
+        Some(stops) => palette_color(&stops, (pct / 100.0) as f32),
+        None => primary_accent_color(usage, is_dark),
+    };
+
+    canvas.fill_rounded_rect(track_rect, radius, track_color);
+
+    let fill_h = (track_rect.height() * (pct.clamp(0.0, 100.0) / 100.0) as f32).round();
+    if fill_h > 0.0 {
+        let fill_top = track_rect.bottom() - fill_h;
+        if let Some(fill_rect) =
+            Rect::from_ltrb(track_rect.left(), fill_top, track_rect.right(), track_rect.bottom())
+        {
+            canvas.fill_rect_clipped_to_rounded_rect(fill_rect, track_rect, radius, fill_color);
+        }
+    }
+}
+
 /// The widget's actual "does this look like a usage bar" render entry point: label + filled
 /// bar (fill percentage from `frame.fill_pcts`, color from `settings.appearance`, shimmer/
 /// glow effects if enabled) + text, for however many sections are active. Direct port of
