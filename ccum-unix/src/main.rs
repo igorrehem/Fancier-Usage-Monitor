@@ -356,7 +356,9 @@ impl ApplicationHandler<AppEvent> for App {
     /// with each other.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         if self.panel.window_id() == Some(window_id) {
-            self.panel.handle_window_event(&event, &mut self.text);
+            if let Some(new_settings) = self.panel.handle_window_event(&event, &mut self.text) {
+                self.apply_saved_settings(new_settings);
+            }
             return;
         }
 
@@ -614,6 +616,39 @@ impl App {
             height: f64::from(r.size.height),
         });
         self.panel.toggle(event_loop, anchor, &self.settings, &self.text);
+    }
+
+    /// Task 13: applies a freshly Saved settings draft (returned from
+    /// `Panel::handle_window_event` -- see that method's doc comment) to this app's own live
+    /// state. `ccum_core::settings::save` has already persisted it to disk (inside
+    /// `Panel::handle_button_action`, the SAME free function/path
+    /// `ccum-windows/src/config_window.rs::handle_button_action`'s own `Save` arm calls) -- this
+    /// method's job is everything `Panel` itself has no access to: replacing `self.settings`
+    /// (the tray icon's and demo window's actual render input), re-deriving `self.poll_interval`
+    /// from the new `poll_interval_ms` (mirrors `App::new`'s own initial derivation -- a changed
+    /// poll interval must take effect immediately, not just on the next app restart), and
+    /// repainting both the demo window and the tray icon right away so an appearance/geometry
+    /// change is visible without waiting for the next natural redraw/poll tick.
+    fn apply_saved_settings(&mut self, new_settings: Settings) {
+        self.settings = new_settings;
+        self.poll_interval = Duration::from_millis(u64::from(self.settings.poll_interval_ms));
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+
+        if let Some(tray) = &self.tray_icon {
+            match tray::render_icon(&self.settings, &self.tray_usage, true) {
+                Ok(icon) => {
+                    if let Err(err) = tray.set_icon(Some(icon)) {
+                        eprintln!("ccum-unix: failed to update tray icon bitmap after settings save: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("ccum-unix: failed to render tray icon bitmap after settings save: {err}");
+                }
+            }
+        }
     }
 }
 

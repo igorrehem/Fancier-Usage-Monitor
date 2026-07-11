@@ -167,12 +167,28 @@ pub const SECTIONS: [&str; 6] = ["Appearance", "Font", "Size", "Animations", "Up
 // lay out more content than the window is tall enough to show. 520 gives content-area bottom
 // 504px, ~30px of slack past the 474px actually needed.
 const PANEL_W: i32 = 520;
-const PANEL_H: i32 = 520;
+/// Content-area height, unchanged from Task 11's tuning (see the comment above) -- the button
+/// bar (Task 13) is added as EXTRA height below this, via `PANEL_H`, specifically so
+/// `content_area()`'s footprint (and every section's already-tuned layout, e.g. Animations' own
+/// `reduce_motion` row) stays byte-for-byte the same as before this task rather than shrinking
+/// to make room for the new buttons.
+const BODY_H: i32 = 520;
+/// Save/Cancel/Reset button bar height, matching `ccum-windows/src/config_window.rs`'s own
+/// `BUTTON_BAR_H`.
+const BUTTON_BAR_H: i32 = 56;
+const PANEL_H: i32 = BODY_H + BUTTON_BAR_H;
 const SIDEBAR_W: i32 = 150;
 const SECTION_ITEM_H: i32 = 36;
 const SECTION_TOP_PAD: i32 = 12;
 const SECTION_TEXT_INSET: i32 = 16;
 const ACCENT_BAR_W: i32 = 3;
+
+// --- Task 13: Save/Cancel/Reset button bar -- sizes match
+// `ccum-windows/src/config_window.rs`'s own `BTN_W`/`BTN_H`/`BTN_GAP`/`BTN_BAR_PAD` exactly.
+const BTN_W: i32 = 84;
+const BTN_H: i32 = 30;
+const BTN_GAP: i32 = 10;
+const BTN_BAR_PAD: i32 = 16;
 
 /// Padding, in unscaled pixels, applied on all sides of the content area (right of the
 /// sidebar) before handing it to a section's layout function -- mirrors
@@ -196,6 +212,15 @@ const FOCUS_GRACE: Duration = Duration::from_millis(200);
 /// that equality is also *why* the race's reverse ordering needs no separate guard of its own
 /// (see the doc comment), so don't let the two drift apart without re-reading that reasoning.
 const TRAY_CLICK_GRACE: Duration = FOCUS_GRACE;
+
+/// Which button-bar button (if any) a click landed on. Direct port of
+/// `ccum-windows/src/config_window.rs::ButtonAction`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ButtonAction {
+    Save,
+    Cancel,
+    Reset,
+}
 
 /// The tray icon's on-screen rect at the moment the panel is being shown, in physical pixels --
 /// a local copy of the handful of fields this module actually needs out of
@@ -244,6 +269,17 @@ pub struct Panel {
     /// already persist. Only `appearance` (below) reads/writes into it so far; Tasks 11-13
     /// extend both to the remaining sections and Save/Cancel/Reset.
     draft: Option<Settings>,
+    /// The settings actually persisted to disk / applied to the real tray icon and demo
+    /// rendering, as of the moment `draft` was seeded (see `create`) or last synced by a
+    /// successful Save (see `commit_draft`). Distinct from `draft` (the working copy the user is
+    /// actively editing): `Cancel` reverts `draft` back to this, and `Reset` rebuilds `draft` as
+    /// `Settings::default_preserving_position` of THIS (not of `draft`) -- mirroring
+    /// `ccum-windows/src/config_window.rs`'s own Reset handler, which resets from
+    /// `window::current_settings()` (the real widget's live settings), never from its own
+    /// in-progress `draft`, so a Reset genuinely undoes any unsaved edits too, not just the
+    /// appearance/animation fields `default_preserving_position` itself resets. `None` until the
+    /// panel's window has been created once (see `create`), same lifecycle as `draft`.
+    committed: Option<Settings>,
     /// Live `RgbaPicker`/`Slider` widgets for the Appearance section, seeded from `draft` the
     /// same moment `draft` itself is seeded. `None` until the panel's window has been created
     /// once (see `create`).
@@ -290,6 +326,7 @@ impl Panel {
             shown_at: None,
             focus_lost_at: None,
             draft: None,
+            committed: None,
             appearance: None,
             font: None,
             size: None,
@@ -439,6 +476,7 @@ impl Panel {
             self.size = Some(SizeControls::from_settings(&draft.geometry));
             self.animations = Some(AnimationControls::from_settings(&draft.animation));
             self.update = Some(UpdateControls::from_settings(draft.poll_interval_ms));
+            self.committed = Some(draft.clone());
             self.draft = Some(draft);
         }
 
@@ -450,19 +488,31 @@ impl Panel {
     /// `main.rs` match on individual variants itself) so all of the panel's window-event
     /// handling logic -- and the invariants around it (e.g. `cursor` must be updated before a
     /// same-frame `MouseInput` click can hit-test against it) -- stays local to this module.
-    pub fn handle_window_event(&mut self, event: &WindowEvent, text: &mut TextRenderer) {
+    ///
+    /// Returns `Some(settings)` exactly when this event was a click on the Save button that
+    /// actually persisted a draft (see `handle_button_action`) -- `main.rs::App` uses this to
+    /// apply the just-saved settings to its own live state (tray icon rendering, poll interval),
+    /// which only `App`, not `Panel`, has access to. Every other event returns `None`.
+    pub fn handle_window_event(&mut self, event: &WindowEvent, text: &mut TextRenderer) -> Option<Settings> {
         match event {
             // A borderless window has no OS close button to generate this from directly, but
             // some platforms/window managers can still send it (e.g. Alt+F4) -- treat it as
             // "close the panel", not "exit the whole app" (only the demo window's
             // `CloseRequested` does that, in `main.rs`).
-            WindowEvent::CloseRequested => self.hide(),
+            WindowEvent::CloseRequested => {
+                self.hide();
+                None
+            }
             WindowEvent::Resized(_) => {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+                None
             }
-            WindowEvent::RedrawRequested => self.redraw(text),
+            WindowEvent::RedrawRequested => {
+                self.redraw(text);
+                None
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 // Broadcast unconditionally -- see `config_window.rs`'s own `WM_MOUSEMOVE`
@@ -470,18 +520,26 @@ impl Panel {
                 // "Mouse message model"): only a control mid-drag reacts to this at all, so
                 // it's cheap even at full mouse-move rates.
                 self.dispatch_content_mouse(MouseMsg::Move);
+                None
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == MouseButton::Left {
                     match state {
-                        ElementState::Pressed => self.handle_click(),
+                        ElementState::Pressed => return self.handle_click(),
                         ElementState::Released => self.dispatch_content_mouse(MouseMsg::Up),
                     }
                 }
+                None
             }
-            WindowEvent::Focused(focused) => self.handle_focus_change(*focused),
-            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(*delta),
-            _ => {}
+            WindowEvent::Focused(focused) => {
+                self.handle_focus_change(*focused);
+                None
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.handle_mouse_wheel(*delta);
+                None
+            }
+            _ => None,
         }
     }
 
@@ -533,11 +591,25 @@ impl Panel {
     /// port of `ccum-windows/src/config_window.rs`'s `WM_LBUTTONDOWN` handler's own
     /// sidebar-vs-content split (a sidebar hit always returns early, never falling through to
     /// `dispatch_controls`/`dispatch_content_mouse`).
-    fn handle_click(&mut self) {
+    /// Handles `MouseInput{Pressed, Left}`: button-bar clicks (Task 13) act immediately, before
+    /// any section-nav/content dispatch -- matching
+    /// `ccum-windows/src/config_window.rs::WM_LBUTTONDOWN`'s own ordering comment ("Button-bar
+    /// clicks act immediately on down ... and are handled before capture/dispatch since
+    /// Save/Cancel destroy the window"; this panel doesn't destroy its window on Save/Cancel,
+    /// but hides it, so the same "handle first, don't fall through" ordering still applies).
+    /// Sidebar clicks switch the active section (closing any open Appearance popover -- see
+    /// `AppearanceControls::close_all_popovers`'s doc comment); every other click is routed to
+    /// the active section's content dispatch.
+    fn handle_click(&mut self) -> Option<Settings> {
         let size = match &self.window {
             Some(window) => window.inner_size(),
-            None => return,
+            None => return None,
         };
+        let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (reset_rect, cancel_rect, save_rect) = button_rects(size.width as i32, size.height as i32);
+        if let Some(action) = button_at(cx, cy, reset_rect, cancel_rect, save_rect) {
+            return self.handle_button_action(action);
+        }
         if let Some(idx) = section_at(self.cursor.0, self.cursor.1, size.width, size.height) {
             if idx != self.active_section {
                 self.active_section = idx;
@@ -554,9 +626,99 @@ impl Panel {
                 }
                 self.request_redraw();
             }
-            return;
+            return None;
         }
         self.dispatch_content_mouse(MouseMsg::Down);
+        None
+    }
+
+    /// Runs a button-bar button's effect -- direct port of
+    /// `ccum-windows/src/config_window.rs::handle_button_action`'s three behaviors, adapted to
+    /// this panel's hide/show (not destroy/recreate) window lifecycle:
+    /// - `Save`: persists `draft` to disk (`ccum_core::settings::save`, the SAME function/path
+    ///   `ccum-windows` uses -- see `ccum_core::settings::settings_path`'s per-OS doc comments)
+    ///   via `commit_draft`, then hides the panel. Returns the just-saved settings so
+    ///   `main.rs::App` can apply them to its own live state.
+    /// - `Cancel`: discards `draft`'s in-progress edits by reverting it (and every section's
+    ///   cached control state) back to `committed` -- what's actually on disk/live, as of the
+    ///   last successful Save or this panel's first-ever open -- then hides the panel. Nothing
+    ///   is persisted; always returns `None`.
+    /// - `Reset`: rebuilds `draft` as `Settings::default_preserving_position` of `committed`
+    ///   (NOT of `draft` -- see `committed`'s own doc comment on why this must read from the
+    ///   real live settings, undoing in-progress edits too, matching the Windows original). Does
+    ///   NOT close the panel (so the user can keep editing or still Cancel afterward) and never
+    ///   persists; always returns `None`.
+    fn handle_button_action(&mut self, action: ButtonAction) -> Option<Settings> {
+        match action {
+            ButtonAction::Save => {
+                let committed = self.commit_draft();
+                if let Some(draft) = &committed {
+                    ccum_core::settings::save(draft);
+                }
+                committed
+            }
+            ButtonAction::Cancel => {
+                self.revert_draft_to_committed();
+                self.hide();
+                None
+            }
+            ButtonAction::Reset => {
+                if let Some(committed) = self.committed.clone() {
+                    self.apply_new_draft(Settings::default_preserving_position(committed));
+                }
+                None
+            }
+        }
+    }
+
+    /// The disk-I/O-free portion of Save's effect: commits `draft` as the new `committed`
+    /// settings and hides the panel, returning a clone of what was just committed (or `None` if
+    /// `draft` was never seeded, i.e. the panel's window was never created). Split out from
+    /// `handle_button_action`'s `Save` arm specifically so this logic is directly unit-testable
+    /// without writing to the real `ccum_core::settings::settings_path()` on whatever machine
+    /// runs `cargo test` -- see this module's test suite for why that matters (mirroring
+    /// `ccum-core::settings`'s own test module, which likewise never exercises `save`/`load`'s
+    /// actual disk I/O, only the pure data-shape logic around it).
+    fn commit_draft(&mut self) -> Option<Settings> {
+        let draft = self.draft.clone()?;
+        self.committed = Some(draft.clone());
+        self.hide();
+        Some(draft)
+    }
+
+    /// Reverts `draft` to `committed` -- Cancel's effect, minus hiding the panel (kept separate
+    /// so a future caller could revert without also closing, though none does today). A no-op if
+    /// `committed` was never seeded (panel window never created).
+    fn revert_draft_to_committed(&mut self) {
+        if let Some(committed) = self.committed.clone() {
+            self.apply_new_draft(committed);
+        }
+    }
+
+    /// Replaces `draft` with `new_settings` and rebuilds every section's cached control state
+    /// from it -- the same "rebuild controls from settings after an external draft mutation"
+    /// discipline `dispatch_content_mouse`'s Presets arm already uses (see that call site's own
+    /// comment), just applied to the whole `Settings` at once instead of two sections. The
+    /// Font section's dropdown reuses whatever font-family list is already cached on
+    /// `self.font` (rather than needing a `TextRenderer` here to re-enumerate installed fonts --
+    /// this method has no access to one, and the list doesn't change at runtime anyway), falling
+    /// back to a single-item list containing `new_settings.typography.family` if `self.font` was
+    /// never seeded yet, mirroring `FontControls::from_settings`'s own empty-list fallback.
+    fn apply_new_draft(&mut self, new_settings: Settings) {
+        // `is_dark: true` matches `create`'s own hardcoded seed (no OS dark/light-mode detection
+        // wired up yet -- see that method's doc comment).
+        self.appearance = Some(AppearanceControls::from_settings(&new_settings.appearance, true));
+        let families = self
+            .font
+            .as_ref()
+            .map(|f| f.family.items.clone())
+            .unwrap_or_else(|| vec![new_settings.typography.family.clone()]);
+        self.font = Some(FontControls::from_settings(&new_settings.typography, families));
+        self.size = Some(SizeControls::from_settings(&new_settings.geometry));
+        self.animations = Some(AnimationControls::from_settings(&new_settings.animation));
+        self.update = Some(UpdateControls::from_settings(new_settings.poll_interval_ms));
+        self.draft = Some(new_settings);
+        self.request_redraw();
     }
 
     /// Routes a mouse message to the active section's content controls and requests a repaint if
@@ -733,8 +895,111 @@ fn content_area() -> LRect {
         left: content_left + CTRL_PAD,
         top: CTRL_PAD,
         right: (PANEL_W as f32 - CTRL_PAD).max(content_left + CTRL_PAD),
-        bottom: (PANEL_H as f32 - CTRL_PAD).max(CTRL_PAD),
+        bottom: (BODY_H as f32 - CTRL_PAD).max(CTRL_PAD),
     }
+}
+
+/// Rects for the three button-bar buttons, given the window's client size: `Reset` pinned to
+/// the left edge, `Cancel`/`Save` pinned to the right edge (`Save` rightmost, matching the
+/// common OK-is-rightmost convention), all vertically centered in the bar below `BODY_H`. Direct
+/// port of `ccum-windows/src/config_window.rs::button_rects`, minus DPI scaling (matching every
+/// other layout function in this module -- see this module's doc comment, "Porting notes").
+/// Shared by `paint` (drawing) and `handle_click` (hit-testing) so the two can never drift apart.
+fn button_rects(client_w: i32, client_h: i32) -> (LRect, LRect, LRect) {
+    let body_bottom = (client_h - BUTTON_BAR_H) as f32;
+    let bar_h = BUTTON_BAR_H as f32;
+    let btn_w = BTN_W as f32;
+    let btn_h = BTN_H as f32;
+    let gap = BTN_GAP as f32;
+    let pad = BTN_BAR_PAD as f32;
+
+    let top = body_bottom + (bar_h - btn_h) / 2.0;
+    let bottom = top + btn_h;
+
+    let save_right = client_w as f32 - pad;
+    let save_left = save_right - btn_w;
+    let save = LRect { left: save_left, top, right: save_right, bottom };
+
+    let cancel_right = save_left - gap;
+    let cancel_left = cancel_right - btn_w;
+    let cancel = LRect { left: cancel_left, top, right: cancel_right, bottom };
+
+    let reset_left = pad;
+    let reset_right = reset_left + btn_w;
+    let reset = LRect { left: reset_left, top, right: reset_right, bottom };
+
+    (reset, cancel, save)
+}
+
+/// Which button-bar button (if any) contains client point `(x, y)`. Direct port of
+/// `ccum-windows/src/config_window.rs::button_at`.
+fn button_at(x: f32, y: f32, reset: LRect, cancel: LRect, save: LRect) -> Option<ButtonAction> {
+    let hit = |r: LRect| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+    if hit(save) {
+        Some(ButtonAction::Save)
+    } else if hit(cancel) {
+        Some(ButtonAction::Cancel)
+    } else if hit(reset) {
+        Some(ButtonAction::Reset)
+    } else {
+        None
+    }
+}
+
+/// Draws one button-bar button: `Save` as a filled accent "primary" button, `Cancel`/`Reset` as
+/// bordered "secondary" buttons -- the same accent/neutral tones `paint`'s sidebar
+/// active-section highlight already uses, matching
+/// `ccum-windows/src/config_window.rs::draw_button`'s own palette choice. The border is drawn as
+/// a filled outer rect in the border color, then a filled 1px-inset rect in `bg` on top --
+/// `render::Canvas` has no stroke-a-rect-outline primitive (only `fill_rect`/`fill_rounded_rect`/
+/// `fill_circle`, see that module's doc comment), so this is the simplest way to get a
+/// 1px-bordered rect out of fill-only primitives, same trick used nowhere else in this crate
+/// only because nothing else needed a bordered rect until now.
+fn draw_button(canvas: &mut Canvas, text: &mut TextRenderer, rect: LRect, label: &str, primary: bool) {
+    let accent = Color::from_rgba8(0xd9, 0x77, 0x57, 0xff);
+    let (bg, text_color, border) = if primary {
+        (accent, Color::from_rgba8(0xff, 0xff, 0xff, 0xff), None)
+    } else {
+        (
+            Color::from_rgba8(0x2a, 0x2a, 0x2a, 0xff),
+            Color::from_rgba8(0xf0, 0xf0, 0xf0, 0xff),
+            Some(Color::from_rgba8(0x45, 0x45, 0x45, 0xff)),
+        )
+    };
+
+    match border {
+        Some(border_color) => {
+            if let Some(r) = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom) {
+                canvas.fill_rect(r, border_color);
+            }
+            let (left, top, right, bottom) = (rect.left + 1.0, rect.top + 1.0, rect.right - 1.0, rect.bottom - 1.0);
+            if let Some(r) = Rect::from_ltrb(left, top, right, bottom) {
+                canvas.fill_rect(r, bg);
+            }
+        }
+        None => {
+            if let Some(r) = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom) {
+                canvas.fill_rect(r, bg);
+            }
+        }
+    }
+
+    let font_size = 13.0;
+    let text_w = text.text_width(label, font_size);
+    let tx = rect.left + (rect.width() - text_w) / 2.0;
+    // Same close-enough fixed vertical-centering offset the sidebar labels use in `paint` below
+    // (see that call site's own comment on why this isn't real text-metrics-based centering).
+    let ty = rect.top + (rect.height() - font_size) / 2.0;
+    text.draw_text(canvas, tx, ty, label, font_size, text_color);
+}
+
+/// Draws the three buttons into the button bar, given the window's client size. Called from
+/// `paint`.
+fn draw_button_bar(canvas: &mut Canvas, text: &mut TextRenderer, client_w: i32, client_h: i32) {
+    let (reset, cancel, save) = button_rects(client_w, client_h);
+    draw_button(canvas, text, reset, "Reset", false);
+    draw_button(canvas, text, cancel, "Cancel", false);
+    draw_button(canvas, text, save, "Save", true);
 }
 
 /// Index of the section-nav item containing client point `(x, y)`, if any -- mirrors
@@ -907,6 +1172,15 @@ fn paint(
             _ => {}
         }
     }
+
+    // --- Task 13: Save/Cancel/Reset button bar --- a horizontal divider directly above the bar
+    // (same `divider` color the sidebar/content divider above already uses), then the three
+    // buttons themselves.
+    let body_bottom = (BODY_H as f32).min(h);
+    if let Some(bar_divider) = Rect::from_xywh(0.0, body_bottom, w, 1.0f32.min((h - body_bottom).max(0.0))) {
+        canvas.fill_rect(bar_divider, divider);
+    }
+    draw_button_bar(canvas, text, width as i32, height as i32);
 }
 
 #[cfg(test)]
@@ -1065,5 +1339,117 @@ mod tests {
         // implementation detail already covered by the other `compute_position` tests.
         assert!(pos.x >= 0);
         assert!(pos.y >= 0);
+    }
+
+    // --- Task 13: Save/Cancel/Reset button bar ---
+
+    #[test]
+    fn button_at_hits_reset_cancel_save_and_nothing_outside_them() {
+        let (reset, cancel, save) = button_rects(PANEL_W, PANEL_H);
+        let center = |r: LRect| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+
+        let (rx, ry) = center(reset);
+        assert_eq!(button_at(rx, ry, reset, cancel, save), Some(ButtonAction::Reset));
+        let (cx, cy) = center(cancel);
+        assert_eq!(button_at(cx, cy, reset, cancel, save), Some(ButtonAction::Cancel));
+        let (sx, sy) = center(save);
+        assert_eq!(button_at(sx, sy, reset, cancel, save), Some(ButtonAction::Save));
+
+        // The sidebar area (top-left corner) hits no button.
+        assert_eq!(button_at(0.0, 0.0, reset, cancel, save), None);
+    }
+
+    #[test]
+    fn button_rects_reset_is_left_of_cancel_is_left_of_save_all_below_body_h() {
+        let (reset, cancel, save) = button_rects(PANEL_W, PANEL_H);
+        assert!(reset.right <= cancel.left, "Reset must sit left of Cancel, no overlap");
+        assert!(cancel.right <= save.left, "Cancel must sit left of Save, no overlap");
+        assert!(reset.top >= BODY_H as f32, "buttons must be drawn below the unchanged content-area height");
+        assert!(save.right <= PANEL_W as f32, "Save must not overflow the panel's right edge");
+    }
+
+    #[test]
+    fn commit_draft_updates_committed_and_hides_without_touching_disk() {
+        // No `ccum_core::settings::save` call anywhere in this test -- see `commit_draft`'s own
+        // doc comment for why this method exists (a real Save DOES call `save`, exercised only
+        // by native-Windows-run verification, never by `cargo test`, so routine test runs on any
+        // dev machine never write to that machine's real settings.json).
+        let mut panel = Panel::new();
+        let mut s = Settings::default();
+        s.geometry.height = 99;
+        panel.draft = Some(s);
+        panel.visible = true;
+
+        let result = panel.commit_draft();
+
+        assert_eq!(result.as_ref().map(|c| c.geometry.height), Some(99));
+        assert_eq!(panel.committed.as_ref().map(|c| c.geometry.height), Some(99));
+        assert!(!panel.is_visible(), "commit_draft (Save's effect) must hide the panel");
+    }
+
+    #[test]
+    fn commit_draft_returns_none_when_draft_was_never_seeded() {
+        let mut panel = Panel::new();
+        assert!(panel.commit_draft().is_none());
+    }
+
+    #[test]
+    fn cancel_reverts_draft_to_committed_and_hides() {
+        let mut panel = Panel::new();
+        let committed = Settings::default();
+        let mut edited = committed.clone();
+        edited.geometry.height = 123;
+        panel.committed = Some(committed.clone());
+        panel.draft = Some(edited);
+        panel.visible = true;
+
+        let result = panel.handle_button_action(ButtonAction::Cancel);
+
+        assert!(result.is_none(), "Cancel must never return Some -- nothing is persisted");
+        assert!(!panel.is_visible(), "Cancel must close the panel");
+        assert_eq!(
+            panel.draft.as_ref().map(|d| d.geometry.height),
+            Some(committed.geometry.height),
+            "Cancel must discard draft's in-progress edit, reverting to committed"
+        );
+    }
+
+    #[test]
+    fn reset_rebuilds_draft_from_default_preserving_position_of_committed_not_of_draft() {
+        // Distinguishes committed vs. draft as Reset's source: committed's tray_offset (42) must
+        // survive Reset; draft's own unsaved edit to that same field (999) must NOT.
+        let mut panel = Panel::new();
+        let mut committed = Settings::default();
+        committed.tray_offset = 42;
+        let mut edited = committed.clone();
+        edited.tray_offset = 999; // an in-progress, unsaved edit to a state-derived field
+        edited.geometry.height = 12345; // an in-progress, unsaved appearance-ish edit
+        panel.committed = Some(committed.clone());
+        panel.draft = Some(edited);
+        panel.visible = true;
+
+        let result = panel.handle_button_action(ButtonAction::Reset);
+
+        assert!(result.is_none(), "Reset must never return Some -- nothing is persisted");
+        assert!(panel.is_visible(), "Reset must NOT close the panel");
+        let draft = panel.draft.as_ref().expect("Reset must leave draft seeded");
+        assert_eq!(
+            draft.tray_offset, 42,
+            "Reset must preserve committed's state-derived fields, not draft's in-progress edit"
+        );
+        assert_eq!(
+            draft.geometry.height,
+            Settings::default().geometry.height,
+            "Reset discards appearance/geometry edits (from either committed or draft) back to Settings::default()"
+        );
+    }
+
+    #[test]
+    fn reset_is_a_noop_when_committed_was_never_seeded() {
+        let mut panel = Panel::new();
+        panel.visible = true;
+        let result = panel.handle_button_action(ButtonAction::Reset);
+        assert!(result.is_none());
+        assert!(panel.draft.is_none(), "no committed settings to reset from -- draft stays unseeded");
     }
 }
