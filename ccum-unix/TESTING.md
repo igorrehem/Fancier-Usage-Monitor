@@ -44,11 +44,24 @@ From an actual macOS or Linux checkout (not this Windows machine):
 
 ```sh
 # macOS: Xcode command-line tools must be installed (cc, the system SDK).
-# Linux: needs GTK3 + libappindicator dev headers (e.g. Debian/Ubuntu:
-#   sudo apt install libgtk-3-dev libappindicator3-dev pkg-config
+# Linux: needs GTK3 + libappindicator dev headers plus libxdo (e.g. Debian/Ubuntu:
+#   sudo apt install libgtk-3-dev libappindicator3-dev libxdo-dev pkg-config
 # ), plus OpenSSL dev headers (libssl-dev) for native-tls.
 cargo build -p ccum-unix --release
 ```
+
+Verified on real Linux (Ubuntu 24.04 server, 2026-07-12): with the packages above the whole
+workspace slice (`ccum-core` + `ccum-unix`) compiles, links, and passes its test suite natively.
+Two gaps the original guess-list missed, both found on that first run:
+
+- **`libxdo-dev` is required at link time** (`rust-lld: unable to find library -lxdo`) — it is a
+  real dependency of `muda`/`tray-icon`'s Linux backend, missing from the original package list.
+- **`libxkbcommon-x11` is required at runtime** (Debian/Ubuntu package `libxkbcommon-x11-0`):
+  `winit`'s X11 backend dlopens it and aborts at startup when absent. Present on normal desktop
+  installs, missing on minimal/server systems. Under a headless `xvfb-run` smoke test the app
+  then runs and stays alive; GTK prints tray-related `Gtk-CRITICAL` warnings because no
+  StatusNotifier tray host exists there (the known limitation in item 1 below), but does not
+  crash.
 
 The binary lands at `target/release/ccum-unix` (no `.exe` extension, unlike the Windows build).
 There is no installer/packaging step — see "Known, accepted limitations" below.

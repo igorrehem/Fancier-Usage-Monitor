@@ -605,6 +605,10 @@ mod tests {
 
     // --- settings_path() -- see that function's own per-OS doc comments ---
 
+    // Windows-only: on other OSes PathBuf::join uses `/`, so the raw-string
+    // comparison below only holds when compiled for Windows (found on first
+    // real-Linux test run, 2026-07-12).
+    #[cfg(target_os = "windows")]
     #[test]
     fn join_settings_path_windows_convention() {
         let base = PathBuf::from(r"C:\Users\test\AppData\Roaming");
