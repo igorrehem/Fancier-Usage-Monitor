@@ -1,3 +1,12 @@
+// This module holds the platform-agnostic parts of localization: the `LanguageId` enum, the
+// `Strings` table type, the 10 locale data tables, and locale-code parsing/lookup -- none of
+// which touch any OS API. System UI-language *detection* (reading the actual OS setting) is
+// inherently platform-specific and lives in each platform crate instead: see
+// `ccum-windows::localization` for `resolve_language`/`detect_system_language`, which are
+// implemented via the Win32 Globalization APIs and re-export everything from this module so
+// existing `ccum-windows` call sites (`use crate::localization::{self, LanguageId, Strings};`)
+// keep working unchanged after the Task 1 workspace split.
+
 mod dutch;
 mod english;
 mod french;
@@ -8,12 +17,6 @@ mod portuguese_brazil;
 mod russian;
 mod spanish;
 mod traditional_chinese;
-
-use windows::core::PWSTR;
-use windows::Win32::Globalization::{
-    GetUserDefaultLocaleName, GetUserDefaultUILanguage, GetUserPreferredUILanguages,
-    LCIDToLocaleName, LOCALE_ALLOW_NEUTRAL_NAMES, MAX_LOCALE_NAME, MUI_LANGUAGE_NAME,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanguageId {
@@ -236,84 +239,9 @@ pub struct Strings {
     pub preset_category_apps: &'static str,
 }
 
-pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
-    language_override.unwrap_or_else(detect_system_language)
-}
-
-pub fn detect_system_language() -> LanguageId {
-    preferred_ui_languages()
-        .into_iter()
-        .find_map(|locale| LanguageId::from_code(&locale))
-        .or_else(default_ui_locale)
-        .or_else(default_locale_name)
-        .unwrap_or(LanguageId::English)
-}
-
+/// Looks up the winget-update-instructions label for `language`. Purely a `Strings`-table
+/// lookup (no OS dependency), unlike `resolve_language`/`detect_system_language`
+/// (`ccum-windows::localization`), which actually query the OS for its UI language.
 pub fn update_via_winget(language: LanguageId) -> &'static str {
     language.update_via_winget_label()
-}
-
-fn preferred_ui_languages() -> Vec<String> {
-    unsafe {
-        let mut num_languages = 0u32;
-        let mut buffer_len = 0u32;
-        if GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &mut num_languages,
-            PWSTR::null(),
-            &mut buffer_len,
-        )
-        .is_err()
-            || buffer_len == 0
-        {
-            return Vec::new();
-        }
-
-        let mut buffer = vec![0u16; buffer_len as usize];
-        if GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &mut num_languages,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut buffer_len,
-        )
-        .is_err()
-        {
-            return Vec::new();
-        }
-
-        buffer
-            .split(|unit| *unit == 0)
-            .filter(|part| !part.is_empty())
-            .map(String::from_utf16_lossy)
-            .collect()
-    }
-}
-
-fn default_ui_locale() -> Option<LanguageId> {
-    unsafe {
-        let lang_id = GetUserDefaultUILanguage();
-        let mut buffer = [0u16; MAX_LOCALE_NAME as usize];
-        let len = LCIDToLocaleName(
-            lang_id as u32,
-            Some(&mut buffer),
-            LOCALE_ALLOW_NEUTRAL_NAMES,
-        );
-        if len <= 1 {
-            return None;
-        }
-        let locale = String::from_utf16_lossy(&buffer[..(len as usize - 1)]);
-        LanguageId::from_code(&locale)
-    }
-}
-
-fn default_locale_name() -> Option<LanguageId> {
-    unsafe {
-        let mut buffer = [0u16; MAX_LOCALE_NAME as usize];
-        let len = GetUserDefaultLocaleName(&mut buffer);
-        if len <= 1 {
-            return None;
-        }
-        let locale = String::from_utf16_lossy(&buffer[..(len as usize - 1)]);
-        LanguageId::from_code(&locale)
-    }
 }

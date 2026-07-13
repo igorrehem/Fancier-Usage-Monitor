@@ -1,18 +1,22 @@
 // Settings schema, defaults, and migration for Claude Code Usage Monitor.
 //
-// This module owns the on-disk settings file (`%APPDATA%\ClaudeCodeUsageMonitor\settings.json`)
-// and the full settings schema: the legacy state fields (tray offset, poll interval, visibility
-// toggles, etc.) plus the newer appearance/typography/geometry/animation sections used by the
-// settings window and renderer.
+// This module owns the on-disk settings file and the full settings schema: the legacy state
+// fields (tray offset, poll interval, visibility toggles, etc.) plus the newer
+// appearance/typography/geometry/animation sections used by the settings window and renderer.
+//
+// The on-disk location (`settings_path()`, below) is OS-specific -- see that function's own
+// per-`#[cfg(target_os = ...)]` doc comments:
+//   - Windows: `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`
+//   - macOS:   `~/Library/Application Support/ClaudeCodeUsageMonitor/settings.json`
+//   - Linux:   `$XDG_CONFIG_HOME/claude-code-usage-monitor/settings.json`, falling back to
+//              `~/.config/claude-code-usage-monitor/settings.json`
 //
 // `load()` is the migration path: any missing field (including entirely new sections) falls back
 // to its serde default, so a settings.json written by an older build just gains the new sections
 // with default values the first time it's loaded.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
-use crate::native_interop::Color;
+use std::path::{Path, PathBuf};
 
 /// Current on-disk schema version. Bump this if a future migration needs to distinguish
 /// old-shape files from new-shape files at runtime.
@@ -45,36 +49,18 @@ fn default_show_antigravity() -> bool {
     false
 }
 
-/// Plain serializable RGBA color, decoupled from the native `Color` helper so the settings
-/// schema doesn't depend on native_interop's Windows-specific conversions.
+/// Plain serializable RGBA color, decoupled from any native/GDI color helper so the settings
+/// schema (this crate, `ccum-core`) has zero dependency on OS-specific rendering code. Platforms
+/// (`ccum-windows`'s `native_interop::Color`, and in a later task `ccum-unix`'s own color type)
+/// convert to/from this at their own boundary via free functions local to that crate --
+/// `ccum-windows`'s `native_interop::rgba_to_color`/`color_to_rgba`, for example -- rather than
+/// this struct knowing about any native color type.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Rgba {
     pub r: u8,
     pub g: u8,
     pub b: u8,
     pub a: u8,
-}
-
-impl Rgba {
-    #[allow(dead_code)] // used by the settings window / renderer in a later task
-    pub fn to_color(&self) -> Color {
-        Color {
-            r: self.r,
-            g: self.g,
-            b: self.b,
-            a: self.a,
-        }
-    }
-
-    #[allow(dead_code)] // used by the settings window / renderer in a later task
-    pub fn from_color(c: Color) -> Rgba {
-        Rgba {
-            r: c.r,
-            g: c.g,
-            b: c.b,
-            a: c.a,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -448,11 +434,64 @@ impl Settings {
     }
 }
 
+/// Pure, `cfg`-independent path-joining logic shared by every OS's `settings_path()` below:
+/// given an already-resolved base directory and an app-folder name, produces
+/// `base/app_dir_name/settings.json`. Extracted specifically so this logic has direct test
+/// coverage on ANY host OS this crate is built on: the real `settings_path()` functions are
+/// each `#[cfg(target_os = ...)]`-gated, so only the branch matching whatever OS actually
+/// compiles this crate can be exercised directly by a `#[test]` here (see the
+/// `settings_path_windows_matches_appdata_env_var` test below, which runs for real on this
+/// Windows dev machine) -- this helper lets the macOS/Linux path CONVENTIONS still get genuine
+/// test coverage in this same file, by exercising the join logic against hypothetical base
+/// directories for all three OSes' conventions, even though the `#[cfg(target_os = "macos")]`/
+/// `#[cfg(target_os = "linux")]` functions that actually call it in production never compile
+/// here.
+fn join_settings_path(base: &Path, app_dir_name: &str) -> PathBuf {
+    base.join(app_dir_name).join("settings.json")
+}
+
+/// Windows: `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`. UNCHANGED from this function's
+/// pre-macOS/Linux-port form -- byte-for-byte identical logic -- since this is a zero-regression
+/// boundary for the real, currently-running production `ccum-windows` app (see this module's
+/// doc comment). Deliberately NOT routed through the `dirs` crate's `config_dir()` (which also
+/// happens to resolve to `%APPDATA%` on Windows -- confirmed against `dirs` 6.x's own Windows
+/// backend) specifically to keep this one call site's risk at literally zero: the exact original
+/// `std::env::var("APPDATA")` call, unmodified, still decides the path; only the trailing
+/// `.join(...).join(...)` was factored out into `join_settings_path` above (a pure refactor of
+/// the join step, not a behavior change -- verified by
+/// `settings_path_windows_matches_appdata_env_var` below).
+#[cfg(target_os = "windows")]
 pub fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata)
-        .join("ClaudeCodeUsageMonitor")
-        .join("settings.json")
+    join_settings_path(&PathBuf::from(appdata), "ClaudeCodeUsageMonitor")
+}
+
+/// macOS: `~/Library/Application Support/ClaudeCodeUsageMonitor/settings.json`, per the design
+/// spec (`docs/superpowers/specs/2026-07-11-macos-linux-port-design.md` §4). `dirs::config_dir()`
+/// resolves to exactly `~/Library/Application Support` on macOS (confirmed by reading `dirs`
+/// 6.0.0's own `src/mac.rs`: `config_dir`/`data_dir`/`data_local_dir` all alias to the same
+/// `home_dir().join("Library/Application Support")` helper) -- no hand-rolled `$HOME` join
+/// needed. Falls back to `.` (matching the Windows branch's own `unwrap_or_else` fallback above)
+/// in the vanishingly rare case `dirs` can't resolve a home directory at all.
+#[cfg(target_os = "macos")]
+pub fn settings_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    join_settings_path(&base, "ClaudeCodeUsageMonitor")
+}
+
+/// Linux: XDG Base Directory -- `$XDG_CONFIG_HOME/claude-code-usage-monitor/settings.json`,
+/// falling back to `~/.config/claude-code-usage-monitor/settings.json` if `$XDG_CONFIG_HOME` is
+/// unset, per the design spec §4. `dirs::config_dir()` already implements exactly this
+/// `$XDG_CONFIG_HOME`-or-`~/.config` resolution on Linux (confirmed by reading `dirs` 6.0.0's
+/// own `src/lin.rs`: `env::var_os("XDG_CONFIG_HOME")...or_else(|| home_dir().map(|h|
+/// h.join(".config")))`), so no hand-rolled env-var/`$HOME` fallback logic is needed here
+/// either. Note the different app-folder naming convention from Windows/macOS:
+/// `claude-code-usage-monitor` kebab-case, not `ClaudeCodeUsageMonitor` -- the Linux/XDG
+/// convention, per the design spec.
+#[cfg(target_os = "linux")]
+pub fn settings_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    join_settings_path(&base, "claude-code-usage-monitor")
 }
 
 /// Load settings from disk, applying defaults for anything missing or unparsable.
@@ -562,5 +601,56 @@ mod tests {
         let back: Settings = serde_json::from_str(&js).unwrap();
         assert_eq!(back.geometry.height, 40);
         assert_eq!(back.appearance.background, Some(Rgba { r: 1, g: 2, b: 3, a: 4 }));
+    }
+
+    // --- settings_path() -- see that function's own per-OS doc comments ---
+
+    // Windows-only: on other OSes PathBuf::join uses `/`, so the raw-string
+    // comparison below only holds when compiled for Windows (found on first
+    // real-Linux test run, 2026-07-12).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn join_settings_path_windows_convention() {
+        let base = PathBuf::from(r"C:\Users\test\AppData\Roaming");
+        let p = join_settings_path(&base, "ClaudeCodeUsageMonitor");
+        assert_eq!(p, PathBuf::from(r"C:\Users\test\AppData\Roaming\ClaudeCodeUsageMonitor\settings.json"));
+    }
+
+    #[test]
+    fn join_settings_path_macos_convention() {
+        let base = PathBuf::from("/Users/test/Library/Application Support");
+        let p = join_settings_path(&base, "ClaudeCodeUsageMonitor");
+        assert_eq!(p, PathBuf::from("/Users/test/Library/Application Support/ClaudeCodeUsageMonitor/settings.json"));
+    }
+
+    #[test]
+    fn join_settings_path_linux_xdg_config_home_convention() {
+        // A hypothetical explicit $XDG_CONFIG_HOME.
+        let base = PathBuf::from("/home/test/.config-custom");
+        let p = join_settings_path(&base, "claude-code-usage-monitor");
+        assert_eq!(p, PathBuf::from("/home/test/.config-custom/claude-code-usage-monitor/settings.json"));
+    }
+
+    #[test]
+    fn join_settings_path_linux_home_config_fallback_convention() {
+        // The ~/.config fallback used when $XDG_CONFIG_HOME is unset.
+        let base = PathBuf::from("/home/test/.config");
+        let p = join_settings_path(&base, "claude-code-usage-monitor");
+        assert_eq!(p, PathBuf::from("/home/test/.config/claude-code-usage-monitor/settings.json"));
+    }
+
+    /// THE critical zero-regression check for the macOS/Linux settings-persistence work: confirms
+    /// the REAL, compiled-for-Windows `settings_path()` still resolves to exactly
+    /// `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`, matching this function's pre-port
+    /// behavior byte for byte -- see this module's doc comment. This is load-bearing: the real,
+    /// currently-running production `ccum-windows` app on this dev machine reads/writes its
+    /// settings at this exact path, so a mistake here would silently relocate where it looks.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_path_windows_matches_appdata_env_var() {
+        let appdata = std::env::var("APPDATA")
+            .expect("APPDATA should be set on this Windows machine (it's how the OS itself locates AppData\\Roaming)");
+        let expected = PathBuf::from(appdata).join("ClaudeCodeUsageMonitor").join("settings.json");
+        assert_eq!(settings_path(), expected);
     }
 }

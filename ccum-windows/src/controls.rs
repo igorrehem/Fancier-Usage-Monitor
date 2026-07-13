@@ -8,8 +8,8 @@ use windows::Win32::Foundation::{COLORREF, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
 
-use crate::native_interop::Color;
-use crate::settings::Rgba;
+use crate::native_interop::{self, Color};
+use ccum_core::settings::Rgba;
 
 /// Result of feeding a mouse message to a `Control`.
 #[allow(dead_code)] // consumed by the settings window (Tasks 11-15), not yet wired up
@@ -553,9 +553,9 @@ impl Control for RgbaPicker {
             // Closed row: swatch + hex readout + disclosure arrow. Always drawn, whether
             // or not the popover is open.
             let swatch = self.swatch_rect(rect);
-            draw_checkerboard_swatch(hdc, swatch, &self.value.to_color());
+            draw_checkerboard_swatch(hdc, swatch, &native_interop::rgba_to_color(self.value));
 
-            let hex = self.value.to_color().to_hex();
+            let hex = native_interop::rgba_to_color(self.value).to_hex();
             let mut hex_wide: Vec<u16> = hex.encode_utf16().collect();
             let mut hex_rect = RECT {
                 left: swatch.right + HEX_GAP,
@@ -603,7 +603,7 @@ impl Control for RgbaPicker {
 
             for i in 0..QUICK_SWATCHES.len() {
                 let cell = self.swatch_cell_rect(i, rect);
-                let swatch_color = QUICK_SWATCHES[i].to_color();
+                let swatch_color = native_interop::rgba_to_color(QUICK_SWATCHES[i]);
                 if self.value == QUICK_SWATCHES[i] {
                     draw_rounded_rect(hdc, &cell, &highlight, 4);
                     let inset = RECT {

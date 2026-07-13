@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+#[cfg(target_os = "windows")]
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
@@ -22,6 +24,7 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
 ];
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
@@ -144,6 +147,7 @@ struct AntigravityQuotaSummaryBucket {
     reset_time: Option<String>,
 }
 
+#[cfg(target_os = "windows")]
 #[repr(C)]
 struct CredentialW {
     flags: u32,
@@ -160,6 +164,7 @@ struct CredentialW {
     user_name: *mut u16,
 }
 
+#[cfg(target_os = "windows")]
 #[link(name = "Advapi32")]
 extern "system" {
     fn CredReadW(
@@ -322,6 +327,7 @@ fn cli_refresh_token(source: &CredentialSource) {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn cli_refresh_windows_token() {
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
@@ -372,6 +378,17 @@ fn cli_refresh_windows_token() {
     }
 }
 
+/// Non-Windows counterpart of `cli_refresh_windows_token`: on macOS/Linux the
+/// `claude` CLI (if installed) runs directly on the host — there's no
+/// `.cmd`/`where.exe`/`cmd.exe` launcher convention to resolve, so we just
+/// invoke it through a login-less POSIX shell the same way the WSL bridge
+/// used to invoke it *inside* the WSL guest. See `cli_refresh_claude_posix`.
+#[cfg(not(target_os = "windows"))]
+fn cli_refresh_windows_token() {
+    cli_refresh_claude_posix();
+}
+
+#[cfg(target_os = "windows")]
 fn cli_refresh_wsl_token(distro: &str) {
     diagnose::log(format!(
         "attempting WSL Claude token refresh in distro {distro}"
@@ -401,6 +418,49 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
+/// Non-Windows counterpart of `cli_refresh_wsl_token`. WSL itself doesn't
+/// exist on macOS/Linux, so `distro` is not meaningful here — in practice
+/// this arm is unreachable on these platforms because `list_wsl_distros()`
+/// returns an empty list below, so `CredentialSource::Wsl` is never
+/// constructed. It's still implemented (rather than left a no-op) as
+/// defense in depth: it performs the same direct POSIX refresh as the
+/// native path, since that's the closest equivalent to "run `claude`
+/// without any bridging layer."
+#[cfg(not(target_os = "windows"))]
+fn cli_refresh_wsl_token(_distro: &str) {
+    cli_refresh_claude_posix();
+}
+
+/// Refresh the Claude CLI's OAuth token by invoking it directly on a POSIX
+/// host (macOS/Linux), with no WSL-style bridging layer and no
+/// `creation_flags` (that's a Windows-only `Command` concept). This mirrors
+/// the inner shell script the Windows build used to run *inside* a WSL
+/// distro, since on a real macOS/Linux machine `claude` already runs
+/// natively on the host.
+#[cfg(not(target_os = "windows"))]
+fn cli_refresh_claude_posix() {
+    diagnose::log("attempting POSIX Claude token refresh via claude on PATH");
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg("if command -v claude >/dev/null 2>&1; then claude -p .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p .; else exit 127; fi")
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(error) => {
+            diagnose::log_error("unable to spawn POSIX Claude token refresh", error);
+            return;
+        }
+    };
+
+    wait_for_refresh(&mut child);
+}
+
+#[cfg(target_os = "windows")]
 fn cli_refresh_codex_token() {
     let codex_path = resolve_windows_codex_path();
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
@@ -445,8 +505,34 @@ fn cli_refresh_codex_token() {
     wait_for_refresh(&mut child);
 }
 
+/// Non-Windows counterpart of `cli_refresh_codex_token`: on macOS/Linux
+/// `codex` (if installed) is a normal POSIX executable/shell script on
+/// `$PATH` — there's no `.cmd`/`.ps1`/`cmd.exe`/`powershell.exe` launcher
+/// convention to resolve, so we invoke it directly.
+#[cfg(not(target_os = "windows"))]
+fn cli_refresh_codex_token() {
+    diagnose::log("attempting POSIX Codex token refresh via codex on PATH");
+    let mut cmd = Command::new("codex");
+    cmd.args(["exec", "."])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(error) => {
+            diagnose::log_error("unable to spawn POSIX Codex token refresh", error);
+            return;
+        }
+    };
+
+    wait_for_refresh(&mut child);
+}
+
 /// Spawn a command and wait up to `timeout` for it to finish.
 /// Returns None if the process fails to start or exceeds the deadline.
+/// Only used by the Windows-only WSL-bridge helpers below.
+#[cfg(target_os = "windows")]
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
     let mut child = cmd.spawn().ok()?;
     let start = std::time::Instant::now();
@@ -485,6 +571,7 @@ fn wait_for_refresh(child: &mut std::process::Child) {
 }
 
 /// Resolve the full path to the `claude` CLI executable.
+#[cfg(target_os = "windows")]
 fn resolve_windows_claude_path() -> String {
     for name in &["claude.cmd", "claude"] {
         if Command::new(name)
@@ -520,6 +607,7 @@ fn resolve_windows_claude_path() -> String {
     "claude.cmd".to_string()
 }
 
+#[cfg(target_os = "windows")]
 fn resolve_windows_codex_path() -> String {
     for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
         if Command::new(name)
@@ -596,6 +684,12 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
     sources
 }
 
+/// Despite the `Windows`/`windows_` naming (kept for minimal diff against
+/// the pre-port code), this resolves the native, non-bridged credentials
+/// file path via `dirs::home_dir()` and plain `std::fs` reads — it is
+/// already fully portable and needs no OS-specific handling. It applies
+/// equally to macOS/Linux, where `claude` (if installed) also stores its
+/// credentials at `~/.claude/.credentials.json`.
 fn windows_credential_source() -> Option<CredentialSource> {
     let home = dirs::home_dir()?;
     Some(CredentialSource::Windows(
@@ -626,6 +720,7 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
     let output = run_with_timeout(
         Command::new("wsl.exe")
@@ -652,6 +747,17 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
     };
 
     Some(format!("wsl:{distro}|{state}"))
+}
+
+/// WSL doesn't exist on macOS/Linux, so there is nothing to probe here.
+/// This is unreachable in practice on these platforms since
+/// `list_wsl_distros()` returns an empty list, so `CredentialSource::Wsl`
+/// is never constructed — kept as a real function (rather than omitted) so
+/// `credential_watch_signature`'s match stays exhaustive without `cfg` on
+/// the `CredentialSource` enum itself.
+#[cfg(not(target_os = "windows"))]
+fn wsl_credential_watch_signature(_distro: &str) -> Option<String> {
+    None
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
@@ -1262,6 +1368,7 @@ fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn read_windows_generic_credential(target: &str) -> Option<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
@@ -1300,6 +1407,85 @@ fn read_windows_generic_credential(target: &str) -> Option<String> {
     result
 }
 
+/// macOS counterpart of `read_windows_generic_credential`. Windows stores
+/// this via Credential Manager (`CredReadW`); the closest macOS analog is
+/// Keychain's "generic password" store, addressed by service name via the
+/// `security` CLI (no extra crate dependency needed).
+///
+/// BEST-EFFORT / UNCONFIRMED: this assumes Antigravity, if installed on
+/// macOS, stores its token as a generic-password Keychain item whose
+/// service name matches `target` (`"gemini:antigravity"`). That naming
+/// convention has not been verified against a real macOS Antigravity
+/// install — if it stores credentials differently (e.g. under a different
+/// service/account name, or in its own file), this will fail closed
+/// (return `None`) and Antigravity support will silently be unavailable on
+/// macOS until corrected against the real client.
+#[cfg(target_os = "macos")]
+fn read_windows_generic_credential(target: &str) -> Option<String> {
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(target)
+        .arg("-w")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        diagnose::log(format!(
+            "unable to read macOS Keychain generic credential target {target}"
+        ));
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Linux counterpart of `read_windows_generic_credential`.
+///
+/// TODO(macos-linux-port): Linux has no single standard secret store for
+/// CLI tools — it varies by desktop environment (libsecret/GNOME Keyring,
+/// KWallet) or is often just a plain credentials file, the way Claude Code
+/// and Codex already store theirs (see `read_windows_credentials` and
+/// `codex_auth_path`). This is a BEST-EFFORT, UNCONFIRMED attempt via
+/// `secret-tool` (part of `libsecret-tools`, common on GNOME-based
+/// distros), guessing that Antigravity would register its token under a
+/// `service` attribute equal to `target`. If Antigravity on Linux instead
+/// uses a different secret backend, a different attribute schema, or a
+/// plain file, this will fail closed (return `None`) rather than crash —
+/// Antigravity support will silently be unavailable on Linux until this is
+/// corrected against a real installation.
+#[cfg(target_os = "linux")]
+fn read_windows_generic_credential(target: &str) -> Option<String> {
+    let output = Command::new("secret-tool")
+        .arg("lookup")
+        .arg("service")
+        .arg(target)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        diagnose::log(format!(
+            "unable to read Linux secret-service generic credential target {target}"
+        ));
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
     let output = run_with_timeout(
         Command::new("wsl.exe")
@@ -1330,6 +1516,14 @@ fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
             distro: distro.to_string(),
         },
     )
+}
+
+/// WSL doesn't exist on macOS/Linux, so there is nothing to read here. In
+/// practice this is unreachable on these platforms — see the comment on
+/// `wsl_credential_watch_signature`'s non-Windows counterpart.
+#[cfg(not(target_os = "windows"))]
+fn read_wsl_credentials(_distro: &str) -> Option<Credentials> {
+    None
 }
 
 fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credentials> {
@@ -1375,6 +1569,7 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
     None
 }
 
+#[cfg(target_os = "windows")]
 fn list_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
         Command::new("wsl.exe")
@@ -1400,6 +1595,17 @@ fn list_wsl_distros() -> Vec<String> {
         .collect()
 }
 
+/// WSL doesn't exist on macOS/Linux — there is nothing to enumerate. This
+/// is what makes `CredentialSource::Wsl` and the various `_wsl_`-suffixed
+/// non-Windows stubs above unreachable in practice on these platforms.
+#[cfg(not(target_os = "windows"))]
+fn list_wsl_distros() -> Vec<String> {
+    Vec::new()
+}
+
+/// Only used by the Windows-only WSL-bridge helpers above (`list_wsl_distros`,
+/// `wsl_credential_watch_signature`) to decode `wsl.exe`'s UTF-16LE output.
+#[cfg(target_os = "windows")]
 fn decode_wsl_text(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
@@ -1412,6 +1618,7 @@ fn decode_wsl_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+#[cfg(target_os = "windows")]
 fn decode_utf16le(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 2 || bytes.len() % 2 != 0 {
         return None;
@@ -1433,6 +1640,7 @@ fn decode_utf16le(bytes: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
+#[cfg(target_os = "windows")]
 fn looks_like_utf16le(bytes: &[u8]) -> bool {
     let sample_len = bytes.len().min(128);
     let units = sample_len / 2;

@@ -63,11 +63,12 @@ fn rgba(r: u8, g: u8, b: u8) -> Rgba {
 }
 
 /// All 24 `PresetId` variants (4 original + 20 added in Task 3), in `PresetId`'s own
-/// declaration order. `pub(crate)` (rather than test-only) because the Presets grid
-/// (`config_window.rs`, Task 5) needs this exact 24-entry list to build its card grid, and the
-/// unit tests below reuse the same const rather than duplicating the 24-entry literal a second
-/// time.
-pub(crate) const ALL_PRESET_IDS: [PresetId; 24] = [
+/// declaration order. `pub` (was `pub(crate)` before the Task 1 workspace split, back when
+/// `config_window.rs` shared this crate) because the Presets grid (`config_window.rs`, now in
+/// the separate `ccum-windows` crate) needs this exact 24-entry list to build its card grid, and
+/// the unit tests below reuse the same const rather than duplicating the 24-entry literal a
+/// second time.
+pub const ALL_PRESET_IDS: [PresetId; 24] = [
     PresetId::Default,
     PresetId::Glass,
     PresetId::Neon,

@@ -14,20 +14,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCap
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::animation::{AnimationClock, AnimationFrame};
 use crate::config_window;
-use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
 use crate::native_interop::{
     self, Color, IDT_ANIM, IDT_TRAY_CLICK_DEBOUNCE, TIMER_COUNTDOWN, TIMER_POLL,
     TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
-use crate::poller;
-use crate::settings;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use ccum_core::animation::{AnimationClock, AnimationFrame};
+use ccum_core::diagnose;
+use ccum_core::models::AppUsageData;
+use ccum_core::poller;
+use ccum_core::settings;
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -462,7 +462,7 @@ fn save_state_settings() {
         settings.show_claude_code = s.show_claude_code;
         settings.show_codex = s.show_codex;
         settings.show_antigravity = s.show_antigravity;
-        crate::settings::save(&settings);
+        ccum_core::settings::save(&settings);
         store_settings(settings);
     }
 }
@@ -1552,7 +1552,7 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let settings = crate::settings::load();
+        let settings = ccum_core::settings::load();
         store_settings(settings.clone());
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
@@ -1780,9 +1780,9 @@ fn derive_colors(appearance: &settings::Appearance, is_dark: bool) -> (Color, Co
     };
     // Option-override model: `None` (the default) reproduces today's adaptive colors
     // exactly; `Some(rgba)` overrides them.
-    let track = appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
-    let text_color = appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
-    let bg_color = appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
+    let track = appearance.divider.map(native_interop::rgba_to_color).unwrap_or(track_default);
+    let text_color = appearance.text.map(native_interop::rgba_to_color).unwrap_or(text_default);
+    let bg_color = appearance.background.map(native_interop::rgba_to_color).unwrap_or(bg_default);
     (bg_color, text_color, track)
 }
 
@@ -3657,9 +3657,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
     };
     // Option-override model: `None` (the default) reproduces today's adaptive colors
     // exactly; `Some(rgba)` overrides them.
-    let track = cfg.appearance.divider.map(|r| r.to_color()).unwrap_or(track_default);
-    let text_color = cfg.appearance.text.map(|r| r.to_color()).unwrap_or(text_default);
-    let bg_color = cfg.appearance.background.map(|r| r.to_color()).unwrap_or(bg_default);
+    let track = cfg.appearance.divider.map(native_interop::rgba_to_color).unwrap_or(track_default);
+    let text_color = cfg.appearance.text.map(native_interop::rgba_to_color).unwrap_or(text_default);
+    let bg_color = cfg.appearance.background.map(native_interop::rgba_to_color).unwrap_or(bg_default);
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -3849,9 +3849,9 @@ fn model_usage_width(segment_count: i32, geometry: &settings::Geometry) -> i32 {
 /// the lower half blends calm→attention, the upper half blends attention→critical.
 fn palette_color(stops: &settings::PaletteStops, p: f32) -> Color {
     let p = p.clamp(0.0, 1.0);
-    let calm = stops.calm.to_color();
-    let attention = stops.attention.to_color();
-    let critical = stops.critical.to_color();
+    let calm = native_interop::rgba_to_color(stops.calm);
+    let attention = native_interop::rgba_to_color(stops.attention);
+    let critical = native_interop::rgba_to_color(stops.critical);
     if p < 0.5 {
         calm.lerp(&attention, p * 2.0)
     } else {

@@ -214,6 +214,33 @@ pub struct Color {
     pub a: u8,
 }
 
+/// Convert a `ccum-core` settings `Rgba` (platform-agnostic, serializable) into a native
+/// `Color`. This is the `ccum-windows`-side half of the boundary the Task 1 workspace split
+/// introduced: `ccum_core::settings::Rgba` deliberately has no knowledge of this GDI-adjacent
+/// `Color` type (see `Rgba`'s doc comment in `ccum-core`), so the two directions of conversion
+/// (`rgba_to_color`/`color_to_rgba`) live here instead, replacing what used to be
+/// `Rgba::to_color()`/`Rgba::from_color()` inherent methods before the split.
+pub fn rgba_to_color(r: ccum_core::settings::Rgba) -> Color {
+    Color {
+        r: r.r,
+        g: r.g,
+        b: r.b,
+        a: r.a,
+    }
+}
+
+/// Convert a native `Color` into a `ccum-core` settings `Rgba` (e.g. for persisting an
+/// adaptive-default color as a fixed override). See `rgba_to_color` for why this lives here
+/// rather than as a method on either type.
+pub fn color_to_rgba(c: Color) -> ccum_core::settings::Rgba {
+    ccum_core::settings::Rgba {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: c.a,
+    }
+}
+
 impl Color {
     #[allow(dead_code)]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
