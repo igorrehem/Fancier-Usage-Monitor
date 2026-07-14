@@ -1,4 +1,4 @@
-// ccum-unix: macOS + Linux entry point for Claude Code Usage Monitor.
+// ccum-unix: macOS + Linux entry point for Fancier Usage Monitor.
 //
 // Task 7 scope: replace Task 6's placeholder rect+text paint with the real usage-bar widget
 // (`render::bars::draw_bars`), driven by a genuine `ccum_core::animation::AnimationClock`
@@ -267,7 +267,7 @@ impl ApplicationHandler<AppEvent> for App {
         // for `Logical` here just meant every later read of that size was already "wrong" by
         // the scale factor before `bars.rs` ever saw it.
         let attributes = Window::default_attributes()
-            .with_title("Claude Code Usage Monitor")
+            .with_title("Fancier Usage Monitor")
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Rc::new(window),

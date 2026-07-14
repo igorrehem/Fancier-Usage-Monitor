@@ -3,7 +3,7 @@ name = "ccum-unix"
 version = "1.5.0"
 edition = "2021"
 license = "MIT"
-description = "Claude Code Usage Monitor (macOS/Linux)"
+description = "Fancier Usage Monitor (macOS/Linux)"
 publish = false
 
 # Task 4 note: this is a "hello world" skeleton -- winit event loop, one blank window, a

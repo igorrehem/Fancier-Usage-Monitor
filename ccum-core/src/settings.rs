@@ -1,4 +1,4 @@
-// Settings schema, defaults, and migration for Claude Code Usage Monitor.
+// Settings schema, defaults, and migration for Fancier Usage Monitor.
 //
 // This module owns the on-disk settings file and the full settings schema: the legacy state
 // fields (tray offset, poll interval, visibility toggles, etc.) plus the newer
@@ -6,10 +6,10 @@
 //
 // The on-disk location (`settings_path()`, below) is OS-specific -- see that function's own
 // per-`#[cfg(target_os = ...)]` doc comments:
-//   - Windows: `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`
-//   - macOS:   `~/Library/Application Support/ClaudeCodeUsageMonitor/settings.json`
-//   - Linux:   `$XDG_CONFIG_HOME/claude-code-usage-monitor/settings.json`, falling back to
-//              `~/.config/claude-code-usage-monitor/settings.json`
+//   - Windows: `%APPDATA%\FancierUsageMonitor\settings.json`
+//   - macOS:   `~/Library/Application Support/FancierUsageMonitor/settings.json`
+//   - Linux:   `$XDG_CONFIG_HOME/fancier-usage-monitor/settings.json`, falling back to
+//              `~/.config/fancier-usage-monitor/settings.json`
 //
 // `load()` is the migration path: any missing field (including entirely new sections) falls back
 // to its serde default, so a settings.json written by an older build just gains the new sections
@@ -450,7 +450,7 @@ fn join_settings_path(base: &Path, app_dir_name: &str) -> PathBuf {
     base.join(app_dir_name).join("settings.json")
 }
 
-/// Windows: `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`. UNCHANGED from this function's
+/// Windows: `%APPDATA%\FancierUsageMonitor\settings.json`. UNCHANGED from this function's
 /// pre-macOS/Linux-port form -- byte-for-byte identical logic -- since this is a zero-regression
 /// boundary for the real, currently-running production `ccum-windows` app (see this module's
 /// doc comment). Deliberately NOT routed through the `dirs` crate's `config_dir()` (which also
@@ -463,10 +463,10 @@ fn join_settings_path(base: &Path, app_dir_name: &str) -> PathBuf {
 #[cfg(target_os = "windows")]
 pub fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    join_settings_path(&PathBuf::from(appdata), "ClaudeCodeUsageMonitor")
+    join_settings_path(&PathBuf::from(appdata), "FancierUsageMonitor")
 }
 
-/// macOS: `~/Library/Application Support/ClaudeCodeUsageMonitor/settings.json`, per the design
+/// macOS: `~/Library/Application Support/FancierUsageMonitor/settings.json`, per the design
 /// spec (`docs/superpowers/specs/2026-07-11-macos-linux-port-design.md` §4). `dirs::config_dir()`
 /// resolves to exactly `~/Library/Application Support` on macOS (confirmed by reading `dirs`
 /// 6.0.0's own `src/mac.rs`: `config_dir`/`data_dir`/`data_local_dir` all alias to the same
@@ -476,22 +476,22 @@ pub fn settings_path() -> PathBuf {
 #[cfg(target_os = "macos")]
 pub fn settings_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    join_settings_path(&base, "ClaudeCodeUsageMonitor")
+    join_settings_path(&base, "FancierUsageMonitor")
 }
 
-/// Linux: XDG Base Directory -- `$XDG_CONFIG_HOME/claude-code-usage-monitor/settings.json`,
-/// falling back to `~/.config/claude-code-usage-monitor/settings.json` if `$XDG_CONFIG_HOME` is
+/// Linux: XDG Base Directory -- `$XDG_CONFIG_HOME/fancier-usage-monitor/settings.json`,
+/// falling back to `~/.config/fancier-usage-monitor/settings.json` if `$XDG_CONFIG_HOME` is
 /// unset, per the design spec §4. `dirs::config_dir()` already implements exactly this
 /// `$XDG_CONFIG_HOME`-or-`~/.config` resolution on Linux (confirmed by reading `dirs` 6.0.0's
 /// own `src/lin.rs`: `env::var_os("XDG_CONFIG_HOME")...or_else(|| home_dir().map(|h|
 /// h.join(".config")))`), so no hand-rolled env-var/`$HOME` fallback logic is needed here
 /// either. Note the different app-folder naming convention from Windows/macOS:
-/// `claude-code-usage-monitor` kebab-case, not `ClaudeCodeUsageMonitor` -- the Linux/XDG
+/// `fancier-usage-monitor` kebab-case, not `FancierUsageMonitor` -- the Linux/XDG
 /// convention, per the design spec.
 #[cfg(target_os = "linux")]
 pub fn settings_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    join_settings_path(&base, "claude-code-usage-monitor")
+    join_settings_path(&base, "fancier-usage-monitor")
 }
 
 /// Load settings from disk, applying defaults for anything missing or unparsable.
@@ -612,36 +612,36 @@ mod tests {
     #[test]
     fn join_settings_path_windows_convention() {
         let base = PathBuf::from(r"C:\Users\test\AppData\Roaming");
-        let p = join_settings_path(&base, "ClaudeCodeUsageMonitor");
-        assert_eq!(p, PathBuf::from(r"C:\Users\test\AppData\Roaming\ClaudeCodeUsageMonitor\settings.json"));
+        let p = join_settings_path(&base, "FancierUsageMonitor");
+        assert_eq!(p, PathBuf::from(r"C:\Users\test\AppData\Roaming\FancierUsageMonitor\settings.json"));
     }
 
     #[test]
     fn join_settings_path_macos_convention() {
         let base = PathBuf::from("/Users/test/Library/Application Support");
-        let p = join_settings_path(&base, "ClaudeCodeUsageMonitor");
-        assert_eq!(p, PathBuf::from("/Users/test/Library/Application Support/ClaudeCodeUsageMonitor/settings.json"));
+        let p = join_settings_path(&base, "FancierUsageMonitor");
+        assert_eq!(p, PathBuf::from("/Users/test/Library/Application Support/FancierUsageMonitor/settings.json"));
     }
 
     #[test]
     fn join_settings_path_linux_xdg_config_home_convention() {
         // A hypothetical explicit $XDG_CONFIG_HOME.
         let base = PathBuf::from("/home/test/.config-custom");
-        let p = join_settings_path(&base, "claude-code-usage-monitor");
-        assert_eq!(p, PathBuf::from("/home/test/.config-custom/claude-code-usage-monitor/settings.json"));
+        let p = join_settings_path(&base, "fancier-usage-monitor");
+        assert_eq!(p, PathBuf::from("/home/test/.config-custom/fancier-usage-monitor/settings.json"));
     }
 
     #[test]
     fn join_settings_path_linux_home_config_fallback_convention() {
         // The ~/.config fallback used when $XDG_CONFIG_HOME is unset.
         let base = PathBuf::from("/home/test/.config");
-        let p = join_settings_path(&base, "claude-code-usage-monitor");
-        assert_eq!(p, PathBuf::from("/home/test/.config/claude-code-usage-monitor/settings.json"));
+        let p = join_settings_path(&base, "fancier-usage-monitor");
+        assert_eq!(p, PathBuf::from("/home/test/.config/fancier-usage-monitor/settings.json"));
     }
 
     /// THE critical zero-regression check for the macOS/Linux settings-persistence work: confirms
     /// the REAL, compiled-for-Windows `settings_path()` still resolves to exactly
-    /// `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`, matching this function's pre-port
+    /// `%APPDATA%\FancierUsageMonitor\settings.json`, matching this function's pre-port
     /// behavior byte for byte -- see this module's doc comment. This is load-bearing: the real,
     /// currently-running production `ccum-windows` app on this dev machine reads/writes its
     /// settings at this exact path, so a mistake here would silently relocate where it looks.
@@ -650,7 +650,7 @@ mod tests {
     fn settings_path_windows_matches_appdata_env_var() {
         let appdata = std::env::var("APPDATA")
             .expect("APPDATA should be set on this Windows machine (it's how the OS itself locates AppData\\Roaming)");
-        let expected = PathBuf::from(appdata).join("ClaudeCodeUsageMonitor").join("settings.json");
+        let expected = PathBuf::from(appdata).join("FancierUsageMonitor").join("settings.json");
         assert_eq!(settings_path(), expected);
     }
 }

@@ -1,6 +1,6 @@
 # Testing `ccum-unix` on real macOS/Linux hardware
 
-`ccum-unix` is the macOS/Linux port of Claude Code Usage Monitor, developed entirely on a
+`ccum-unix` is the macOS/Linux port of Fancier Usage Monitor, developed entirely on a
 **Windows-only** machine (see "Environment limitation" below). This document is the handoff
 guide for verifying it on real hardware: how to build it, what to check first, and — most
 important — a prioritized list of every place the implementation is a best-effort guess rather

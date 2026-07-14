@@ -431,7 +431,7 @@ impl Panel {
     /// (`event_loop.exit()` is NOT called).
     fn create(&mut self, event_loop: &ActiveEventLoop, settings: &Settings, text: &TextRenderer) -> bool {
         let attributes = Window::default_attributes()
-            .with_title("Claude Code Usage Monitor \u{2014} Settings")
+            .with_title("Fancier Usage Monitor \u{2014} Settings")
             .with_inner_size(PhysicalSize::new(PANEL_W as u32, PANEL_H as u32))
             .with_resizable(false)
             .with_decorations(false)

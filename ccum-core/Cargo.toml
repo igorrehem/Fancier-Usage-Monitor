@@ -3,7 +3,7 @@ name = "ccum-core"
 version = "1.5.0"
 edition = "2021"
 license = "MIT"
-description = "Platform-agnostic core (settings, presets, animation, poller, localization) for Claude Code Usage Monitor"
+description = "Platform-agnostic core (settings, presets, animation, poller, localization) for Fancier Usage Monitor"
 publish = false
 
 [dependencies]

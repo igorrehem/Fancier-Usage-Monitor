@@ -1,7 +1,7 @@
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# Claude Code Usage Monitor
+# Fancier Usage Monitor
 
 ![Screenshot](.github/animation.gif)
 
@@ -44,20 +44,16 @@ If you use Claude Code through WSL, that is supported too. The monitor can read 
 
 ## Install
 
-Install the latest version from WinGet:
+Download the latest `fancier-usage-monitor.exe` from the [Releases](https://github.com/igorrehem/Fancier-Usage-Monitor/releases) page and run it directly. No installer, no admin rights needed.
 
-```powershell
-winget install CodeZeno.ClaudeCodeUsageMonitor
-```
-
-If you prefer not to use WinGet, you can still download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) page and run it directly.
+A WinGet package is planned for a future release; this README will be updated with the install command once it's published.
 
 ## Use
 
-After installing with WinGet, run:
+After downloading, just run:
 
 ```powershell
-claude-code-usage-monitor
+fancier-usage-monitor
 ```
 
 Once running, it will appear in your taskbar and as one or more tray icons in the notification area.
@@ -114,19 +110,19 @@ Every change appears immediately in the window's live preview. Nothing is writte
 If you need to troubleshoot startup or visibility issues, run:
 
 ```powershell
-claude-code-usage-monitor --diagnose
+fancier-usage-monitor --diagnose
 ```
 
 This writes a log file to:
 
 ```text
-%TEMP%\claude-code-usage-monitor.log
+%TEMP%\fancier-usage-monitor.log
 ```
 
 Settings are saved to:
 
 ```text
-%APPDATA%\ClaudeCodeUsageMonitor\settings.json
+%APPDATA%\FancierUsageMonitor\settings.json
 ```
 
 ## Account Support

@@ -142,7 +142,7 @@ pub fn fallback_usage_data(tick: u64) -> UsageData {
 /// bar (see `bars::draw_tray_icon`'s doc comment for why), so the tooltip is the only place the
 /// actual per-model/per-window numbers are legible at all.
 pub fn tooltip_text(usage: &UsageData) -> String {
-    let mut lines = vec!["Claude Code Usage Monitor".to_string()];
+    let mut lines = vec!["Fancier Usage Monitor".to_string()];
     if usage.show_claude_code {
         lines.push(format!(
             "Claude Code: session {} / weekly {}",

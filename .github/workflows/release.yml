@@ -9,8 +9,11 @@ permissions:
   contents: write
 
 env:
-  RELEASE_ASSET_NAME: claude-code-usage-monitor.exe
-  WINGET_PACKAGE_ID: CodeZeno.ClaudeCodeUsageMonitor
+  RELEASE_ASSET_NAME: fancier-usage-monitor.exe
+  # No manifest has been published to winget-pkgs under this ID yet. The `winget` job below
+  # only submits *updates* to an existing manifest (`wingetcreate update`); the first release
+  # needs a manual `wingetcreate new` submission before this job can succeed.
+  WINGET_PACKAGE_ID: igorrehem.FancierUsageMonitor
 
 jobs:
   build:
@@ -28,7 +31,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/claude-code-usage-monitor.exe
+          files: target/release/fancier-usage-monitor.exe
           generate_release_notes: true
 
   winget:

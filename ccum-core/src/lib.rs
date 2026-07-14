@@ -1,4 +1,4 @@
-// ccum-core: platform-agnostic core of the Claude Code Usage Monitor.
+// ccum-core: platform-agnostic core of Fancier Usage Monitor.
 //
 // Everything here is pure logic and data -- settings schema/persistence, style presets, the
 // animation state machine, the usage poller, and localization data -- with zero dependency on
