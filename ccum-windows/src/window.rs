@@ -187,6 +187,12 @@ fn refresh_dpi() {
 /// crash-looping); when detected we back off instead of spawning in a tight loop.
 const RELAUNCH_THROTTLE_SECS: u64 = 10;
 const RELAUNCH_BACKOFF_SECS: u64 = 30;
+/// How long a relaunched child waits on the previous instance's single-instance
+/// mutex before giving up. Must comfortably exceed `RELAUNCH_BACKOFF_SECS` (30s):
+/// a predecessor sleeping out a relaunch-storm backoff is holding the mutex the
+/// whole time, and if the child's patience were shorter it could give up and
+/// exit while the predecessor is still backing off, leaving zero instances running.
+const RELAUNCH_MUTEX_WAIT_MS: u32 = 60_000;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
 const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
@@ -212,14 +218,14 @@ fn relaunch_self() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
-        diagnose::log("relaunch storm detected; backing off before relaunching");
+        diagnose::journal("relaunch storm detected; backing off before relaunching");
         std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
     }
 
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
+            diagnose::journal(format!("watchdog: unable to resolve current executable: {error}"));
             return;
         }
     };
@@ -232,11 +238,11 @@ fn relaunch_self() {
         .spawn()
     {
         Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+            diagnose::journal("watchdog: relaunched fresh instance, exiting old one");
             std::process::exit(0);
         }
         Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
+            diagnose::journal(format!("watchdog: unable to spawn relaunched instance: {error}"));
         }
     }
 }
@@ -261,7 +267,7 @@ fn spawn_taskbar_watchdog() {
         let taskbars = native_interop::find_taskbars();
         if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
             let new = taskbars[0].hwnd;
-            diagnose::log(format!(
+            diagnose::journal(format!(
                 "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
                 old.0, new.0
             ));
@@ -1503,26 +1509,25 @@ pub fn run() {
             Ok(h) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
                     if is_relaunch {
-                        diagnose::log("relaunch: waiting for previous instance to exit");
-                        let wait_result = WaitForSingleObject(h, 10_000);
+                        diagnose::journal("relaunch: waiting for previous instance to exit");
+                        let wait_result = WaitForSingleObject(h, RELAUNCH_MUTEX_WAIT_MS);
                         if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
-                            diagnose::log(format!(
+                            diagnose::journal(format!(
                                 "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
                             ));
                             return;
                         }
                     } else {
-                        diagnose::log("startup aborted: another instance is already running");
+                        diagnose::journal("startup aborted: another instance is already running");
                         return;
                     }
                 }
                 h
             }
             Err(error) => {
-                diagnose::log_error(
-                    "startup aborted: unable to create single-instance mutex",
-                    error,
-                );
+                diagnose::journal(format!(
+                    "startup aborted: unable to create single-instance mutex: {error}"
+                ));
                 return;
             }
         }
@@ -1731,6 +1736,7 @@ pub fn run() {
             DispatchMessageW(&msg);
         }
     }
+    diagnose::journal("message loop ended; process exiting");
 }
 
 /// Bundled per-model usage data (percentages + display text + section visibility) that
@@ -3305,6 +3311,7 @@ unsafe extern "system" fn wnd_proc(
                 native_interop::unhook_win_event(h);
             }
             tray_icon::remove_all(hwnd);
+            diagnose::journal("WM_DESTROY: exiting message loop");
             PostQuitMessage(0);
             LRESULT(0)
         }
