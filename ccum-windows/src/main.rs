@@ -12,7 +12,10 @@ mod window;
 use ccum_core::diagnose;
 
 fn main() {
+    diagnose::install_panic_hook();
+
     let args: Vec<String> = std::env::args().collect();
+    diagnose::journal(format!("process started args={args:?}"));
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {
