@@ -260,8 +260,16 @@ fn spawn_taskbar_watchdog() {
             let state = lock_state();
             state.as_ref().and_then(|s| s.taskbar_hwnd)
         };
-        // Only relevant once we have embedded into a taskbar at least once.
+        // Never embedded: startup lost the race with explorer (autostart at
+        // boot, or a shell restart while we were coming up) and the widget is
+        // stranded as a topmost popup at 0,0 with no recovery path, since the
+        // handle-change check below can never fire. Relaunch as soon as a
+        // taskbar exists so the fresh process embeds normally.
         let Some(old) = stored else {
+            if !native_interop::find_taskbars().is_empty() {
+                diagnose::journal("watchdog: taskbar appeared but we never embedded -> relaunching");
+                relaunch_self();
+            }
             continue;
         };
         let taskbars = native_interop::find_taskbars();
