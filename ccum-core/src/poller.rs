@@ -324,6 +324,9 @@ fn cli_refresh_token(source: &CredentialSource) {
     match source {
         CredentialSource::Windows(_) => cli_refresh_windows_token(),
         CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
+        // Same native `claude -p .` nudge as the file-backed source: on macOS
+        // that CLI is what rewrites the Keychain item we just read.
+        CredentialSource::MacKeychain { .. } => cli_refresh_windows_token(),
     }
 }
 
@@ -678,6 +681,9 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
     if let Some(source) = windows_credential_source() {
         sources.push(source);
     }
+    if let Some(source) = macos_keychain_source() {
+        sources.push(source);
+    }
     for distro in list_wsl_distros() {
         sources.push(CredentialSource::Wsl { distro });
     }
@@ -688,8 +694,13 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
 /// the pre-port code), this resolves the native, non-bridged credentials
 /// file path via `dirs::home_dir()` and plain `std::fs` reads — it is
 /// already fully portable and needs no OS-specific handling. It applies
-/// equally to macOS/Linux, where `claude` (if installed) also stores its
+/// equally to Linux, where `claude` (if installed) also stores its
 /// credentials at `~/.claude/.credentials.json`.
+///
+/// NOT on macOS, though: verified on real hardware (2026-07-29, macOS 15
+/// arm64) that Claude Code writes no such file there and instead uses the
+/// Keychain — see `CredentialSource::MacKeychain`. This source still gets
+/// probed first on macOS (harmless, just misses) before the Keychain one.
 fn windows_credential_source() -> Option<CredentialSource> {
     let home = dirs::home_dir()?;
     Some(CredentialSource::Windows(
@@ -701,6 +712,7 @@ fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
     match source {
         CredentialSource::Windows(path) => Some(windows_credential_watch_signature(path)),
         CredentialSource::Wsl { distro } => wsl_credential_watch_signature(distro),
+        CredentialSource::MacKeychain { service } => macos_keychain_watch_signature(service),
     }
 }
 
@@ -1282,10 +1294,19 @@ struct Credentials {
 enum CredentialSource {
     Windows(PathBuf),
     Wsl { distro: String },
+    /// macOS: Claude Code does not write `~/.claude/.credentials.json` there
+    /// — it stores the same JSON blob as a Keychain generic password under
+    /// the `Claude Code-credentials` service. Read via the `security` CLI,
+    /// mirroring `read_windows_generic_credential`'s macOS arm.
+    MacKeychain { service: String },
 }
 
 fn read_first_credentials() -> Option<Credentials> {
     if let Some(creds) = read_windows_credentials() {
+        return Some(creds);
+    }
+
+    if let Some(creds) = read_macos_keychain_credentials() {
         return Some(creds);
     }
 
@@ -1295,6 +1316,98 @@ fn read_first_credentials() -> Option<Credentials> {
         }
     }
 
+    None
+}
+
+/// Keychain service name Claude Code registers its OAuth blob under on macOS.
+/// Gated so the Windows/Linux builds don't trip `dead_code` on it.
+#[cfg(target_os = "macos")]
+const MACOS_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+#[cfg(target_os = "macos")]
+fn macos_keychain_source() -> Option<CredentialSource> {
+    Some(CredentialSource::MacKeychain {
+        service: MACOS_KEYCHAIN_SERVICE.to_string(),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_keychain_source() -> Option<CredentialSource> {
+    None
+}
+
+/// Reads the raw Keychain secret for `service`. Returns `None` (fails closed)
+/// when the item is absent or the user denies the access prompt.
+#[cfg(target_os = "macos")]
+fn read_macos_keychain_secret(service: &str) -> Option<String> {
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(service)
+        .arg("-w")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        diagnose::log(format!(
+            "unable to read macOS Keychain credential for service {service}"
+        ));
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_keychain_credentials() -> Option<Credentials> {
+    let CredentialSource::MacKeychain { service } = macos_keychain_source()? else {
+        return None;
+    };
+    let content = read_macos_keychain_secret(&service)?;
+    parse_credentials(&content, CredentialSource::MacKeychain { service })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_macos_keychain_credentials() -> Option<Credentials> {
+    None
+}
+
+/// Change-detection signature for the Keychain source. Deliberately reads the
+/// item's *attributes* (no `-w`), not its secret: attribute reads need no
+/// Keychain ACL approval, so polling this every watch tick never re-prompts
+/// the user. `mdat` (modification date) changes whenever Claude Code rewrites
+/// the token, which is exactly the signal the watcher needs.
+#[cfg(target_os = "macos")]
+fn macos_keychain_watch_signature(service: &str) -> Option<String> {
+    let key = format!("mac-keychain:{service}");
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(service)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return Some(format!("{key}|missing"));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mdat = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("\"mdat\""))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "no-mdat".to_string());
+    Some(format!("{key}|present|{mdat}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_keychain_watch_signature(_service: &str) -> Option<String> {
     None
 }
 
@@ -1327,6 +1440,7 @@ fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials
             parse_credentials(&content, source.clone())
         }
         CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
+        CredentialSource::MacKeychain { .. } => read_macos_keychain_credentials(),
     }
 }
 
@@ -1546,6 +1660,18 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
 fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials> {
     match source {
         CredentialSource::Windows(_) => {
+            // Mirrors `read_first_credentials`' order: Keychain sits between
+            // the file source and the WSL distros.
+            if let Some(creds) = read_macos_keychain_credentials() {
+                return Some(creds);
+            }
+            for distro in list_wsl_distros() {
+                if let Some(creds) = read_wsl_credentials(&distro) {
+                    return Some(creds);
+                }
+            }
+        }
+        CredentialSource::MacKeychain { .. } => {
             for distro in list_wsl_distros() {
                 if let Some(creds) = read_wsl_credentials(&distro) {
                     return Some(creds);
